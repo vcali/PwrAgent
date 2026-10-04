@@ -446,7 +446,8 @@ import type {
   DeleteDesktopPwrAgentProfileRequest,
   DeleteDesktopPwrAgentProfileResponse,
   DesktopAppearanceDensity,
-  DesktopAppearancePalette,
+  DesktopDarkTheme,
+  DesktopLightTheme,
   DesktopAppearanceTheme,
   DesktopTextSize,
   DesktopMessagingContactLookupRequest,
@@ -1506,7 +1507,8 @@ export type DesktopApi = {
   onAppearanceChanged?: (
     callback: (appearance: {
       theme: DesktopAppearanceTheme;
-      palette: DesktopAppearancePalette;
+      darkTheme: DesktopDarkTheme;
+      lightTheme: DesktopLightTheme;
       density: DesktopAppearanceDensity;
       sidebarTextSize: DesktopTextSize;
       transcriptTextSize: DesktopTextSize;
