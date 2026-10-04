@@ -496,6 +496,8 @@ export type AppServerThreadStatus = "active" | "idle" | "notLoaded" | "unknown";
 export type CodexNativeSubAgentProvenance = {
   parentThreadId: ThreadIdentifier;
   depth?: number;
+  /** The name the parent chose, as a path: `/root/breakfast_politics`. */
+  agentPath?: string;
   agentNickname?: string;
   agentRole?: string;
 };
@@ -511,6 +513,11 @@ export type CodexNativeSubAgentSummary = {
   updatedAt?: number;
   threadStatus?: AppServerThreadStatus;
   depth?: number;
+  /**
+   * The worker's name, resolved by `codexNativeSubAgentName`: its path
+   * segment, else Codex's nickname. The field keeps its older name because
+   * navigation snapshots carry it to peers.
+   */
   agentNickname?: string;
   agentRole?: string;
 };
@@ -561,11 +568,15 @@ export type AppServerThreadSummary = {
   titleSource: AppServerThreadTitleSource;
   /** Current backend runtime status when exposed by the thread-list protocol. */
   threadStatus?: AppServerThreadStatus;
+  /** Provider-owned pin, independent of PwrAgent's per-directory pin rank. */
+  isPinned?: boolean;
   summary?: string;
   projectKey?: string;
   createdAt?: number;
   updatedAt?: number;
   archivedAt?: number;
+  archiveRetentionStartedAt?: number;
+  archiveRetentionProtectedReason?: string;
   linkedDirectories: LinkedDirectorySummary[];
   gitBranch?: string;
   gitOriginUrl?: string;
@@ -785,7 +796,19 @@ export type AppServerThreadCommandDetail = {
 export type AppServerThreadSubAgentCallDetail = {
   backend: AppServerBackendKind;
   origin: "codex-native" | "pwragent";
-  operation: "spawn" | "wait" | "send_input" | "resume" | "close" | "unknown";
+  /**
+   * `complete` and `interrupt` come from Codex `subAgentActivity` reports: the
+   * worker finished or was interrupted on its own, which no tool call did.
+   */
+  operation:
+    | "spawn"
+    | "wait"
+    | "send_input"
+    | "resume"
+    | "close"
+    | "complete"
+    | "interrupt"
+    | "unknown";
   agents: Array<{
     threadId: string;
     name?: string;
@@ -1189,6 +1212,8 @@ export type AppServerReadThreadResponse = {
    */
   pendingRequest?: AppServerPendingRequestNotification;
   pricing?: {
+    /** Whole-thread estimate input; never added to observed ledger totals. */
+    snapshot?: import("../token-usage-pricing").ThreadPricingSnapshot;
     /** Observed context compactions, oldest first. */
     compactions?: ThreadCompactionRecord[];
     lines: ThreadUsageLineRecord[];
@@ -1864,6 +1889,12 @@ export type AppServerNotification =
     }
   | {
       method: "thread/unarchived";
+      params: {
+        threadId: string;
+      };
+    }
+  | {
+      method: "thread/deleted";
       params: {
         threadId: string;
       };

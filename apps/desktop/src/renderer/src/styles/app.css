@@ -4801,12 +4801,10 @@ textarea,
 }
 
 /* The idle stand-in for the scanner. A beam still sweeping next to a 0 would
-   say the opposite of the number, but this must NOT be built by switching off
-   `.thinking-scanner__beam`'s animation: every scanner in the app is pinned to
-   one document-timeline epoch by a mount-time ref (ThinkingScanner.tsx, PR
-   #1187), and an animation that CSS stops and restarts under a live element is
-   never re-pinned. So the zero state is its own element and the live state is
-   an untouched `ThinkingScanner`. Matches `.thinking-scanner--mini`'s footprint
+   say the opposite of the number, so the zero state is its own empty track and
+   the live state is a `ThinkingScanner`. Live beams share one document-timeline
+   epoch, pinned on mount and on CSS animation restarts (ThinkingScanner.tsx).
+   Matches `.thinking-scanner--mini`'s footprint
    so the tab does not reflow when the count leaves zero. */
 .signal-count__dormant-scanner {
   display: block;
@@ -5006,6 +5004,14 @@ a.button {
   min-width: 0;
 }
 
+/* The `role="listitem"` box around a row's sub-thread tray in Inbox and
+   Recents: the `<li><ul>...</ul></li>` shape. `display: contents` for the
+   reason `.directory-row__threads-slot` gives: the tray's layout is unchanged
+   by construction. */
+.thread-group__subthreads-slot {
+  display: contents;
+}
+
 .subthread-list {
   position: relative;
   display: grid;
@@ -5114,6 +5120,13 @@ a.button {
   margin: 1px 0 2px 15px;
   padding-left: 8px;
   border-left: 1px solid var(--border-subtle);
+}
+
+.native-subagents__status-line {
+  margin: 1px 0 2px 23px;
+  padding: 4px 6px;
+  color: var(--text-muted);
+  font-size: 12px;
 }
 
 .native-subagents__agent {
@@ -6454,9 +6467,13 @@ a.button {
     transform 120ms ease;
 }
 
+/* Keyboard focus only. `:focus-within` also matches a button that took focus
+   from a mouse click, which pinned its tooltip open over the next control
+   until focus moved: after clicking the composer mic, its "End voice" tooltip
+   sat beside the voice bar's End voice and read as a second button. */
 .tooltip-target[data-tooltip]:hover::after,
 .tooltip-target[data-tooltip]:focus-visible::after,
-.tooltip-target[data-tooltip]:focus-within::after {
+.tooltip-target[data-tooltip]:has(:focus-visible)::after {
   opacity: 1;
   transform: translateX(-50%) translateY(0);
 }
@@ -8035,10 +8052,16 @@ a.button {
 }
 
 /* A menu with checkable items gives every other item the same check column,
-   so labels align down the menu. 10px button padding + 16px box + 7px gap. */
+   so labels align down the menu. 10px button padding + 16px box + 7px gap.
+   A cascade row's button sits one level down, inside its wrapper; the child
+   combinator there keeps the indent off the flyout's own rows. */
 .thread-context-menu--check-column
   > .thread-context-menu__section
-  > button:not([role="menuitemcheckbox"]) {
+  > button:not([role="menuitemcheckbox"]),
+.thread-context-menu--check-column
+  > .thread-context-menu__section
+  > .thread-context-menu__cascade
+  > button {
   padding-left: 33px;
 }
 
@@ -11288,7 +11311,8 @@ a.button {
   margin-left: auto;
 }
 
-.incoming-files-folder__action {
+.incoming-files-folder__action,
+.settings-folder-line__action {
   min-height: 24px;
   padding: 0 8px;
   color: var(--text-secondary);
@@ -11296,9 +11320,45 @@ a.button {
   white-space: nowrap;
 }
 
-.incoming-files-folder__action:hover:not([disabled]):not([aria-disabled="true"]) {
+.incoming-files-folder__action:hover:not([disabled]):not([aria-disabled="true"]),
+.settings-folder-line__action:hover {
   border-color: var(--accent-border);
   color: var(--accent);
+}
+
+/* A read-only folder under a settings control: the path, then a quiet
+   Open folder that sits right and keeps the incoming folder's 24px size. */
+.settings-folder-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  min-width: 0;
+  min-height: 24px;
+}
+
+.settings-folder-line__path {
+  flex: 1 1 260px;
+  min-width: 0;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.settings-folder-line__actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.settings-folder-line__note {
+  color: var(--text-muted);
+  font-size: 11.5px;
+  line-height: 1.45;
 }
 
 .discord-permission-result {
@@ -12599,18 +12659,23 @@ a.button {
   gap: 8px;
 }
 
-/* Default Models: each line under a helper's pickers names what will run. */
-.settings-default-models__line {
+/* Helper model: each line under the pickers names what will run. */
+.settings-helper-model__line {
   display: block;
 }
 
-.settings-default-models__line strong {
+.settings-helper-model__line strong {
   color: var(--text-secondary);
   font-weight: 600;
 }
 
-.settings-default-models__line.settings-field__value--warn strong {
+.settings-helper-model__line.settings-field__value--warn strong {
   color: inherit;
+}
+
+.settings-helper-model__actions {
+  display: block;
+  margin-top: 6px;
 }
 
 .settings-select--chip {
@@ -15268,6 +15333,72 @@ a.button {
   border-radius: 3px;
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
+}
+
+.settings-archive-sweep {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.settings-archive-sweep__line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: 8px;
+  row-gap: 4px;
+  min-height: 26px;
+  min-width: 0;
+}
+
+.settings-archive-sweep__status {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: 8px;
+  row-gap: 4px;
+  min-width: 0;
+}
+
+.settings-archive-sweep__time {
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.settings-archive-sweep__text {
+  min-width: 0;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.settings-archive-sweep__run {
+  margin-left: auto;
+}
+
+.settings-archive-sweep__run[aria-disabled="true"] {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.settings-archive-sweep__error {
+  margin: 0;
+  color: var(--danger-text);
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.settings-archive-sweep__next {
+  margin: 0;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
 }
 
 .settings-thread-management__status {
@@ -20169,184 +20300,6 @@ a.button {
   font-weight: 700;
 }
 
-.environment-setup-choice {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px 18px;
-  margin: 12px 22px;
-  padding: 14px 16px;
-  /* Stay inside the transcript column even when the context rail is pinned. */
-  max-width: 100%;
-  box-sizing: border-box;
-  /* The panel is a sibling of the transcript inside `.thread-view__primary`,
-     so every pixel it takes comes out of the transcript. A flex item's
-     `min-height: auto` floor let it size to its own content and refuse to
-     shrink: at a 700px-tall window it measured 685px inside a 644px pane,
-     which left the transcript 0px tall (nothing to scroll) and pushed the
-     actions row 53px below the `overflow: hidden` on `.thread-view`, so
-     "Continue anyway" could not be reached at all. The height bound lives on
-     `__body` — the part that scrolls — and the actions row sits outside it. */
-  min-height: 0;
-  border: 1px solid var(--danger-border);
-  border-radius: 8px;
-  background: var(--danger-soft);
-  color: var(--text-primary);
-}
-
-.environment-setup-choice__body {
-  /* Take all remaining horizontal space so the output pre fills the
-     dialog. The actions column on the right is flex: 0 0 auto so it
-     only gets its natural width, leaving the rest to the body. */
-  flex: 1 1 auto;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  /* The panel's vertical bound, and the panel's one scroll container. It is
-     here rather than on the section because the actions row wraps below the
-     body under ~1200px of chat column, and a wrapped flex line is sized to
-     its content: capping the section would clip the buttons instead of
-     shrinking the body. A percentage would resolve against the section's
-     auto height (that is, not at all), so the bound is window-relative, in
-     the `min(<px>, <vh>)` form `.launchpad-pending__command` already uses:
-     the vh share keeps the actions inside the pane well below the 640px
-     minimum window height, and the pixel ceiling stops a tall display from
-     handing the panel 600px of transcript for no reason. */
-  min-height: 0;
-  max-height: min(360px, 40vh);
-  overflow-y: auto;
-}
-
-.environment-setup-choice__heading > *:first-child {
-  margin-top: 0;
-}
-
-.environment-setup-choice h3 {
-  margin: 0;
-  font-size: 16px;
-  line-height: 1.3;
-}
-
-.environment-setup-choice p {
-  margin: 6px 0 0;
-  color: var(--text-secondary);
-  font-size: 13px;
-  line-height: 1.45;
-}
-
-.environment-setup-choice__error {
-  color: var(--danger-text);
-}
-
-.environment-setup-choice__details {
-  margin: 0;
-  width: 100%;
-  min-width: 0;
-  border: 1px solid var(--border-subtle);
-  border-radius: 6px;
-  background: var(--bg-panel-elevated);
-  padding: 0;
-}
-
-.environment-setup-choice__details > summary {
-  cursor: pointer;
-  list-style: none;
-  padding: 8px 10px;
-  font-size: 12px;
-  color: var(--text-secondary);
-  user-select: none;
-  /* `__body` scrolls, and this summary carries the exit code and the collapse
-     control — the two things worth keeping in view while reading the output.
-     Its containing block is the `<details>`, which spans the whole scrolled
-     stack, so it stays pinned for as long as any of the detail is visible.
-     `.launchpad-pending__output`'s header is pinned for the same reason. */
-  position: sticky;
-  top: 0;
-  z-index: 1;
-  background: var(--bg-panel-elevated);
-  border-top-left-radius: 6px;
-  border-top-right-radius: 6px;
-}
-
-.environment-setup-choice__details > summary::-webkit-details-marker {
-  display: none;
-}
-
-.environment-setup-choice__details[open] > summary {
-  border-bottom: 1px solid var(--border-subtle);
-}
-
-.environment-setup-choice__field {
-  padding: 8px 10px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.environment-setup-choice__field + .environment-setup-choice__field {
-  border-top: 1px solid var(--border-subtle);
-}
-
-.environment-setup-choice__field-label {
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--text-muted);
-}
-
-.environment-setup-choice__pre {
-  margin: 0;
-  padding: 6px 8px;
-  background: var(--bg-input);
-  border-radius: 4px;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 1.5;
-  color: var(--text-primary);
-  white-space: pre;
-  overflow-x: auto;
-  /* Defensive: ensure the user can actually copy build output from the
-     dialog. Some upstream rules globally set user-select: none on chrome. */
-  user-select: text;
-  -webkit-user-select: text;
-}
-
-.environment-setup-choice__pre--output {
-  /* No height cap of its own: `__body` is the panel's one scroll container,
-     and a 320px box inside a body that is itself shorter than that on a small
-     window made two nested vertical scrollers the wheel had to chain out of.
-     Wrapping rather than scrolling sideways matches
-     `.launchpad-pending__output pre`, the live setup panel's output block —
-     and it is what keeps this readable now that the body scrolls, because
-     `__pre`'s horizontal scrollbar would otherwise sit at the bottom of the
-     full output, outside the body's viewport. */
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.environment-setup-choice__path {
-  font-family: var(--font-mono);
-  font-size: 12px;
-  color: var(--text-secondary);
-  word-break: break-all;
-  user-select: text;
-  -webkit-user-select: text;
-}
-
-.environment-setup-choice__actions {
-  /* Natural width only so the body next to it can stretch to fill the
-     dialog. When the dialog wraps onto two rows (narrow widths), this
-     wraps under the body at full width with the buttons right-aligned. */
-  display: flex;
-  flex: 0 0 auto;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  align-self: flex-start;
-  gap: 8px;
-}
-
 .thread-header__eyebrow-row {
   display: flex;
   align-items: center;
@@ -20601,37 +20554,11 @@ a.button {
   min-height: 0;
 }
 
-/* A failed environment can coincide with a failed first history read. The
-   setup choice and composer both have substantial natural heights, while the
-   transcript normally starts from a zero flex basis. On a short or narrow
-   pane that left only a sliver for the history error; its text then painted
-   out of that sliver and underneath the composer.
-
-   Reserving the error row makes the setup panel surrender height. Its normal
-   wrapping flex layout cannot pass that deficit into `__body`: the wrapped
-   flex lines keep their content heights and overflow the panel, including the
-   escape actions. In this combined state, use one non-wrapping column instead.
-   `__body` is the only child allowed to shrink and already scrolls, while the
-   natural-height action row remains `flex: 0 0 auto` inside the panel. */
-.thread-view__primary:has(> .transcript-panel .transcript-error)
-  > .environment-setup-choice {
-  flex-direction: column;
-  flex-wrap: nowrap;
-  align-items: stretch;
-  justify-content: flex-start;
-  overflow: hidden;
-}
-
-.thread-view__primary:has(> .transcript-panel .transcript-error)
-  > .environment-setup-choice
-  > .environment-setup-choice__actions {
-  width: 100%;
-  align-self: end;
-}
-
-/* Reserve one readable error row. Longer errors scroll inside
-   `.transcript-error` instead of escaping the card. */
-.thread-view__primary:has(> .environment-setup-choice)
+/* A failed environment setup can coincide with a failed first history read.
+   The setup row lives in the composer band, which can give up height, so
+   reserve one readable history-error row and let the band take the deficit.
+   Longer errors scroll inside `.transcript-error` instead of escaping it. */
+.thread-view__primary:has(> .composer .environment-setup-row)
   > .transcript-panel:has(.transcript-error) {
   flex-basis: 132px;
   min-height: 132px;
@@ -20939,6 +20866,10 @@ a.button {
 .launchpad-pending__output pre {
   flex: 1;
   min-height: 0;
+  /* The forking placeholder is the one place this panel still renders, and
+     its output box is a block-level <details> sized to its content: without
+     a bound, a long install log ran past the clipped bottom of the column. */
+  max-height: min(360px, 45vh);
   padding: 12px;
   overflow: auto;
 }
@@ -21436,6 +21367,40 @@ a.button {
   align-items: baseline;
   justify-content: space-between;
   gap: 12px;
+}
+
+.transcript-voice-context__toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.transcript-voice-context__toggle:hover {
+  color: var(--text-primary);
+}
+
+.transcript-voice-context__toggle:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.transcript-voice-context__toggle[aria-expanded="true"] .transcript-work-phase-group__chevron {
+  transform: rotate(45deg);
+}
+
+.transcript-voice-context__text {
+  margin: 8px 0 0;
+  color: var(--text-secondary);
+  font-size: var(--transcript-text-size);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .transcript-message__header--continuation {
@@ -25906,6 +25871,120 @@ a.transcript-message__messaging-origin:focus-visible {
   gap: 6px;
 }
 
+/* Environment setup, as one row in the band (EnvironmentSetupRow.tsx). It
+   borrows the env action row's chrome and the error row's header, so the
+   three read as one family; these rules cover only what it adds. */
+.environment-setup-row__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-right: 8px;
+}
+
+.environment-setup-row__toggle {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+
+.environment-setup-row__toggle:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+.environment-setup-row[data-open="true"] .composer__queued-env-action-chevron {
+  transform: rotate(45deg);
+}
+
+.environment-setup-row__tail {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+.composer__queued-env-action-actions .environment-setup-row__retry,
+.environment-setup-row__decision-actions .composer__secondary-action,
+.environment-setup-row__body-actions .composer__secondary-action {
+  flex: 0 0 auto;
+  min-height: 26px;
+  height: 26px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+/* The decision a thread with no turns still needs. It sits outside the
+   disclosure, so it is visible while the row is collapsed. 24px of left
+   padding puts the copy under the label, past the chevron. */
+.environment-setup-row__decision {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 10px;
+  padding: 0 8px 7px 24px;
+}
+
+.environment-setup-row__hint {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.environment-setup-row__hint--error {
+  color: var(--danger-text);
+}
+
+.environment-setup-row__decision-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.environment-setup-row__decision-actions .environment-setup-row__cleanup {
+  color: var(--danger-text);
+  border-color: var(--danger-border);
+}
+
+.environment-setup-row__decision-actions .environment-setup-row__cleanup:hover:not(:disabled) {
+  background: var(--danger-soft);
+}
+
+.environment-setup-row__body-actions {
+  display: flex;
+}
+
+/* Two classes: `.composer__queued-env-action-output` sets `white-space: pre`
+   further down at the same specificity. Setup output wraps, as it did in the
+   panel this replaces, so a long pnpm line is readable without a sideways
+   scroll at the bottom of a box that already scrolls vertically. */
+.environment-setup-row .environment-setup-row__output {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  /* Shorter than the band on a small window, so the command, path and the
+     output's own tail can share the band's viewport instead of the output
+     box alone filling it. */
+  max-height: min(320px, 28vh);
+}
+
+.environment-setup-row__path {
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.composer-error-rail:empty {
+  display: none;
+}
+
 .composer-error-row__header {
   display: flex;
   align-items: center;
@@ -25948,6 +26027,15 @@ div.composer-error-row__toggle {
 .composer-error-row .composer-error-row__detail {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+  /* The band scrolls at min(40vh, 300px); a 320px detail box inside it would
+     be taller than its own scroller on a small window. */
+  max-height: min(320px, 28vh);
+}
+
+/* Same reason, for an env action's output above the composer. The sidebar
+   copy keeps its own 260px bound. */
+.env-action-run--composer .composer__queued-env-action-output {
+  max-height: min(320px, 28vh);
 }
 
 .transcript-activity {
@@ -26701,6 +26789,47 @@ div.composer-error-row__toggle {
   flex-wrap: wrap;
 }
 
+/* Always allow on the left, alone; the refusals and the primary grant on the
+   right. `margin-left: auto` holds the group right when Always allow is not
+   offered. */
+.transcript-mcp__actions {
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.transcript-mcp__actions-end {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+
+/* `.button` sets no size, so approval rows inherited the 16px document size:
+   larger than the 14px transcript and as large as the card's title. One size
+   for every transcript approval row keeps the cards one family. The MCP
+   login card's Open link sits in its URL row and takes the same size. */
+.transcript-request__actions .button,
+.transcript-questionnaire__actions .button,
+.transcript-mcp__actions .button,
+.transcript-mcp__url .button {
+  min-height: 30px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.transcript-request__actions .button--ghost,
+.transcript-questionnaire__actions .button--ghost,
+.transcript-mcp__actions .button--ghost {
+  color: var(--text-secondary);
+}
+
+.transcript-request__actions .button--ghost:hover:not([disabled]),
+.transcript-questionnaire__actions .button--ghost:hover:not([disabled]),
+.transcript-mcp__actions .button--ghost:hover:not([disabled]) {
+  color: var(--text-primary);
+}
+
 .transcript-request__actions .button {
   max-width: 100%;
   white-space: normal;
@@ -26760,23 +26889,91 @@ div.composer-error-row__toggle {
   line-height: 1.35;
 }
 
-.transcript-mcp__params {
-  display: grid;
+/* The MCP card is denser than the questionnaire it shares a frame with: the
+   title, its warning and its parameters read as one 6px block, and the card
+   spends 10px between header, block, fields and actions. */
+.transcript-mcp {
+  gap: 10px;
+  padding: 12px 14px 14px;
+}
+
+.transcript-mcp--risk {
+  border-color: var(--status-warning);
+}
+
+.transcript-mcp__identity {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.transcript-mcp__connector {
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.transcript-mcp__server {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.transcript-mcp__summary {
+  display: flex;
+  flex-direction: column;
   gap: 6px;
+}
+
+.transcript-mcp__prompt h3 {
+  font-size: 15px;
+  font-weight: 650;
+}
+
+/* The server's own warning line. It stays in body text: the light theme's
+   --status-warning is 4.1:1 on this card, under 4.5:1 for 13px text, so a
+   high-risk card carries the warning on its border instead. */
+.transcript-mcp__subtitle {
   margin: 0;
   color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.transcript-mcp--risk .transcript-mcp__subtitle {
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+/* One grid for every row, so labels share the longest label's width and a
+   short key sits next to its value. A per-row 0.3fr column put the value
+   165px from a 25px label at the card's 760px cap; the 200px cap keeps one
+   long raw key from pushing every value off the card. */
+.transcript-mcp__params {
+  display: grid;
+  grid-template-columns: fit-content(200px) minmax(0, 1fr);
+  align-items: baseline;
+  gap: 4px 12px;
+  margin: 0;
   font-size: 13px;
 }
 
 .transcript-mcp__params div {
-  display: grid;
-  grid-template-columns: minmax(120px, 0.3fr) minmax(0, 1fr);
-  gap: 10px;
+  display: contents;
 }
 
 .transcript-mcp__params dt {
+  min-width: 0;
+  overflow-wrap: anywhere;
   color: var(--text-muted);
-  font-weight: 650;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+/* No display name: the raw parameter key, verbatim. */
+.transcript-mcp__params dt.transcript-mcp__param-key {
+  font-family: var(--font-mono);
 }
 
 .transcript-mcp__params dd {
@@ -26784,6 +26981,7 @@ div.composer-error-row__toggle {
   margin: 0;
   overflow-wrap: anywhere;
   color: var(--text-primary);
+  line-height: 1.45;
 }
 
 .transcript-mcp__url {
@@ -27501,106 +27699,76 @@ div.composer-error-row__toggle {
 }
 
 /* Delegated-agent lifecycle activity: distinct from a shell transcript so a
-   wait visibly reads as observing a child, not running `$ wait`. */
+   wait visibly reads as observing a child, not running `$ wait`. The row
+   above names the event and its status, so the body carries only the worker
+   line. A neutral border, like the diff and command bodies beside it: accent
+   stays reserved for what needs attention. */
 .transcript-subagent {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  overflow: hidden;
-  border: 1px solid var(--accent-border);
-  border-radius: 8px;
-  background: var(--bg-panel-elevated);
-}
-
-.transcript-subagent__head {
-  display: flex;
   align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 12px 12px 0;
-}
-
-.transcript-subagent__origin,
-.transcript-subagent__settings,
-.transcript-subagent__agent-id,
-.transcript-subagent__message {
-  margin: 0;
-}
-
-.transcript-subagent__origin {
-  color: var(--accent);
-  font-size: 11px;
-  font-weight: 650;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-}
-
-.transcript-subagent__head h4,
-.transcript-subagent__agent-name {
-  margin: 2px 0 0;
-  color: var(--text-primary);
-  font-size: 13px;
-  font-weight: 650;
-  line-height: 1.3;
-}
-
-.transcript-subagent__status,
-.transcript-subagent__agent-status {
-  flex: 0 0 auto;
-  color: var(--text-secondary);
-  font-size: 11px;
-  font-weight: 600;
-}
-
-.transcript-subagent__settings {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 12px;
-  padding: 0 12px;
-  color: var(--text-secondary);
-  font-size: 11px;
-  line-height: 1.4;
-}
-
-.transcript-subagent__settings code,
-.transcript-subagent__agent-id,
-.transcript-subagent__output code {
-  font-family: var(--font-mono);
+  gap: 8px;
+  overflow: hidden;
+  padding: 10px 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: var(--bg-panel);
 }
 
 .transcript-subagent__agents {
   display: flex;
+  align-self: stretch;
   flex-direction: column;
   gap: 8px;
-  padding: 0 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
 }
 
 .transcript-subagent__agent {
   display: flex;
+  min-width: 0;
   flex-direction: column;
-  gap: 6px;
-  padding: 10px;
-  border: 1px solid var(--border-subtle);
-  border-radius: 6px;
-  background: var(--bg-panel);
+  gap: 4px;
 }
 
-.transcript-subagent__agent-head {
+.transcript-subagent__agent-line {
   display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
 }
 
-.transcript-subagent__agent-id {
-  margin-top: 2px;
+.transcript-subagent__agent-name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.transcript-subagent__settings {
+  min-width: 0;
+  overflow: hidden;
   color: var(--text-muted);
+  font-family: var(--font-mono);
   font-size: 11px;
-  line-height: 1.3;
-  overflow-wrap: anywhere;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.transcript-subagent__action {
+  flex: 0 0 auto;
+  min-height: 28px;
+  margin-left: auto;
+  padding: 0 10px;
+  font-size: 12px;
 }
 
 .transcript-subagent__message {
+  margin: 0;
   color: var(--text-secondary);
   font-size: 12px;
   line-height: 1.45;
@@ -27608,26 +27776,39 @@ div.composer-error-row__toggle {
   white-space: pre-wrap;
 }
 
-.transcript-subagent__actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  padding: 0 12px 12px;
+/* The same quiet text action the sub-agent dialog uses for Copy and Show
+   more. */
+.transcript-subagent__raw-toggle {
+  min-height: 24px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: color 120ms ease;
 }
 
-.transcript-subagent__action {
-  align-self: flex-start;
-  min-height: 28px;
-  padding: 0 10px;
-  font-size: 12px;
+.transcript-subagent__raw-toggle:hover {
+  color: var(--accent-bright);
+}
+
+.transcript-subagent__raw-toggle:focus-visible {
+  border-radius: 3px;
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
 }
 
 .transcript-subagent__output {
-  margin: -2px 0 0;
+  align-self: stretch;
+  margin: 0 -12px -10px;
   padding: 10px 12px;
   border-top: 1px solid var(--border-subtle);
-  background: var(--bg-panel);
+  background: var(--bg-panel-elevated);
   color: var(--text-secondary);
+  font-family: var(--font-mono);
   font-size: 11px;
   line-height: 1.5;
   overflow-wrap: anywhere;
@@ -29960,10 +30141,51 @@ div.composer-error-row__toggle {
   font-size: 12px;
 }
 
+/* The form's last row: Enabled, the validation error, Cancel, and Save.
+   Edge to edge in the card (the negative margin cancels the form's 12px
+   padding) with its own rule above, so it reads as the form's footer whether
+   it is resting at the end or pinned over the fields (below). */
 .automation-editor__actions {
   display: flex;
-  justify-content: flex-end;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 8px;
+  margin: 0 -12px -12px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--border-subtle);
+  border-radius: 0 0 8px 8px;
+  background: var(--bg-panel-elevated);
+}
+
+/* The error takes a line of its own, beside the button that raised it. */
+.automation-editor__actions .automation-editor__error {
+  flex: 1 1 100%;
+}
+
+.automation-editor__actions .automation-checkbox {
+  margin-right: auto;
+}
+
+/* `.button` sets no size, so these inherited the 16px document size beside
+   the editor's 12px buttons (`.automation-preview__toggle`). */
+.automation-editor__actions .button {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+/* On the Automations screen the form is a page about 2,600px tall, and its
+   actions were only at the end. Sticky against `.automations-content`'s
+   scrollport keeps them on the pane's bottom edge until the form's end
+   scrolls up to meet them. The sticky edge is the scrollport's content box,
+   so `bottom` cancels the pane's 24px bottom padding to land the bar on the
+   window edge (Settings cancels its top padding the same way, with
+   `--settings-section-sticky-top`). Above the stage nodes (`z-index: 1`);
+   below the picker menus (20 and 30). The thread rail's editor keeps the bar
+   in flow. */
+.automations-editor-panel .automation-editor__actions {
+  position: sticky;
+  bottom: -24px;
+  z-index: 2;
 }
 
 .automation-run-history {
@@ -32190,6 +32412,56 @@ button.pricing-token-miser__folded:focus-visible {
 .composer > .composer__pending-controls > * {
   width: 100%;
   max-width: var(--chat-column-max);
+  /* The input, attachments tray and toolbar never give up height. The band
+     below is the one composer row that does. */
+  flex-shrink: 0;
+}
+
+/* The band: every transient row between the transcript and the input —
+   sub-agents, automations, environment setup, env actions, composer errors,
+   queued turns. Before it existed these were all direct children of the
+   composer, each sized to its content, and each open row could add 320px of
+   output. A failed environment setup on an existing thread stacked a
+   content-sized panel above the transcript and an open error row in here, and
+   the composer's toolbar ended up below `.thread-view`'s `overflow: hidden`
+   edge, unreachable.
+
+   Now the band is capped and scrolls, and it is the only composer row allowed
+   to shrink, so the column gives up height in a fixed order: the transcript
+   first (its basis is 0), then the band, never the input. The vh share keeps
+   about 180px of transcript at the 640px minimum window; the pixel ceiling
+   stops a tall display from handing the band half the column. See
+   `styles/__tests__/composer-band-bounds.test.ts`. */
+.composer > .composer__pending-controls > .composer__band {
+  display: flex;
+  flex: 0 1 auto;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  max-height: min(40vh, 300px);
+  overflow-y: auto;
+  /* A scroller clips on both axes, which would slice the 2px focus rings of
+     the rows' controls at the band's edges. Pad them back in and return the
+     space with a matching negative margin so the rows stay on the chat
+     column's edges. */
+  width: calc(100% + 6px);
+  max-width: calc(var(--chat-column-max) + 6px);
+  margin: -3px;
+  padding: 3px;
+  box-sizing: border-box;
+}
+
+/* Same specificity as the rule above, so `display: none` wins by order. */
+.composer > .composer__pending-controls > .composer__band:empty {
+  display: none;
+}
+
+/* In the thread column the composer may shrink — only its band can — so a
+   column over budget takes the deficit out of the band rather than pushing the
+   composer's content past the clipped bottom edge. */
+.thread-view__primary > .composer {
+  flex: 0 1 auto;
+  min-height: 0;
 }
 
 .integrated-terminal {
@@ -33326,9 +33598,20 @@ button.pricing-token-miser__folded:focus-visible {
      ring flat. Pad the two edges it overhangs; the negative top margin puts
      the strip back where it was, and the right pad sits inside the row's
      own wrapping slack so the left edge stays aligned with the rest of the
-     composer column. */
-  padding: 10px 10px 0 0;
+     composer column.
+
+     The left edge needs the same care for a different overhang: each
+     thumbnail's own focus ring (`.composer__attachment-open:focus-visible`,
+     2px at 2px) reaches 4px past the first column, and with no left pad the
+     scroller sliced it flat — visible every time the lightbox closed and
+     handed focus back. The left pad is paid back by moving the box 4px left,
+     and the right margin returns the same 4px so the margin box stays the
+     width `.composer > *` centres. A left margin alone shifts the centred box
+     by half of it and puts the thumbnails 2px right of the Reply box. */
+  padding: 10px 10px 0 4px;
   margin-top: -10px;
+  margin-right: 4px;
+  margin-left: -4px;
 }
 
 .composer__attachment {
@@ -34284,6 +34567,31 @@ button.pricing-token-miser__folded:focus-visible {
   border-color: var(--accent-strong);
   background: var(--accent-strong);
   color: var(--button-text);
+}
+
+/* A dropdown that replaces an icon toggle keeps the toggle's footprint while
+   its choice is the default: the 26px circle of `.composer__toggle`. */
+.composer-dropdown--icon-only .composer-dropdown__button {
+  width: 26px;
+  height: 26px;
+  justify-content: center;
+  padding: 0;
+}
+
+/* An opt-in mode that is on (Speed at Fast or Ultrafast). Same treatment as
+   `.composer__toggle.is-active`, so a model with the plain Fast toggle and a
+   model with the Speed menu say "on" the same way. */
+.composer-dropdown--active .composer-dropdown__button,
+.composer-dropdown--active .composer-dropdown__button:hover,
+.composer-dropdown--active .composer-dropdown__button:focus-visible,
+.composer-dropdown--active.composer-dropdown--open .composer-dropdown__button {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-bright);
+}
+
+.composer-dropdown--active .composer-dropdown__icon {
+  color: var(--accent);
 }
 
 /* The launchpad's machine chip when it targets another machine. An accent
@@ -37429,6 +37737,10 @@ button.pricing-token-miser__folded:focus-visible {
   font-family: var(--font-mono);
   font-size: 13px;
   white-space: pre-wrap;
+}
+
+.renderer-error-boundary .button {
+  align-self: flex-start;
 }
 
 @media (max-width: 1100px) {

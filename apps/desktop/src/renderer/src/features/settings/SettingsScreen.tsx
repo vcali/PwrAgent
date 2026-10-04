@@ -32,7 +32,6 @@ import {
 } from "./MessagingSettings";
 import { formatMessagingPlatformName } from "../../lib/messaging-platform-branding";
 import { ModelsSettings } from "./ModelsSettings";
-import { DEFAULT_MODELS_FOCUS } from "./DefaultModelsSettings";
 import { ProfilesSettings } from "./ProfilesSettings";
 import { PricingSettings } from "./PricingSettings";
 import { ApplicationsSettings } from "./ApplicationsSettings";
@@ -522,11 +521,6 @@ export function SettingsScreen(props: {
         snapshot?.models.codex.discovery.selectedCommand,
       );
       return [
-        {
-          key: DEFAULT_MODELS_FOCUS,
-          label: "Default Models",
-          sub: DEFAULT_MODELS_FOCUS,
-        },
         {
           key: "codex",
           label: "Codex",
@@ -1068,6 +1062,11 @@ function SettingsSectionBody(props: {
             experimental: { tokenMiserFocusedSummariesEnabled: enabled },
           });
         }}
+        onTokenMiserDiagnosticsEnabledChange={async (enabled: boolean) => {
+          await props.settings.writeConfig({
+            experimental: { tokenMiserDiagnosticsEnabled: enabled },
+          });
+        }}
         onTokenMiserPollingReviewsEnabledChange={async (enabled: boolean) => {
           await props.settings.writeConfig({
             experimental: { tokenMiserPollingReviewsEnabled: enabled },
@@ -1273,6 +1272,8 @@ function SettingsSectionBody(props: {
   if (props.section === "archived") {
     return (
       <ArchivedThreadsSettings
+        snapshot={props.snapshot}
+        onWriteConfig={props.settings.writeConfig}
         desktopApi={props.desktopApi}
         onOpenThread={props.onOpenThread}
       />

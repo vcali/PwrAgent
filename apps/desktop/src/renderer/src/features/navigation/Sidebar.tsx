@@ -186,6 +186,8 @@ import type { NavigationDirectoryDisclosure } from "../../lib/useNavigationDirec
 import { BrandLockup } from "../chrome/BrandLockup";
 
 type SidebarProps = {
+  /** Director voice's mic, rendered first in the masthead; it subscribes to voice itself. */
+  mastheadVoiceControl?: ReactNode;
   directoryDisclosure?: NavigationDirectoryDisclosure;
   /** True while a full-window layer (Settings, Automations) covers it. */
   inert?: boolean;
@@ -2005,7 +2007,8 @@ export function Sidebar(props: SidebarProps) {
             ? [{
                 instanceId: contextMenuParentInstanceId,
                 label:
-                  contextMenuParentMachine?.label
+                  contextMenuParentMachine?.shortLabel
+                  ?? contextMenuParentMachine?.label
                   ?? contextMenu?.thread.federation?.instanceLabel
                   ?? contextMenuParentInstanceId,
                 // A parent on an offline peer is disabled like any offline
@@ -2038,7 +2041,7 @@ export function Sidebar(props: SidebarProps) {
               - Number(b.availability !== "available"))
             .map((target) => ({
               instanceId: target.instanceId,
-              label: target.label,
+              label: target.shortLabel ?? target.label,
               availability: target.availability,
               parent: false,
               ...subthreadWorktreeChoice(target.instanceId, target.label),
@@ -2246,6 +2249,7 @@ export function Sidebar(props: SidebarProps) {
         <BrandLockup variant="sidebar" />
 
         <div className="sidebar__masthead-actions">
+          {federationLabel ? null : props.mastheadVoiceControl}
           <MastheadActionButton
             ariaLabel="Search threads"
             // ⌘K leads: it's the one an operator reaches for by reflex, and

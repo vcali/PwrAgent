@@ -56,7 +56,13 @@ import { textForFeishuIntent } from "@pwragent/messaging-provider-feishu";
 import { textForLineIntent } from "@pwragent/messaging-provider-line";
 import { textForMattermostIntent } from "@pwragent/messaging-provider-mattermost";
 import { textForSlackIntent } from "@pwragent/messaging-provider-slack";
-import { textForTelegramIntent } from "@pwragent/messaging-provider-telegram";
+import {
+  TelegramAdapter,
+  textForTelegramIntent,
+  type TelegramBotApi,
+  type TelegramEditMessageTextRequest,
+  type TelegramSendMessageRequest,
+} from "@pwragent/messaging-provider-telegram";
 import {
   MessagingController,
   messagingDeliveryPriority,
@@ -6192,14 +6198,18 @@ describe("MessagingController", () => {
     );
   });
 
-  it("creates a native Telegram topic, attaches a target thread, and posts resume status there", async () => {
-    const now = Date.UTC(2026, 5, 9, 23, 5);
+  it.each([
+    { backend: "codex" as const, active: false },
+    { backend: "codex" as const, active: true },
+    { backend: "acp:grok" as const, active: true },
+  ])("creates a native Telegram topic and restores activity for $backend (active=$active)", async ({ backend, active }) => {
+    let now = Date.UTC(2026, 5, 9, 23, 5);
     const navigation = buildNavigationSnapshot();
     navigation.threads.push({
       id: "thread-2",
       title: "Telegram thread naming issue",
       titleSource: "explicit",
-      source: "codex",
+      source: backend,
       linkedDirectories: [
         {
           id: "directory:pwragent",
@@ -6243,6 +6253,9 @@ describe("MessagingController", () => {
       getManagedConversationRights,
       navigation,
       now: () => now,
+      readActiveTurn: async (request) => active && request.threadId === "thread-2"
+        ? { backend, threadId: "thread-2", turnId: "handoff-turn" }
+        : undefined,
       readThreadLastAssistantReply: async () => ({
         createdAt: now - 30 * 60_000,
         text: "Last completed answer.",
@@ -6268,6 +6281,22 @@ describe("MessagingController", () => {
     await harness.controller.handleInboundEvent(event);
     harness.delivered.splice(0);
 
+    if (active) {
+      // Handoff starts the delegated turn before its topic/binding exists.
+      await harness.controller.handleBackendEvent({
+        backend,
+        notification: {
+          method: "turn/started",
+          params: {
+            threadId: "thread-2",
+            turnId: "handoff-turn",
+            turn: { id: "handoff-turn", status: "running" },
+          },
+        },
+      } satisfies AgentEvent);
+      expect(harness.delivered).toEqual([]);
+    }
+
     await expect(
       harness.controller.handlePwrAgentMessagingRequest({
         operation: "attach_thread_here",
@@ -6277,7 +6306,7 @@ describe("MessagingController", () => {
           turnId: "turn-1",
         },
         args: {
-          backend: "codex",
+          backend,
           threadId: "thread-2",
           title: "Telegram thread naming issue",
         },
@@ -6286,7 +6315,7 @@ describe("MessagingController", () => {
       ok: true,
       data: {
         binding: {
-          backend: "codex",
+          backend,
           targetKind: "thread",
           threadId: "thread-2",
         },
@@ -6299,11 +6328,23 @@ describe("MessagingController", () => {
         placement: "new_child",
       },
     });
-    expect(harness.delivered).toEqual([
+    const bindingId = `binding:telegram:topic:-1001:500:${backend}:thread-2`;
+    expect(harness.delivered.filter((intent) => intent.kind === "activity")).toEqual(
+      active
+        ? [expect.objectContaining({
+            kind: "activity",
+            activity: "typing",
+            bindingId,
+            sessionState: "processing",
+            state: "active",
+          })]
+        : [],
+    );
+    expect(harness.delivered.filter((intent) => intent.kind !== "activity")).toEqual([
       expect.objectContaining({
         kind: "status",
-        bindingId:
-          "binding:telegram:topic:-1001:500:codex:thread-2",
+        bindingId,
+        status: active ? "working" : "idle",
         delivery: expect.objectContaining({
           mode: "present",
           pin: true,
@@ -6313,8 +6354,7 @@ describe("MessagingController", () => {
       }),
       expect.objectContaining({
         kind: "message",
-        bindingId:
-          "binding:telegram:topic:-1001:500:codex:thread-2",
+        bindingId,
         role: "assistant",
         parts: [
           expect.objectContaining({
@@ -6346,7 +6386,7 @@ describe("MessagingController", () => {
         },
       }),
     ).resolves.toMatchObject({
-      backend: "codex",
+      backend,
       pinnedStatusSurface: {
         id: expect.stringMatching(/^surface:status:/),
       },
@@ -6356,6 +6396,250 @@ describe("MessagingController", () => {
       targetKind: "thread",
       threadId: "thread-2",
     });
+    if (active) {
+      harness.delivered.length = 0;
+      now += 11_000;
+      await harness.controller.handleBackendEvent({
+        backend,
+        notification: {
+          method: "item/started",
+          params: {
+            threadId: "thread-2",
+            turnId: "handoff-turn",
+            item: { id: "reasoning-1", type: "reasoning" },
+          },
+        },
+      } satisfies AgentEvent);
+      expect(harness.delivered.at(-1)).toMatchObject({
+        kind: "activity",
+        bindingId,
+        state: "active",
+      });
+      await harness.controller.handleBackendEvent({
+        backend,
+        notification: {
+          method: "turn/completed",
+          params: {
+            threadId: "thread-2",
+            turnId: "handoff-turn",
+            turn: { id: "handoff-turn", status: "completed", output: [] },
+          },
+        },
+      } satisfies AgentEvent);
+      expect(harness.delivered.filter((intent) => intent.kind === "activity").at(-1)).toMatchObject({
+        state: "idle",
+      });
+    }
+  });
+
+  it.each([
+    { backend: "codex" as const, method: "item/tool/requestUserInput" as const },
+    { backend: "codex" as const, method: "item/commandExecution/requestApproval" as const },
+    { backend: "acp:grok" as const, method: "item/tool/requestUserInput" as const },
+    { backend: "acp:grok" as const, method: "item/commandExecution/requestApproval" as const },
+  ])("restores waiting when $backend has $method pending before attachment", async ({ backend, method }) => {
+    const navigation = buildNavigationSnapshot();
+    navigation.threads.push({ ...navigation.threads[0]!, id: "thread-2", source: backend });
+    const pendingRequest: AppServerPendingRequestNotification = method === "item/tool/requestUserInput"
+      ? {
+          method,
+          params: {
+            threadId: "thread-2",
+            turnId: "handoff-turn",
+            requestId: "question-before-attach",
+            questions: [{ id: "q1", header: "Mode", question: "Proceed?", isOther: true, isSecret: false, options: [] }],
+          },
+        }
+      : {
+          method,
+          params: {
+            threadId: "thread-2",
+            turnId: "handoff-turn",
+            requestId: "approval-before-attach",
+            prompt: "Run tests?",
+            command: "pnpm test",
+          },
+        };
+    const harness = await createHarness({
+      navigation,
+      getThreadAdmissionState: async (request) => request.threadId === "thread-2"
+        ? {
+            activeTurn: { backend, threadId: "thread-2", turnId: "handoff-turn" },
+            pendingRequest,
+            thread: navigation.threads.at(-1),
+            threadStatus: "active",
+          }
+        : {},
+    });
+    await bindThread(harness);
+    await harness.controller.handleInboundEvent(buildTextEvent("attach another thread"));
+    harness.delivered.length = 0;
+    // No target binding exists when the request originally arrives.
+    await harness.controller.handleBackendPendingRequest(backend, pendingRequest);
+    expect(harness.delivered).toEqual([]);
+
+    await expect(harness.controller.handlePwrAgentMessagingRequest({
+      operation: "attach_thread_here",
+      context: { backend: "codex", threadId: "thread-1", turnId: "turn-1" },
+      args: { backend, threadId: "thread-2", placement: "current_conversation" },
+    })).resolves.toMatchObject({ ok: true });
+    expect(harness.delivered.filter((intent) => intent.kind === "activity" && intent.state === "active")).toEqual([]);
+    expect(harness.delivered.filter((intent) => intent.kind === "activity").at(-1)).toMatchObject({
+      state: "idle",
+      sessionState: "suspended",
+    });
+    expect(harness.delivered.filter((intent) => intent.kind === "status").at(-1)).toMatchObject({
+      status: "waiting",
+    });
+  });
+
+  it.each(["other-thread", "other-turn"] as const)("ignores a pending request for %s during attachment", async (pending) => {
+    const navigation = buildNavigationSnapshot();
+    navigation.threads.push({ ...navigation.threads[0]!, id: "thread-2" });
+    const harness = await createHarness({
+      navigation,
+      getThreadAdmissionState: async (request) => request.threadId === "thread-2"
+        ? {
+            activeTurn: { backend: "codex", threadId: "thread-2", turnId: "handoff-turn" },
+            pendingRequest: {
+              method: "item/tool/requestUserInput",
+              params: {
+                threadId: pending === "other-thread" ? "thread-3" : "thread-2",
+                turnId: pending === "other-turn" ? "older-turn" : "handoff-turn",
+                requestId: "question-stale",
+                questions: [],
+              },
+            },
+            thread: navigation.threads.at(-1),
+            threadStatus: "active",
+          }
+        : {},
+    });
+    await bindThread(harness);
+    await harness.controller.handleInboundEvent(buildTextEvent("attach another thread"));
+    harness.delivered.length = 0;
+
+    await expect(harness.controller.handlePwrAgentMessagingRequest({
+      operation: "attach_thread_here",
+      context: { backend: "codex", threadId: "thread-1", turnId: "turn-1" },
+      args: { backend: "codex", threadId: "thread-2", placement: "current_conversation" },
+    })).resolves.toMatchObject({ ok: true });
+    expect(harness.delivered.filter((intent) => intent.kind === "activity").at(-1)).toMatchObject({ state: "active" });
+    expect(harness.delivered.filter((intent) => intent.kind === "status").at(-1)).toMatchObject({ status: "working" });
+  });
+
+  it.each(["completed", "waiting", "idle", "failed"] as const)(
+    "does not start typing when an attached turn lookup is %s",
+    async (lookup) => {
+      const navigation = buildNavigationSnapshot();
+      navigation.threads.push({ ...navigation.threads[0]!, id: "thread-2" });
+      const harness = await createHarness({ navigation });
+      await bindThread(harness);
+      await harness.controller.handleInboundEvent(buildTextEvent("attach another thread"));
+      harness.delivered.length = 0;
+      let lookupHandled = false;
+      harness.getThreadAdmissionState.mockImplementation(async (request) => {
+        if (request.threadId !== "thread-2") return {};
+        const snapshot = {
+          activeTurn: { backend: "codex" as const, threadId: "thread-2", turnId: "handoff-turn" },
+          threadStatus: lookup === "idle" ? "idle" as const : "active" as const,
+          thread: navigation.threads.at(-1),
+        };
+        if (!lookupHandled) {
+          lookupHandled = true;
+          if (lookup === "failed") throw new Error("Owner unavailable");
+          if (lookup === "completed") {
+            await harness.controller.handleBackendEvent({
+              backend: "codex",
+              notification: {
+                method: "turn/completed",
+                params: {
+                  threadId: "thread-2",
+                  turnId: "handoff-turn",
+                  turn: { id: "handoff-turn", status: "completed", output: [] },
+                },
+              },
+            } satisfies AgentEvent);
+          }
+          if (lookup === "waiting") {
+            await harness.controller.handleBackendPendingRequest("codex", {
+              method: "item/tool/requestUserInput",
+              params: {
+                threadId: "thread-2",
+                turnId: "newer-turn",
+                requestId: "question-1",
+                questions: [{ id: "q1", header: "Mode", question: "Proceed?", isOther: true, isSecret: false, options: [] }],
+              },
+            });
+          }
+        }
+        return snapshot;
+      });
+
+      await expect(harness.controller.handlePwrAgentMessagingRequest({
+        operation: "attach_thread_here",
+        context: { backend: "codex", threadId: "thread-1", turnId: "turn-1" },
+        args: { backend: "codex", threadId: "thread-2", placement: "current_conversation" },
+      })).resolves.toMatchObject({ ok: true });
+      expect(harness.delivered.filter((intent) => intent.kind === "activity" && intent.state === "active")).toEqual([]);
+      expect(harness.delivered.filter((intent) => intent.kind === "status").at(-1)).toMatchObject({
+        status: lookup === "waiting" ? "waiting" : "idle",
+      });
+    },
+  );
+
+  it.each(["idle", "active", "waiting"] as const)("budgets SQLite writes for attaching a turn (state=%s)", async (state) => {
+    const previous = process.env[SQLITE_WRITE_METRICS_ENV];
+    process.env[SQLITE_WRITE_METRICS_ENV] = "1";
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "pwragent-attach-writes-"));
+    tempDirs.push(tempDir);
+    const db = StateDb.open(path.join(tempDir, "state.db"));
+    try {
+      const navigation = buildNavigationSnapshot();
+      navigation.threads.push({ ...navigation.threads[0]!, id: "thread-2" });
+      const harness = await createHarness({
+        navigation,
+        store: new SqliteMessagingStore(db),
+        getThreadAdmissionState: async (request) => request.threadId === "thread-2"
+          ? {
+              ...(state !== "idle"
+                ? { activeTurn: { backend: "codex", threadId: "thread-2", turnId: "handoff-turn" } }
+                : {}),
+              ...(state === "waiting"
+                ? { pendingRequest: {
+                    method: "item/tool/requestUserInput",
+                    params: { threadId: "thread-2", turnId: "handoff-turn", requestId: "question-1", questions: [] },
+                  } }
+                : {}),
+              thread: navigation.threads.at(-1),
+              threadStatus: state === "idle" ? "idle" : "active",
+            }
+          : {},
+      });
+      await bindThread(harness);
+      await harness.controller.handleInboundEvent(buildTextEvent("attach another thread"));
+      resetSqliteWriteMetrics();
+      const { result, writes } = await measureSqliteWrites(async () =>
+        await harness.controller.handlePwrAgentMessagingRequest({
+          operation: "attach_thread_here",
+          context: { backend: "codex", threadId: "thread-1", turnId: "turn-1" },
+          args: { backend: "codex", threadId: "thread-2", placement: "current_conversation" },
+        }),
+      );
+      expect(result).toMatchObject({ ok: true });
+      harness.controller.dispose();
+      expectSqliteWriteBudget({
+        scenario: `messaging-attach-${state}-turn`,
+        note: state === "waiting"
+          ? "one attachment with a pre-existing pending request: binding/status persistence plus one suspended activity delivery; no new timer or turn-state persistence"
+          : "one attachment: binding/status persistence plus one delivery record only for active typing; no new timer or turn-state persistence",
+        writes,
+      });
+    } finally {
+      db.close();
+      if (previous === undefined) delete process.env[SQLITE_WRITE_METRICS_ENV];
+      else process.env[SQLITE_WRITE_METRICS_ENV] = previous;
+    }
   });
 
   it("reuses one status surface when initial and automatic renders race", async () => {
@@ -12083,6 +12367,135 @@ describe("MessagingController", () => {
       targetKind: "agent_thread",
       preferences: expect.objectContaining({ toolUpdateMode: "show_more" }),
     });
+  });
+
+  it.each([
+    { speed: "Standard", clicks: 1, fastMode: false },
+    { speed: "Fast", clicks: 2, fastMode: true },
+  ])("honors explicit $speed over a remote new-thread Ultrafast launchpad", async ({ speed, clicks, fastMode }) => {
+    const navigation = buildNavigationSnapshot();
+    navigation.launchpadDefaults = {
+      ...navigation.launchpadDefaults,
+      model: "gpt-6-astra",
+      serviceTier: "ultrafast",
+      fastMode: false,
+    };
+    const harness = await createHarness({
+      navigation,
+      listBackends: async () => ({
+        fetchedAt: 1000,
+        backends: [buildBackendSummary({
+          launchpadOptions: {
+            models: [{ id: "gpt-6-astra", supportsFast: true, serviceTiers: ["priority", "ultrafast"] }],
+            supportsFastMode: true,
+          },
+        })],
+      }),
+    });
+
+    await harness.controller.handleInboundEvent(buildCommandEvent("/new"));
+    await harness.controller.handleInboundEvent(buildCallbackEvent({
+      actionId: "browse:select-project",
+      value: {
+        directoryKey: "directory:pwragent",
+        label: "PwrAgent",
+        path: "/repo/pwragent",
+        federationInstanceId: "remote-owner",
+      },
+    }));
+    expect(harness.delivered.at(-1)).toMatchObject({
+      kind: "confirmation",
+      actions: expect.arrayContaining([
+        expect.objectContaining({ id: "browse:new:fast", label: "Speed: ultrafast" }),
+      ]),
+    });
+
+    for (let click = 0; click < clicks; click += 1) {
+      await harness.controller.handleInboundEvent(buildCallbackEvent({ actionId: "browse:new:fast" }));
+    }
+    expect(harness.delivered.at(-1)).toMatchObject({
+      kind: "confirmation",
+      actions: expect.arrayContaining([
+        expect.objectContaining({ id: "browse:new:fast", label: `Speed: ${speed.toLowerCase()}` }),
+      ]),
+    });
+    expect(harness.updateDirectoryLaunchpad).not.toHaveBeenCalled();
+
+    await harness.controller.handleInboundEvent(buildTextEvent("Use the selected speed"));
+    expect(harness.materializeDirectoryLaunchpad).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        federationTarget: { scope: "remote", instanceId: "remote-owner" },
+        launchpad: expect.objectContaining({ model: "gpt-6-astra", serviceTier: undefined, fastMode }),
+      }),
+      expectMaterializeOptions(),
+    );
+  });
+
+  it.each([
+    { initialFast: false, clicks: 2 },
+    { initialFast: true, clicks: 1 },
+  ])("cycles new-thread speeds using the projected directory model (initialFast=$initialFast)", async ({ initialFast, clicks }) => {
+    const navigation = buildNavigationSnapshot();
+    navigation.launchpadDefaults = { ...navigation.launchpadDefaults, model: "gpt-6.1-sol", fastMode: false };
+    const directory = navigation.directories[0]!;
+    directory.launchpad = {
+      backend: "codex",
+      directoryKey: directory.key,
+      directoryKind: directory.kind,
+      directoryLabel: directory.label,
+      directoryPath: directory.path,
+      executionMode: "default",
+      model: "gpt-6-astra",
+      fastMode: initialFast,
+      prompt: "",
+      workMode: "local",
+      createdAt: 1000,
+      updatedAt: 1000,
+    };
+    const harness = await createHarness({
+      navigation,
+      listBackends: async () => ({
+        fetchedAt: 1000,
+        backends: [buildBackendSummary({
+          launchpadOptions: {
+            models: [
+              { id: "gpt-6.1-sol", supportsFast: true, current: true, serviceTiers: ["priority"] },
+              { id: "gpt-6-astra", supportsFast: true, serviceTiers: ["priority", "ultrafast"] },
+            ],
+            supportsFastMode: true,
+          },
+        })],
+      }),
+    });
+
+    await harness.controller.handleInboundEvent(buildCommandEvent("/new"));
+    await harness.controller.handleInboundEvent(buildCallbackEvent({
+      actionId: "browse:select-project",
+      value: { directoryKey: directory.key, label: directory.label, path: "/repo/pwragent" },
+    }));
+    expect(harness.delivered.at(-1)).toMatchObject({
+      kind: "confirmation",
+      body: expect.stringContaining("Model: gpt-6-astra"),
+      actions: expect.arrayContaining([
+        expect.objectContaining({ id: "browse:new:fast", label: `Speed: ${initialFast ? "fast" : "standard"}` }),
+      ]),
+    });
+    for (let click = 0; click < clicks; click += 1) {
+      await harness.controller.handleInboundEvent(buildCallbackEvent({ actionId: "browse:new:fast" }));
+    }
+    expect(harness.delivered.at(-1)).toMatchObject({
+      kind: "confirmation",
+      actions: expect.arrayContaining([
+        expect.objectContaining({ id: "browse:new:fast", label: "Speed: ultrafast" }),
+      ]),
+    });
+    await harness.controller.handleInboundEvent(buildTextEvent("Use the directory model"));
+    expect(harness.materializeDirectoryLaunchpad).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        launchpad: expect.objectContaining({ model: "gpt-6-astra", serviceTier: "ultrafast", fastMode: false }),
+      }),
+      expectMaterializeOptions(),
+    );
   });
 
   it("reports zero create-capable backends before opening the new-thread picker", async () => {
@@ -17933,6 +18346,85 @@ describe("MessagingController", () => {
     expect(idleActivityIndex).toBeGreaterThan(finalStreamIndex);
   });
 
+  it("does not post the final answer again when Telegram stream cleanup fails", async () => {
+    let now = 1000;
+    let messageId = 200;
+    const api = {
+      sendMessage: vi.fn(async (_request: TelegramSendMessageRequest) => ({
+        chat: { id: 777, type: "private" as const }, message_id: messageId++,
+      })),
+      editMessageText: vi.fn(async (request: TelegramEditMessageTextRequest) => ({
+        chat: { id: 777, type: "private" as const }, message_id: request.message_id,
+      })),
+      sendRichMessage: vi.fn(async () => ({
+        chat: { id: 777, type: "private" as const }, message_id: 300,
+      })),
+      deleteMessage: vi.fn(async () => { throw new Error("Deletion failed."); }),
+    };
+    const telegram = new TelegramAdapter({
+      api: api as unknown as TelegramBotApi,
+      config: { botToken: "test-token", channel: "telegram", authorizedActorIds: [], streamingResponses: true },
+      now: () => now,
+    });
+    const delivered: MessagingSurfaceIntent[] = [];
+    let finalDelivery: MessagingDeliveryResult | undefined;
+    try {
+      const harness = await createHarness({
+        streamingResponsesDefault: true,
+        now: () => now,
+        deliver: async (intent) => {
+          delivered.push(intent);
+          if (intent.kind === "stream_update" || (intent.kind === "message" && intent.role === "assistant")) {
+            const result = await telegram.deliver({
+              ...intent,
+              audit: {
+                actor: { platformUserId: "42" },
+                channel: { channel: "telegram", conversation: { id: "777", kind: "dm" } },
+                occurredAt: now,
+              },
+            });
+            if (intent.kind === "stream_update" && intent.stream.isFinal) finalDelivery = result;
+            return result;
+          }
+          return { channel: "telegram", deliveredAt: now, outcome: "presented" };
+        },
+      });
+      await bindThread(harness);
+      delivered.length = 0;
+      const partial = `# Downloads\n\n${"x".repeat(4200)}`;
+      for (const delta of [partial, " continued"]) {
+        await harness.controller.handleBackendEvent({
+          backend: "codex",
+          notification: {
+            method: "item/agentMessage/delta",
+            params: { threadId: "thread-1", turnId: "turn-1", itemId: "item-1", delta },
+          },
+        } satisfies AgentEvent);
+        now += 1500;
+      }
+      expect(api.sendMessage).toHaveBeenCalledTimes(2);
+      await harness.controller.handleBackendEvent({
+        backend: "codex",
+        notification: {
+          method: "item/completed",
+          params: {
+            threadId: "thread-1", turnId: "turn-1",
+            item: { id: "item-1", type: "agentMessage", text: `${partial} complete` },
+          },
+        },
+      } satisfies AgentEvent);
+      expect(finalDelivery).toMatchObject({ outcome: "updated", surface: { id: "200" } });
+      expect(api.deleteMessage).toHaveBeenCalledTimes(1);
+      expect(api.editMessageText).toHaveBeenCalledTimes(1);
+      expect(api.editMessageText.mock.calls[0]?.[0].rich_message?.html).toContain("<h1>Downloads</h1>");
+      expect(api.sendMessage).toHaveBeenCalledTimes(2);
+      expect(api.sendRichMessage).not.toHaveBeenCalled();
+      expect(delivered.filter((intent) => intent.kind === "message" && intent.role === "assistant")).toEqual([]);
+    } finally {
+      await telegram.stop();
+    }
+  });
+
   it("delivers the final assistant message when stream updates are discarded", async () => {
     const delivered: MessagingSurfaceIntent[] = [];
     const harness = await createHarness({
@@ -21893,6 +22385,47 @@ describe("MessagingController", () => {
         ],
       }),
     );
+  });
+
+  it("does not revive a binding's Ultrafast preference after the owner selects Standard", async () => {
+    const navigation = buildNavigationSnapshot();
+    navigation.threads[0] = { ...navigation.threads[0]!, fastMode: false, model: "gpt-6-astra" };
+    const harness = await createHarness({ navigation });
+    await harness.store.upsertBinding({
+      id: "speed-binding", authorizedActorIds: ["user-1"], backend: "codex",
+      channel: buildTextEvent("continue").channel, createdAt: 1000, updatedAt: 1000,
+      targetKind: "thread", threadId: "thread-1",
+      preferences: { serviceTier: "ultrafast", fastMode: false, updatedAt: 1000 },
+    });
+    await harness.controller.handleInboundEvent(buildTextEvent("continue"));
+    expect(harness.startTurn).toHaveBeenLastCalledWith(expect.objectContaining({
+      serviceTier: undefined, fastMode: false,
+    }));
+  });
+
+  it("cycles advertised Ultrafast through messaging and preserves it for the next turn", async () => {
+    const harness = await createHarness({
+      listBackends: async () => ({ fetchedAt: 1000, backends: [buildBackendSummary({
+        launchpadOptions: {
+          models: [{ id: "gpt-5.3-codex", supportsFast: true, serviceTiers: ["priority", "ultrafast"] }],
+          supportsFastMode: true,
+        },
+      })] }),
+    });
+    await bindThread(harness);
+    await harness.controller.handleInboundEvent(buildCallbackEvent({ actionId: "status:fast" }));
+    await harness.controller.handleInboundEvent(buildCallbackEvent({ actionId: "status:fast" }));
+    expect(harness.setThreadModelSettings).toHaveBeenLastCalledWith(expect.objectContaining({
+      serviceTier: "ultrafast", fastMode: false,
+    }));
+    await harness.controller.handleInboundEvent(buildTextEvent("please run tests"));
+    expect(harness.startTurn).toHaveBeenLastCalledWith(expect.objectContaining({
+      serviceTier: "ultrafast", fastMode: false,
+    }));
+    await harness.controller.handleInboundEvent(buildCallbackEvent({ actionId: "status:fast" }));
+    expect(harness.setThreadModelSettings).toHaveBeenLastCalledWith(expect.objectContaining({
+      serviceTier: undefined, fastMode: false,
+    }));
   });
 
   it("toggles fast mode and applies it to later free-form turns", async () => {

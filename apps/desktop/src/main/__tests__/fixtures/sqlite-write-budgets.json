@@ -34,6 +34,34 @@
     "rowsChanged": 2,
     "statements": 2
   },
+  "archive-retention-acp-delete": {
+    "commits": 1,
+    "note": "One permanent ACP deletion removes one metadata row; no recurring writes.",
+    "observedWalBytes": 12360,
+    "rowsChanged": 1,
+    "statements": 1
+  },
+  "archive-retention-delete-batch": {
+    "commits": 1,
+    "note": "One transaction releases 100 overlays after permanent provider deletion.",
+    "observedWalBytes": 41200,
+    "rowsChanged": 100,
+    "statements": 100
+  },
+  "archive-retention-idle-day": {
+    "commits": 0,
+    "note": "24 hourly retention observations and reads after initial discovery: zero commits, 0 MB/day.",
+    "observedWalBytes": 0,
+    "rowsChanged": 0,
+    "statements": 0
+  },
+  "archive-retention-initial-batch": {
+    "commits": 1,
+    "note": "One discovery transaction for 100 existing archives; no per-item commits.",
+    "observedWalBytes": 41200,
+    "rowsChanged": 100,
+    "statements": 100
+  },
   "auto-access-selection": {
     "commits": 2,
     "note": "one operator mode selection and permission audit; no per-review persistence",
@@ -83,6 +111,8 @@
     "rowsChanged": 49,
     "statements": 45
   },
+  "codex-ultrafast-profile-reset": {"commits": 3, "note": "one explicit profile reset of one Ultrafast thread, one launchpad and sticky defaults", "observedWalBytes": 16480, "rowsChanged": 13, "statements": 8},
+  "codex-ultrafast-selection": {"commits": 1, "note": "one persisted thread speed selection; no extra writes per turn or streamed event", "observedWalBytes": 16480, "rowsChanged": 1, "statements": 1},
   "completed-questionnaire-transcript": {
     "commits": 1,
     "note": "persist one completed questionnaire transcript summary",
@@ -279,6 +309,41 @@
     "rowsChanged": 0,
     "statements": 0
   },
+  "inactive-acp-thread-archive-day": {
+    "commits": 2,
+    "note": "One stale ACP session archive followed by 23 idle hourly sweeps. Two boundary commits per archive (ACP metadata and retention observation); no heartbeat writes.",
+    "observedWalBytes": 28840,
+    "rowsChanged": 2,
+    "statements": 2
+  },
+  "inactive-thread-archive-restore": {
+    "commits": 2,
+    "note": "One age-eligible conversation archived and restored: two boundary commits for retention observation and restore; subsequent sweep writes nothing.",
+    "observedWalBytes": 32960,
+    "rowsChanged": 2,
+    "statements": 2
+  },
+  "inactive-thread-sweep-dirty": {
+    "commits": 0,
+    "note": "A stale dirty worktree is checked and kept, with no SQLite writes (0 MB/day).",
+    "observedWalBytes": 0,
+    "rowsChanged": 0,
+    "statements": 0
+  },
+  "inactive-thread-sweep-idle-day": {
+    "commits": 0,
+    "note": "24 hourly sweeps of an unchanged restored thread: read-only, 0 MB/day of SQLite writes.",
+    "observedWalBytes": 0,
+    "rowsChanged": 0,
+    "statements": 0
+  },
+  "inactive-thread-worktree-archive": {
+    "commits": 2,
+    "note": "One successful automatic worktree archive persists a recoverable snapshot at the archive boundary; no heartbeat writes.",
+    "observedWalBytes": 32960,
+    "rowsChanged": 2,
+    "statements": 2
+  },
   "live-thread-token-usage": {
     "commits": 1,
     "note": "500 cumulative usage observations across 10 turns, then one terminal flush",
@@ -370,6 +435,7 @@
     "rowsChanged": 0,
     "statements": 0
   },
+  "mcp-automation-native-consent": {"commits": 0, "note": "Native automation MCP consent checks the in-memory run grant and reads the Agent selection without adding SQLite commits.", "observedWalBytes": 0, "rowsChanged": 0, "statements": 0},
   "mcp-gateway-discovery-and-invocation": {
     "commits": 0,
     "note": "Fixed MCP gateway discovery and one scoped approved call use in-memory catalogs and the existing event flow, with no additional SQLite commits.",
@@ -391,6 +457,21 @@
     "rowsChanged": 5,
     "statements": 5
   },
+  "messaging-attach-active-turn": {
+    "commits": 9,
+    "note": "one attachment: binding/status persistence plus one delivery record only for active typing; no new timer or turn-state persistence",
+    "observedWalBytes": 107120,
+    "rowsChanged": 7,
+    "statements": 9
+  },
+  "messaging-attach-idle-turn": {
+    "commits": 8,
+    "note": "one attachment: binding/status persistence plus one delivery record only for active typing; no new timer or turn-state persistence",
+    "observedWalBytes": 94760,
+    "rowsChanged": 6,
+    "statements": 8
+  },
+  "messaging-attach-waiting-turn": {"commits": 9, "note": "one attachment with a pre-existing pending request: binding/status persistence plus one suspended activity delivery; no new timer or turn-state persistence", "observedWalBytes": 107120, "rowsChanged": 7, "statements": 9},
   "messaging-binding-revoke": {
     "commits": 11,
     "note": "one bus-driven binding revoke including Agent Session close status",
@@ -433,10 +514,24 @@
     "rowsChanged": 1,
     "statements": 1
   },
+  "native-subagent-activity-boundaries": {
+    "commits": 2,
+    "note": "One native worker start and completion; duplicate and interaction reports write nothing. At 100 workers/day, two commits/worker project to approximately 4.1 MB/day with no idle writes.",
+    "observedWalBytes": 41200,
+    "rowsChanged": 2,
+    "statements": 2
+  },
   "native-subagent-discovery-backfill": {
     "commits": 2,
     "note": "one missing native child pricing row and parent sub-agent card discovered from the thread list",
     "observedWalBytes": 82400,
+    "rowsChanged": 4,
+    "statements": 4
+  },
+  "native-subagent-model-repair": {
+    "commits": 2,
+    "note": "One worker's model-less usage line filled in place and its card given the model, once; repeated discovery writes nothing. At 100 legacy workers, approximately 7 MB once, then nothing.",
+    "observedWalBytes": 70040,
     "rowsChanged": 4,
     "statements": 4
   },
@@ -446,6 +541,34 @@
     "observedWalBytes": 65920,
     "rowsChanged": 3,
     "statements": 3
+  },
+  "native-subagent-replay-repair": {
+    "commits": 1,
+    "note": "One persisted worker terminal correction; repeated recovery makes no commits. At 100 repairs/day, approximately 1.6 MB/day, with no idle writes.",
+    "observedWalBytes": 16480,
+    "rowsChanged": 1,
+    "statements": 1
+  },
+  "native-subagent-status-repair": {
+    "commits": 1,
+    "note": "One persisted worker terminal correction; repeated recovery makes no commits. At 100 repairs/day, approximately 1.6 MB/day, with no idle writes.",
+    "observedWalBytes": 16480,
+    "rowsChanged": 1,
+    "statements": 1
+  },
+  "native-subagent-usage-burst": {
+    "commits": 2,
+    "note": "20 native worker usage updates in one burst, then the worker's turn end writes the line and the card",
+    "observedWalBytes": 82400,
+    "rowsChanged": 4,
+    "statements": 4
+  },
+  "native-subagent-usage-spaced": {
+    "commits": 2,
+    "note": "20 native worker usage updates a second or more apart, then the worker's turn end writes the line and the card; was 2 commits per update",
+    "observedWalBytes": 82400,
+    "rowsChanged": 4,
+    "statements": 4
   },
   "navigation-append-thread-pin": {
     "commits": 1,
@@ -558,6 +681,13 @@
     "observedWalBytes": 0,
     "rowsChanged": 0,
     "statements": 0
+  },
+  "new-thread-mcp-default-selection": {
+    "commits": 1,
+    "note": "Persist two default MCP ids together once at thread creation, with no writes per connection or streamed event. At 100 new threads/day this adds approximately 1.6 MB/day of WAL and no idle writes.",
+    "observedWalBytes": 16480,
+    "rowsChanged": 1,
+    "statements": 1
   },
   "owner-pr-candidate-bootstrap": {
     "commits": 1,

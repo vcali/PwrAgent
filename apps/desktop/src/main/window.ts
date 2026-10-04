@@ -33,6 +33,7 @@ import { isSafeExternalOpenUrl } from "./external-url-policy";
 import { getMainLogger } from "./log";
 import { mainWindowChromeOptions } from "./main-window-chrome";
 import { lockMainWindowTitle, mainWindowTitle } from "./main-window-title";
+import { attachRendererProcessRecovery } from "./renderer-process-recovery";
 import { recordStartupProfileEvent } from "./diagnostics/startup-profile-events";
 import { resolveActiveProfilePath } from "./profile";
 import {
@@ -50,6 +51,7 @@ import {
   AGENT_EVENT_CHANNEL,
   APPEARANCE_CHANGED_EVENT_CHANNEL,
   CODEX_RESTART_STATUS_CHANGED_EVENT_CHANNEL,
+  THREAD_ARCHIVE_SWEEP_STATUS_CHANGED_EVENT_CHANNEL,
   DIAGNOSTICS_HEAP_SNAPSHOT_CAPTURED_EVENT_CHANNEL,
   GITHUB_PR_AUTHENTICATION_FAILURE_EVENT_CHANNEL,
   GITHUB_PR_SAML_ENFORCEMENT_EVENT_CHANNEL,
@@ -899,6 +901,7 @@ export function createMainWindow(options?: {
   }
 
   applyWindowSecurityHardening(window);
+  attachRendererProcessRecovery(window);
   // Local main windows receive CPU capture notices. Federation viewers
   // also host the app shell, but must not receive local CPU notices.
   // Secondary windows register a narrower
@@ -914,6 +917,7 @@ export function createMainWindow(options?: {
     // This machine's Codex process; a remote peer's window must not offer to
     // restart it.
     ...(options?.federationTarget ? [] : [CODEX_RESTART_STATUS_CHANGED_EVENT_CHANNEL]),
+    ...(options?.federationTarget ? [] : [THREAD_ARCHIVE_SWEEP_STATUS_CHANGED_EVENT_CHANNEL]),
     INTEGRATED_TERMINAL_REVEAL_CHANNEL,
     INTEGRATED_TERMINAL_SESSIONS_CHANNEL,
     MANAGED_GROK_SIGNATURE_REJECTED_EVENT_CHANNEL,

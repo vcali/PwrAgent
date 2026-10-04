@@ -1707,7 +1707,7 @@ describe("SettingsScreen", () => {
     openDiscontinuedDrawer();
     expect(
       screen.getByText(
-        "Send focused-diff hunks to Codex to decide which are safe to hide. Disabled by default — every diff renders in full and no structured-generation request fires. AI Providers → Default Models picks the model.",
+        "Send focused-diff hunks to Codex to decide which are safe to hide. Disabled by default — every diff renders in full and no structured-generation request fires.",
       ),
     ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("switch", { name: "Enable diff condensation" }));
@@ -2145,12 +2145,12 @@ describe("SettingsScreen", () => {
   });
 
   it("copies Troubleshooting diagnostics with the profile, PIDs, and log path", async () => {
-    const copyText = vi.fn(async () => undefined);
+    const copyRichText = vi.fn(async () => undefined);
 
     render(
       <SettingsScreen
         desktopApi={{
-          copyText,
+          copyRichText,
           readAppMetadata: vi.fn(async () => ({
             applicationName: "PwrAgent",
             applicationVersion: "1.2.3",
@@ -2183,24 +2183,28 @@ describe("SettingsScreen", () => {
     fireEvent.click(copyButton);
 
     await waitFor(() => {
-      expect(copyText).toHaveBeenLastCalledWith([
-        "Collected at (UTC): 2026-09-14T04:30:45.123Z",
-        "PwrAgent version: 1.2.3",
-        "PwrAgent build: Packaged",
-        "PwrAgent profile: work",
-        "Main process PID: 4100",
-        "Renderer process PID: 4101",
-        "PwrAgent log path: /Users/operator/Library/Logs/PwrAgent/profile-work.main.log",
-      ].join("\n"));
+      expect(copyRichText).toHaveBeenLastCalledWith({
+        text: [
+          "Collected at (UTC): 2026-09-14T04:30:45.123Z",
+          "PwrAgent version: 1.2.3",
+          "PwrAgent build: Packaged",
+          "PwrAgent profile: work",
+          "Main process PID: 4100",
+          "Renderer process PID: 4101",
+          "PwrAgent log path: /Users/operator/Library/Logs/PwrAgent/profile-work.main.log",
+        ].join("\n"),
+        html: expect.stringContaining("<pre><code>Collected at (UTC):"),
+      });
     });
 
     timestamp.mockReturnValue("2026-09-14T04:35:00.000Z");
     fireEvent.click(copyButton);
 
     await waitFor(() => {
-      expect(copyText).toHaveBeenLastCalledWith(expect.stringContaining(
-        "Collected at (UTC): 2026-09-14T04:35:00.000Z",
-      ));
+      expect(copyRichText).toHaveBeenLastCalledWith({
+        text: expect.stringContaining("Collected at (UTC): 2026-09-14T04:35:00.000Z"),
+        html: expect.stringContaining("<pre><code>Collected at (UTC): 2026-09-14T04:35:00.000Z"),
+      });
     });
   });
 
@@ -2493,6 +2497,36 @@ describe("SettingsScreen", () => {
         experimental: { markdownMathRendering: false },
       });
     });
+  });
+
+  it("refreshes Archived Threads after leaving and reopening the tab", async () => {
+    const listThreads = vi.fn(async () => ({ backend: "all" as const, fetchedAt: Date.now(), threads: [] as AppServerThreadSummary[] }));
+    render(<SettingsScreen desktopApi={{ listThreads }} settings={createSettingsState()} initialSection="archived" onClose={() => undefined} />);
+    await waitFor(() => expect(listThreads).toHaveBeenCalledExactlyOnceWith({ archived: true }));
+    fireEvent.click(screen.getByRole("button", { name: "General" }));
+    const thread: AppServerThreadSummary = {
+      id: "swept-thread", title: "Automatically archived thread", titleSource: "explicit", source: "codex", linkedDirectories: [],
+    };
+    listThreads.mockResolvedValue({ backend: "all", fetchedAt: Date.now(), threads: [thread] });
+    fireEvent.click(screen.getByRole("button", { name: "Archived Threads" }));
+    expect(await screen.findByText(thread.title)).toBeInTheDocument();
+    expect(listThreads).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows recovery snapshots and the permanent deletion deadline in Archived Threads", async () => {
+    const startedAt = new Date("2026-10-01T12:00:00Z").getTime();
+    const thread: AppServerThreadSummary = {
+      id: "expiry-details", title: "Archive with snapshot", titleSource: "explicit", source: "codex", linkedDirectories: [],
+      archiveRetentionStartedAt: startedAt,
+      worktreeSnapshots: [createArchivedSnapshot("expiry-details", startedAt)],
+    };
+    const settings = createSettingsState();
+    settings.snapshot!.worktrees.archive = { enabled: true, mode: "count", inactivityDays: 7, keepPerProject: 20, retentionDays: 30 };
+    const listThreads = vi.fn(async () => ({ backend: "all" as const, fetchedAt: Date.now(), threads: [thread] }));
+    render(<SettingsScreen desktopApi={{ listThreads }} settings={settings} initialSection="archived" onClose={() => undefined} />);
+    expect(await screen.findByText("Archive with snapshot")).toBeInTheDocument();
+    expect(screen.getByText(/1 recovery snapshot/)).toBeInTheDocument();
+    expect(screen.getByText(/Permanent deletion (after|pending since)/)).toHaveTextContent(new Date(startedAt + 30 * 86_400_000).toLocaleString());
   });
 
   it("lists archived threads and restores one", async () => {
@@ -3525,20 +3559,20 @@ describe("SettingsScreen", () => {
     expect(scheduledDialog).not.toBeInTheDocument();
 
     fireEvent.click(
-      screen.getByRole("button", { name: "Turn Fast off everywhere" }),
+      screen.getByRole("button", { name: "Use Standard speed everywhere" }),
     );
     const fastConfirmation =
-      await screen.findByText("Turn Fast off everywhere?");
+      await screen.findByText("Use Standard speed everywhere?");
     expect(fastConfirmation.closest(".settings-field")).toHaveTextContent(
       "Codex",
     );
     expect(fastConfirmation.closest(".settings-field")).toHaveTextContent(
-      "Fast mode",
+      "Fast and Ultrafast",
     );
     expect(
-      screen.queryByRole("button", { name: "Turn Fast off everywhere" }),
+      screen.queryByRole("button", { name: "Use Standard speed everywhere" }),
     ).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Turn Fast off" }));
+    fireEvent.click(screen.getByRole("button", { name: "Use Standard speed" }));
     await waitFor(() => {
       expect(turnOffCodexFastEverywhere).toHaveBeenCalledTimes(1);
     });
@@ -3549,12 +3583,12 @@ describe("SettingsScreen", () => {
     ).toBeInTheDocument();
 
     fireEvent.click(
-      screen.getByRole("switch", { name: "Allow Codex Fast mode" }),
+      screen.getByRole("switch", { name: "Allow Codex Fast and Ultrafast" }),
     );
     expect(
-      await screen.findByText("Prohibit Fast for this profile?"),
+      await screen.findByText("Prohibit Fast and Ultrafast for this profile?"),
     ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Turn Fast off" }));
+    fireEvent.click(screen.getByRole("button", { name: "Use Standard speed" }));
     await waitFor(() => {
       expect(settings.writeConfig).toHaveBeenCalledWith({
         models: {
@@ -3811,6 +3845,70 @@ describe("SettingsScreen", () => {
       onClose={() => undefined}
     />);
     expect(toggle).toBeDisabled();
+  });
+
+  it("offers default-off diagnostic capture inside Token Miser", async () => {
+    const snapshot = createSnapshot();
+    snapshot.experimental.tokenMiserEnabled = { value: true, source: "config" };
+    const settings = createSettingsState(snapshot);
+    const view = render(<SettingsScreen
+      desktopApi={{} as Parameters<typeof SettingsScreen>[0]["desktopApi"]}
+      initialSection="experimental"
+      settings={settings}
+      onClose={() => undefined}
+    />);
+    const toggle = screen.getByRole("switch", {
+      name: "Capture diagnostic samples — Token Miser",
+    });
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(toggle);
+    await waitFor(() => expect(settings.writeConfig).toHaveBeenCalledWith({
+      experimental: { tokenMiserDiagnosticsEnabled: true },
+    }));
+    view.rerender(<SettingsScreen
+      desktopApi={{} as Parameters<typeof SettingsScreen>[0]["desktopApi"]}
+      initialSection="experimental"
+      settings={createSettingsState({
+        ...snapshot,
+        experimental: {
+          ...snapshot.experimental,
+          tokenMiserEnabled: { value: false, source: "config" },
+        },
+      })}
+      onClose={() => undefined}
+    />);
+    expect(toggle).toBeDisabled();
+  });
+
+  it("shows where diagnostic samples are saved and opens the folder", async () => {
+    const directory = "/tmp/pwragent/state/token-miser/diagnostics";
+    const snapshot = createSnapshot();
+    snapshot.experimental.tokenMiserEnabled = { value: true, source: "config" };
+    snapshot.runtime.tokenMiserDiagnosticsDirectory = directory;
+    const openPath = vi.fn()
+      .mockResolvedValueOnce({ opened: false, error: `Path does not exist: ${directory}`, missing: true })
+      .mockResolvedValueOnce({ opened: true });
+    render(<SettingsScreen
+      desktopApi={{ openPath } as unknown as Parameters<typeof SettingsScreen>[0]["desktopApi"]}
+      initialSection="experimental"
+      settings={createSettingsState(snapshot)}
+      onClose={() => undefined}
+    />);
+
+    // Capture is off, but saved files outlive the switch, so the folder shows.
+    expect(screen.getByRole("switch", {
+      name: "Capture diagnostic samples — Token Miser",
+    })).toHaveAttribute("aria-checked", "false");
+    expect(screen.getByText(directory)).toBeInTheDocument();
+
+    const open = screen.getByRole("button", { name: "Open folder" });
+    fireEvent.click(open);
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("No samples saved yet."));
+    expect(openPath).toHaveBeenCalledWith({ path: directory });
+
+    fireEvent.click(open);
+    await waitFor(() => expect(openPath).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByRole("status")).toBeEmptyDOMElement());
   });
 
   it("lets an available Token Miser experiment default threads on or off", async () => {
@@ -8809,8 +8907,8 @@ describe("SettingsScreen", () => {
     const subLabels = Array.from(
       nav.querySelectorAll("#settings-nav-sublist-models .settings-nav__sublabel"),
     ).map((label) => label.textContent);
-    // Default Models leads the list; providers follow in their own order.
-    expect(subLabels).toEqual(["Default Models", "Codex", "Grok", "Gemini CLI"]);
+    // Providers only: the Helper model row lives on the AI Providers page.
+    expect(subLabels).toEqual(["Codex", "Grok", "Gemini CLI"]);
     const geminiButton = within(nav).getByRole("button", {
       name: /Gemini CLI/,
     });

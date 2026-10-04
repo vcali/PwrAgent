@@ -3,6 +3,7 @@ export * from "./backend-selection";
 export * from "./command-action-labels";
 export * from "./codex-environment-action-runs";
 export * from "./codex-turn-error";
+export * from "./codex-speed";
 export * from "./codex-git-action-directives";
 export * from "./codex-async-questions";
 export * from "./contracts/backend";
@@ -76,6 +77,7 @@ export * from "./thread-incident-summary";
 
 export * from "./thread-tool-display";
 export * from "./subagent-kind";
+export * from "./subagent-activity";
 
 export * from "./forge-product";
 export { isCodexAuthenticationFailure } from "./codex-authentication";
@@ -87,3 +89,4 @@ export * from "./thread-search-query";
 export * from "./contracts/usage-activity";
 
 export * from "./contracts/background-terminals";
+export * from "./thread-archive-policy";

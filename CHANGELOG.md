@@ -1,5 +1,27 @@
 # Changelog
 
+## v1.1.6 - 2026-10-02
+
+- Live Voice - Talk to local Codex threads, or use Director voice to check on work, start threads, and steer agents across connected machines, with transcripts and action receipts.
+- Thread Housekeeping - Automatically archive inactive threads by age or project limits while protecting active work and pins. Optional permanent deletion remains disabled by default.
+- Model Controls - Simplified helper defaults to one model and reasoning setting. Added Ultrafast controls when the Codex runtime advertises support.
+- Agent Tools - Fixed Full Access and automation MCP grants, and applied configured MCP defaults consistently to messaging and delegated threads.
+- Work Visibility - Restored Codex sub-agent visibility, cleared phantom background commands, and synchronized turn-error dismissal.
+- Federation - Improved machine identification and remote-thread controls, including keeping mounted remote threads pinned at the top.
+- Everyday Work - Improved automation-editor navigation and attachment browsing.
+- Token Miser - Preserved explicitly requested historical output and added opt-in diagnostic capture for investigating summarization problems.
+
+## v1.1.5 - 2026-10-02
+
+- Federated Work - Copy or move Codex conversations and their Git workspace between compatible machines, preserving history and uncommitted work; choose where new threads and worktree sub-threads run.
+- Star Map and References - Open instances directly from the Federation preview, identify machines with shared short names, and mention machines and profiles in the composer.
+- Helper Models - Choose model and reasoning defaults for thread titles, monitors, Token Miser, usage analysis, and other automatic helper turns in Settings.
+- Usage and Cost - See account-limit pace and projections in Pricing and AI Providers, with a 30-day Usage Activity view and corrected Grok helper pricing.
+- Linux Downloads - Added Fedora RPMs, Arch/Omarchy pacman packages, and tar.gz archives for x64 and arm64 alongside DEBs.
+- Background Commands - Inspect output and runtime details and stop Codex background commands from the Actions rail while continuing the conversation.
+- Thread Organization - Keep selected pins above newly created threads and restore archived threads in place.
+- Everyday Reliability - Added buttons to awaited private messaging replies, improved incoming file-transfer recovery, kept document viewers open across thread updates, and reduced repeated navigation and archive-loading work.
+
 ## v1.1.4 - 2026-09-30
 
 - Models - Added GPT-6.1 Sol to the model picker with usage pricing.

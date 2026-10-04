@@ -1,3 +1,5 @@
+import { CODEX_SPEED_LABELS, codexSpeedOptions, codexSpeedSettings, selectedCodexSpeed, type CodexSpeed } from "@pwragent/shared";
+import { NativeVoiceBar, isNativeVoiceApi, threadVoiceTarget } from "../native-voice/NativeVoice";
 import { ReviewLocationDropdown } from "./ReviewLocationDropdown";
 import {
   EXPLICIT_REVIEW_PULL_REQUEST_URL,
@@ -201,6 +203,9 @@ import {
 } from "./composer-image-files";
 import { HighlightedAutocompleteLabel } from "./HighlightedAutocompleteLabel";
 import { ComposerErrorRail, type ComposerErrorEntry } from "./ComposerErrorRail";
+import { EnvironmentSetupRow, type EnvironmentSetupRowModel } from "./EnvironmentSetupRow";
+import { LinkedTurnFailureMessage } from "../notifications/LinkedTurnFailureMessage";
+import { turnFailureAcknowledgements, turnFailureScopeKey } from "../notifications/turn-failure-acknowledgements";
 import { findSlashCommandTrigger } from "./composer-slash-commands";
 import { ComposerTiptapInput } from "./ComposerTiptapInput";
 import { ProjectDestinationCombobox } from "./ProjectDestinationCombobox";
@@ -332,6 +337,8 @@ type ComposerProps = {
   ) => void;
   hiddenEnvActionRunIds?: ReadonlySet<string>;
   showEnvActionAnchors?: boolean;
+  /** Environment setup progress or failure, as a row in the band. */
+  environmentSetup?: EnvironmentSetupRowModel;
   onBeforeSendTurn?: () => void;
   onPendingStatusChange?: (status?: string) => void;
   /**
@@ -513,6 +520,53 @@ type ComposerPdfReference = {
   path: string;
 };
 
+/** One expandable thumbnail in the attachment strip, as the lightbox shows it. */
+type ComposerStripLightboxItem = {
+  alt: string;
+  caption?: string;
+  dialogLabel?: string;
+  key: string;
+  src: string;
+};
+
+function imageStripItemKey(attachment: ComposerImageAttachment): string {
+  return `image:${attachment.id}`;
+}
+
+function pdfStripItemKey(path: string): string {
+  return `pdf:${path}`;
+}
+
+/** The strip's expandable thumbnails in the order it draws them. A PDF joins
+ *  only once its page preview is ready, because until then it has no image. */
+function composerStripLightboxItems(
+  imageAttachments: readonly ComposerImageAttachment[],
+  pdfReferences: readonly ComposerPdfReference[],
+  pdfPreviewStates: ReadonlyMap<string, ComposerPdfPreviewState>,
+): ComposerStripLightboxItem[] {
+  const items: ComposerStripLightboxItem[] = imageAttachments.map(
+    (attachment, index) => ({
+      alt: formatPastedImageAlt(attachment, index),
+      key: imageStripItemKey(attachment),
+      src: attachment.url,
+    }),
+  );
+  for (const reference of pdfReferences) {
+    const state = pdfPreviewStates.get(reference.path);
+    if (state?.status !== "ready") {
+      continue;
+    }
+    items.push({
+      alt: `Page 1 preview of ${reference.label}`,
+      caption: `${reference.label} · Page 1 of ${state.preview.pageCount}`,
+      dialogLabel: `PDF preview: ${reference.label}`,
+      key: pdfStripItemKey(reference.path),
+      src: state.preview.dataUrl,
+    });
+  }
+  return items;
+}
+
 const EMPTY_COMPOSER_REFERENCE_INSPECTION: ComposerReferenceInspection = {
   filePaths: [],
   pdfPaths: [],
@@ -682,6 +736,14 @@ type ReviewWorkspaceOption = {
 };
 
 const DEFAULT_REASONING_EFFORT = "medium";
+
+// Fast keeps the Fast toggle's own tooltip copy. Ultrafast claims only what
+// the catalog proves: the model advertises it, and nothing is priced yet.
+const CODEX_SPEED_DESCRIPTIONS: Record<CodexSpeed, string> = {
+  standard: "Default processing",
+  fast: "Faster, lower-latency responses",
+  ultrafast: "The fastest tier this model offers",
+};
 const SCHEDULED_SEND_OPTIONS = [
   { label: "Send in 15m", delayMs: 15 * 60_000 },
   { label: "Send in 30m", delayMs: 30 * 60_000 },
@@ -2712,6 +2774,10 @@ function ComposerApplicationButton(props: {
 }
 
 export const Composer = memo(function Composer(props: ComposerProps) {
+  const nativeVoiceApi = isNativeVoiceApi(props.desktopApi) ? props.desktopApi : undefined;
+  // Composer voice entry points stay hidden until dictation can edit only the
+  // draft. Keep the bar so an already-open session or failed stop can be ended.
+  const { threadId: nativeVoiceThreadId } = threadVoiceTarget(props.thread, props.launchpad);
   const threadLinks = useThreadLinks();
   const pullRequestLinks = usePullRequestLinks();
   const rendererFederationTarget = readRendererFederationTarget();
@@ -2757,6 +2823,11 @@ export const Composer = memo(function Composer(props: ComposerProps) {
     : props.thread
       ? buildThreadComposerScopeKey(props.thread.source, props.thread.id, props.thread.federation?.ref.target ?? rendererFederationTarget ?? { scope: "local" })
       : "empty";
+  const failureTarget = props.thread?.federation?.ref.target ?? rendererFederationTarget;
+  const failureScope = props.thread
+    ? turnFailureScopeKey(props.thread.source, props.thread.id,
+        failureTarget?.scope === "remote" ? failureTarget.instanceId : undefined)
+    : undefined;
   const prAutoDispatchPending = props.thread?.prAutoDispatchPending;
   const localDraftStore = useComposerDraftStore();
   const draftStore = useOwnedComposerDraftStore(
@@ -2993,7 +3064,13 @@ export const Composer = memo(function Composer(props: ComposerProps) {
     setSendErrorState((current) => ({ message, occurrence: current.occurrence + 1 }));
   }, []);
   const [agentThreadError, setAgentThreadError] = useState<string>();
-  const [environmentError, setEnvironmentError] = useState<string>();
+  // `selectedEnvironmentId` marks a failed environment selection, so the
+  // setup row can claim the one failure it already reports.
+  const [environmentError, setEnvironmentError] = useState<{
+    message: string;
+    selectedEnvironmentId?: string;
+  }>();
+  const [environmentSetupRetrying, setEnvironmentSetupRetrying] = useState(false);
   const [agentThreadSaving, setAgentThreadSaving] = useState(false);
   const [applicationOpenError, setApplicationOpenError] = useState<string>();
   const [threadEnvActionStarting, setThreadEnvActionStartingState] =
@@ -3021,11 +3098,12 @@ export const Composer = memo(function Composer(props: ComposerProps) {
     cache.set(attachment.id, signature);
     return signature;
   };
-  // Currently expanded attachment shown in the full-size lightbox, or
-  // undefined when the lightbox is closed.
-  const [lightboxAttachment, setLightboxAttachment] =
-    useState<ComposerImageAttachment>();
+  // Key of the attachment-strip item shown in the full-size lightbox
+  // (`image:<id>` or `pdf:<path>`), or undefined when it is closed. A key,
+  // not the item, so the gallery is derived from the strip as it stands and
+  // paging walks the same thumbnails the operator sees.
   // Escape-to-close is owned by `ImageLightbox` itself.
+  const [expandedStripItemKey, setExpandedStripItemKey] = useState<string>();
   const [planModeEnabled, setPlanModeEnabled] = useState(false);
   const [skillTokens, setSkillTokens] = useState<ComposerSkillToken[]>(
     latestDraftSnapshotRef.current.snapshot.skillTokens
@@ -3044,11 +3122,6 @@ export const Composer = memo(function Composer(props: ComposerProps) {
   const composerPdfPreviewStatesRef = useRef(composerPdfPreviewStates);
   composerPdfPreviewStatesRef.current = composerPdfPreviewStates;
   const composerPdfPreviewRequestIdsRef = useRef(new Map<string, number>());
-  const [pdfPreviewLightbox, setPdfPreviewLightbox] = useState<{
-    label: string;
-    path: string;
-    preview: ComposerPdfPreview;
-  }>();
   const [composerSelectionRequest, setComposerSelectionRequest] = useState<{
     id: string;
     index: number;
@@ -3062,6 +3135,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
   useEffect(() => {
     setAgentThreadError(undefined);
     setEnvironmentError(undefined);
+    setEnvironmentSetupRetrying(false);
     setAgentThreadSaving(false);
   }, [composerScopeKey]);
 
@@ -3499,10 +3573,21 @@ export const Composer = memo(function Composer(props: ComposerProps) {
       composerPdfPreviewStatesRef.current = next;
       setComposerPdfPreviewStates(next);
     }
-    setPdfPreviewLightbox((lightbox) =>
-      lightbox && !allowedPaths.has(lightbox.path) ? undefined : lightbox,
-    );
   }, [pdfPreviewPathsKey, pdfReferencePaths]);
+  // A PDF drops out of the gallery when its preview stops being ready — the
+  // path left the strip (its state is pruned above) or a refresh failed. The
+  // key must go with it: the preview can become ready again (the path is
+  // re-referenced, or Retry succeeds), and a key still pointing at it would
+  // reopen the lightbox on its own. Image keys carry a per-paste id and never
+  // return.
+  useEffect(() => {
+    setExpandedStripItemKey((key) =>
+      key?.startsWith("pdf:")
+      && composerPdfPreviewStates.get(key.slice("pdf:".length))?.status !== "ready"
+        ? undefined
+        : key,
+    );
+  }, [composerPdfPreviewStates]);
   useEffect(() => {
     if (props.pdfAnalysisEnabled === false || pdfPreviewPathsKey.length === 0) {
       return;
@@ -4302,16 +4387,24 @@ export const Composer = memo(function Composer(props: ComposerProps) {
       return "failed";
     }
   };
+  const acknowledgeQueuedFailure = (queued: QueuedTurnDraft): void => {
+    turnFailureAcknowledgements.dismissMatching(failureScope, queued.holdReason ?? queued.errorMessage);
+  };
+  const reportQueuedFailure = (message: string): void => {
+    turnFailureAcknowledgements.reportQueueFailure(failureScope, message);
+    setSendError(message);
+  };
   const releaseHeldQueuedTurn = async (
     queued: QueuedTurnDraft,
     scopeKey = composerScopeKey,
   ): Promise<void> => {
+    acknowledgeQueuedFailure(queued);
     if (queued.scheduledActionId) {
       sendQueuedTurnNow(queued);
       return;
     }
     if (!queued.queueEntryId || !props.desktopApi?.releaseQueuedTurn) {
-      setSendError("Queued turn retry is unavailable.");
+      reportQueuedFailure("Queued turn retry is unavailable.");
       return;
     }
     updateSending(true);
@@ -4347,7 +4440,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
           manualReleaseRequired: true,
           holdReason: message,
         }));
-        setSendError(message);
+        reportQueuedFailure(message);
         return;
       }
       const message = response.disposition === "busy"
@@ -4355,9 +4448,9 @@ export const Composer = memo(function Composer(props: ComposerProps) {
         : response.disposition === "not_head"
           ? "Retry the first held message before this one."
           : "This queued message is no longer held for retry.";
-      setSendError(message);
+      reportQueuedFailure(message);
     } catch (error) {
-      setSendError(error instanceof Error ? error.message : String(error));
+      reportQueuedFailure(error instanceof Error ? error.message : String(error));
     } finally {
       updateSending(false);
     }
@@ -6854,7 +6947,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
           const failureMessage = scheduledActionFailureMessage(response.action);
           if (failureMessage) {
             updateSending(false);
-            setSendError(failureMessage);
+            reportQueuedFailure(failureMessage);
             return;
           }
           if (
@@ -6896,7 +6989,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
         },
         (error) => {
           updateSending(false);
-          setSendError(error instanceof Error ? error.message : String(error));
+          reportQueuedFailure(error instanceof Error ? error.message : String(error));
         },
       );
       return;
@@ -9513,7 +9606,9 @@ export const Composer = memo(function Composer(props: ComposerProps) {
       if (!actionStarted) {
         clearThreadEnvActionStarting(startingKey);
       }
-      setEnvironmentError(error instanceof Error ? error.message : String(error));
+      setEnvironmentError({
+        message: error instanceof Error ? error.message : String(error),
+      });
     } finally {
       props.onPendingStatusChange?.(undefined);
     }
@@ -9544,7 +9639,10 @@ export const Composer = memo(function Composer(props: ComposerProps) {
         actionId,
       });
     } catch (error) {
-      setEnvironmentError(error instanceof Error ? error.message : String(error));
+      setEnvironmentError({
+        message: error instanceof Error ? error.message : String(error),
+        selectedEnvironmentId: environmentId,
+      });
     } finally {
       props.onPendingStatusChange?.(undefined);
     }
@@ -9685,6 +9783,16 @@ export const Composer = memo(function Composer(props: ComposerProps) {
         backend.launchpadOptions?.supportsFastMode ??
         false
       : false;
+  const speedOptions = backend?.kind === "codex"
+    ? codexSpeedOptions(
+        selectedModelOption,
+        filesystemFederationTarget?.scope === "remote"
+          ? backend.codexFastAllowed !== false
+          : props.codexFastAllowed !== false,
+        supportsFast,
+      )
+    : [];
+  const selectedSpeed = selectedCodexSpeed(currentSettings ?? {});
   const selectedServiceTier =
     currentSettings?.serviceTier ?? backend?.launchpadOptions?.serviceTiers?.[0];
   const acpRuntimeModeControl = getAcpRuntimeModeControl(backend, currentSettings);
@@ -10614,20 +10722,42 @@ export const Composer = memo(function Composer(props: ComposerProps) {
     imageAttachments.length > 0
     || visibleFileAttachments.length > 0
     || pdfPreviewReferences.length > 0;
-  const imageLightbox = lightboxAttachment ? (
+  // The strip is one gallery: every thumbnail that expands, in the order it
+  // is drawn — pasted images, then PDF page previews that are ready. A sent
+  // message's images page with the arrow keys; these must too, or the same
+  // pair of screenshots behaves differently before and after Send.
+  const stripLightboxItems = expandedStripItemKey
+    ? composerStripLightboxItems(
+        imageAttachments,
+        pdfPreviewReferences,
+        composerPdfPreviewStates,
+      )
+    : [];
+  const expandedStripIndex = stripLightboxItems.findIndex(
+    (item) => item.key === expandedStripItemKey,
+  );
+  const expandedStripItem = stripLightboxItems[expandedStripIndex];
+  const previousStripItem = stripLightboxItems[expandedStripIndex - 1];
+  const nextStripItem = stripLightboxItems[expandedStripIndex + 1];
+  const imageLightbox = expandedStripItem ? (
     <ImageLightbox
-      src={lightboxAttachment.url}
-      alt={formatPastedImageAlt(lightboxAttachment, 0)}
-      onClose={() => setLightboxAttachment(undefined)}
-    />
-  ) : null;
-  const pdfPreviewLightboxNode = pdfPreviewLightbox ? (
-    <ImageLightbox
-      alt={`Page 1 preview of ${pdfPreviewLightbox.label}`}
-      caption={`${pdfPreviewLightbox.label} · Page 1 of ${pdfPreviewLightbox.preview.pageCount}`}
-      dialogLabel={`PDF preview: ${pdfPreviewLightbox.label}`}
-      src={pdfPreviewLightbox.preview.dataUrl}
-      onClose={() => setPdfPreviewLightbox(undefined)}
+      alt={expandedStripItem.alt}
+      caption={expandedStripItem.caption}
+      dialogLabel={expandedStripItem.dialogLabel}
+      src={expandedStripItem.src}
+      position={expandedStripIndex + 1}
+      total={stripLightboxItems.length}
+      onClose={() => setExpandedStripItemKey(undefined)}
+      onPrevious={
+        previousStripItem
+          ? () => setExpandedStripItemKey(previousStripItem.key)
+          : undefined
+      }
+      onNext={
+        nextStripItem
+          ? () => setExpandedStripItemKey(nextStripItem.key)
+          : undefined
+      }
     />
   ) : null;
   const workspaceHandoffDialog =
@@ -10848,6 +10978,45 @@ export const Composer = memo(function Composer(props: ComposerProps) {
       : null;
 
 
+  const environmentSetup = props.environmentSetup;
+  const environmentSetupRetryId =
+    environmentSetup?.status === "failed" && environmentSetup.phase === "setup"
+      ? environmentSetup.environmentId
+      : undefined;
+  const environmentSetupRow = environmentSetup ? (
+    <EnvironmentSetupRow
+      key={environmentSetup.key}
+      desktopApi={props.desktopApi}
+      model={{
+        ...environmentSetup,
+        onDismiss: environmentSetup.onDismiss
+          ? () => {
+              if (
+                environmentError?.selectedEnvironmentId
+                === environmentSetup.environmentId
+              ) {
+                setEnvironmentError(undefined);
+              }
+              environmentSetup.onDismiss?.();
+            }
+          : undefined,
+      }}
+      onRetry={
+        environmentSetupRetryId
+        && props.thread
+        && props.desktopApi?.setCodexThreadEnvironment
+          ? () => {
+              setEnvironmentSetupRetrying(true);
+              void setThreadCodexEnvironment(environmentSetupRetryId).finally(() => {
+                setEnvironmentSetupRetrying(false);
+              });
+            }
+          : undefined
+      }
+      retrying={environmentSetupRetrying}
+    />
+  ) : null;
+
   const composerErrorEntries: readonly ComposerErrorEntry[] = [
     { id: "skills", label: "Couldn't load skills", message: props.skillError },
     { id: "launchpad", label: "Couldn't start thread", message: props.launchpadError },
@@ -10867,7 +11036,23 @@ export const Composer = memo(function Composer(props: ComposerProps) {
       message: sendError,
       occurrence: sendErrorState.occurrence,
     },
-    { id: "environment", label: "Environment error", message: environmentError },
+    {
+      id: "environment",
+      label: "Environment error",
+      // A failed setup command rejects `setCodexThreadEnvironment`, and the
+      // setup row already shows that failure with its full output: one
+      // surface per error. Only a failure for the same environment is
+      // claimed, so a different selection's error still reports here. The
+      // row clears this error when it is dismissed, so it cannot reappear.
+      // With no row (no progress stream reached this window), the error row
+      // is the only report and stays.
+      message:
+        environmentSetup?.status === "failed"
+        && environmentError?.selectedEnvironmentId !== undefined
+        && environmentError.selectedEnvironmentId === environmentSetup.environmentId
+          ? undefined
+          : environmentError?.message,
+    },
     { id: "agent-thread", label: "Couldn't change agent", message: agentThreadError },
     {
       id: "agent-change",
@@ -10897,6 +11082,11 @@ export const Composer = memo(function Composer(props: ComposerProps) {
           }
         }}
       >
+      {/* Outside the pending fieldset: a hot microphone's End voice must work
+          while a send is being prepared. */}
+      {nativeVoiceApi ? (
+        <NativeVoiceBar api={nativeVoiceApi} threadId={nativeVoiceThreadId} />
+      ) : null}
       <fieldset className="composer__pending-controls" disabled={preparingSend}>
         {/* Issue #240: removed the visible "Reply" / "New thread" /
           "Review" eyebrow that used to sit above the composer. The
@@ -10908,6 +11098,12 @@ export const Composer = memo(function Composer(props: ComposerProps) {
           above an input that already names itself was redundant
           chrome. */}
 
+      {/* The band: every transient row between the transcript and the
+          input. It is the one part of the composer allowed to give up height
+          — capped, scrolling, and shrinkable — so no number of open rows can
+          push the input or its toolbar off the window. See
+          `composer-band-bounds.test.ts`. */}
+      <div className="composer__band">
       {/* Topmost in the band: ambient agent work the operator did not just
           launch. Env action rows sit below it, nearer the input, because they
           carry the Stop the operator is most likely to reach for. */}
@@ -10924,6 +11120,8 @@ export const Composer = memo(function Composer(props: ComposerProps) {
         thread={props.thread}
       />
 
+      {environmentSetupRow}
+
       {props.showEnvActionAnchors === false ? null : (
         <EnvActionAnchorList
           runtime={props.thread?.codexEnvironmentRuntime}
@@ -10935,6 +11133,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
       )}
 
       <ComposerErrorRail
+        failureScope={failureScope}
         desktopApi={props.desktopApi}
         entries={composerErrorEntries}
       />
@@ -11144,14 +11343,10 @@ export const Composer = memo(function Composer(props: ComposerProps) {
                 {formatDraftPreview(queued)}
               </span>
               {queued.errorMessage ? (
-                <span className="composer__queued-error">
-                  {queued.errorMessage}
-                </span>
+                <LinkedTurnFailureMessage scope={failureScope} className="composer__queued-error" message={queued.errorMessage} />
               ) : null}
               {queued.holdReason ? (
-                <span className="composer__queued-error">
-                  {queued.holdReason}
-                </span>
+                <LinkedTurnFailureMessage scope={failureScope} className="composer__queued-error" message={queued.holdReason} />
               ) : null}
             </div>
             <QueuedImageAttachments attachments={queued.imageAttachments} />
@@ -11235,6 +11430,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
                 type="button"
                 onClick={() => {
                   const editQueuedTurn = (editable = queued): void => {
+                    acknowledgeQueuedFailure(queued);
                     removeQueuedTurnInScope(queuedScopeKey, queued);
                     if (activeComposerScopeKeyRef.current !== queuedScopeKey) {
                       const currentDraft = draftStore.get(queuedScopeKey);
@@ -11299,6 +11495,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
                 type="button"
                 onClick={() => {
                   if (!backendOwned) {
+                    acknowledgeQueuedFailure(queued);
                     removeQueuedTurnAt(index);
                     return;
                   }
@@ -11308,6 +11505,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
                       queuedScopeKey,
                     );
                     if (cancellation === "cancelled") {
+                      acknowledgeQueuedFailure(queued);
                       removeQueuedTurnInScope(queuedScopeKey, queued);
                     }
                   })();
@@ -11319,6 +11517,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
           </div>
         );
       })}
+      </div>
 
       {hasVisibleAttachments ? (
         <div
@@ -11342,7 +11541,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
                     className="composer__attachment-open"
                     type="button"
                     onClick={() => {
-                      setLightboxAttachment(attachment);
+                      setExpandedStripItemKey(imageStripItemKey(attachment));
                     }}
                   >
                     <img
@@ -11391,11 +11590,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
                       className="composer__attachment-open"
                       type="button"
                       onClick={() => {
-                        setPdfPreviewLightbox({
-                          label: reference.label,
-                          path: reference.path,
-                          preview,
-                        });
+                        setExpandedStripItemKey(pdfStripItemKey(reference.path));
                       }}
                     >
                       <img
@@ -12806,7 +13001,35 @@ export const Composer = memo(function Composer(props: ComposerProps) {
             />
           ) : null}
 
-          {(props.launchpad || props.thread) && supportsFast ? (
+          {(props.launchpad || props.thread) && speedOptions.includes("ultrafast") ? (
+            <ComposerDropdown
+              id="composer-speed"
+              ariaLabel="Speed"
+              disabled={launchpadSubmitting}
+              icon={LightningIcon}
+              // Standard keeps the old Fast toggle's 26px circle; a faster
+              // tier is a paid choice, so it is named and lit like the toggle.
+              iconOnly={selectedSpeed === "standard"}
+              tone={selectedSpeed === "standard" ? undefined : "active"}
+              tooltip={`Speed: ${CODEX_SPEED_LABELS[selectedSpeed]}`}
+              value={selectedSpeed}
+              options={speedOptions.map((speed) => ({
+                value: speed,
+                label: CODEX_SPEED_LABELS[speed],
+                description: CODEX_SPEED_DESCRIPTIONS[speed],
+              }))}
+              onChange={(value) => {
+                const patch = codexSpeedSettings(value as CodexSpeed);
+                if (props.launchpad) {
+                  handleLaunchpadPatch(patch);
+                  return;
+                }
+                handleThreadModelSettingsPatch(patch);
+              }}
+            />
+          ) : null}
+
+          {(props.launchpad || props.thread) && supportsFast && !speedOptions.includes("ultrafast") ? (
             <button
               type="button"
               className={`composer__toggle tooltip-target${
@@ -13354,7 +13577,6 @@ export const Composer = memo(function Composer(props: ComposerProps) {
       </form>
       {fullAccessRiskDialog}
       {imageLightbox}
-      {pdfPreviewLightboxNode}
     </>
   );
 });

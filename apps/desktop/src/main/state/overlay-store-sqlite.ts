@@ -596,6 +596,7 @@ const NAVIGATION_BROWSE_MODE_META_KEY = "navigation_browse_mode";
  * it needs no write budget: this is not a per-turn or per-event write.
  */
 const STAR_MAP_MANAGER_THREAD_META_KEY = "star_map_manager_thread";
+const VOICE_MANAGER_THREAD_META_KEY = "voice_manager_thread";
 const LEGACY_HANDOFF_AGENT_INSTRUCTIONS =
   "Work only on the delegated task from the parent PwrAgent thread. Keep progress and results in this thread.";
 
@@ -763,6 +764,12 @@ export class SqliteOverlayStore implements RemoteThreadTargetStore {
                 ? { status: "failure" as const, outcome: "failure" as const }
                 : {}),
             };
+          }
+
+          // Codex owns native workers independently of the PwrAgent process
+          // that observed them. Reconcile their status through the protocol.
+          if (subAgent.backend === "codex" && subAgent.monitorId.startsWith("codex-native:")) {
+            return subAgent;
           }
 
           const ownerRuntimeInstanceId = subAgent.ownerRuntimeInstanceId?.trim();
@@ -3706,6 +3713,7 @@ export class SqliteOverlayStore implements RemoteThreadTargetStore {
     backend: ThreadOverlayState["backend"];
     threadId: string;
     archivedAt?: number;
+    restoredAt?: number;
   }): Promise<ThreadOverlayState> {
     const threadKey = buildThreadIdentityKey(params.backend, params.threadId);
     const current = this.getThread(threadKey) ?? {
@@ -3717,6 +3725,8 @@ export class SqliteOverlayStore implements RemoteThreadTargetStore {
     const nextState: ThreadOverlayState = {
       ...current,
       archiveTombstonedAt: params.archivedAt,
+      archiveRestoredAt: params.restoredAt ?? current.archiveRestoredAt,
+      archiveRetentionStartedAt: params.restoredAt === undefined ? current.archiveRetentionStartedAt : undefined,
     };
     this.putThread(threadKey, nextState);
     return nextState;
@@ -7052,12 +7062,14 @@ export class SqliteOverlayStore implements RemoteThreadTargetStore {
     for (const row of rows) {
       try {
         const thread = JSON.parse(row.payload) as ThreadOverlayState;
-        if (thread.backend !== "codex" || thread.fastMode !== true) {
+        if (thread.backend !== "codex"
+          || (thread.fastMode !== true && thread.serviceTier !== "ultrafast")) {
           continue;
         }
         this.putThread(row.thread_id, {
           ...thread,
           fastMode: false,
+          serviceTier: undefined,
         });
         updatedThreadIds.push(thread.threadId);
         threadCount += 1;
@@ -7069,12 +7081,15 @@ export class SqliteOverlayStore implements RemoteThreadTargetStore {
     const launchpads = await this.listDirectoryLaunchpads();
     let launchpadCount = 0;
     for (const launchpad of launchpads) {
-      if (launchpad.backend !== "codex" || launchpad.fastMode !== true) {
+      if (launchpad.backend !== "codex"
+        || (launchpad.fastMode !== true && launchpad.serviceTier !== "ultrafast")) {
         continue;
       }
       await this.upsertDirectoryLaunchpad({
-        ...launchpad,
-        fastMode: false,
+        ...applyNavigationLaunchpadProviderSettingsPatch(launchpad, {
+          fastMode: false,
+          serviceTier: undefined,
+        }),
         updatedAt: Date.now(),
       });
       launchpadCount += 1;
@@ -7252,7 +7267,28 @@ export class SqliteOverlayStore implements RemoteThreadTargetStore {
   getStarMapManagerThread():
     | { backend: string; threadId: string }
     | undefined {
-    const raw = this.stateDb.getMeta(STAR_MAP_MANAGER_THREAD_META_KEY);
+    return this.readManagerThreadMeta(STAR_MAP_MANAGER_THREAD_META_KEY);
+  }
+
+  setStarMapManagerThread(thread: { backend: string; threadId: string }): void {
+    this.writeManagerThreadMeta(STAR_MAP_MANAGER_THREAD_META_KEY, thread);
+  }
+
+  /** The remembered Voice manager thread director voice talks through. */
+  getVoiceManagerThread():
+    | { backend: string; threadId: string }
+    | undefined {
+    return this.readManagerThreadMeta(VOICE_MANAGER_THREAD_META_KEY);
+  }
+
+  setVoiceManagerThread(thread: { backend: string; threadId: string }): void {
+    this.writeManagerThreadMeta(VOICE_MANAGER_THREAD_META_KEY, thread);
+  }
+
+  private readManagerThreadMeta(
+    key: string,
+  ): { backend: string; threadId: string } | undefined {
+    const raw = this.stateDb.getMeta(key);
     if (!raw) return undefined;
     try {
       const parsed = JSON.parse(raw) as { backend?: unknown; threadId?: unknown };
@@ -7271,9 +7307,12 @@ export class SqliteOverlayStore implements RemoteThreadTargetStore {
     }
   }
 
-  setStarMapManagerThread(thread: { backend: string; threadId: string }): void {
+  private writeManagerThreadMeta(
+    key: string,
+    thread: { backend: string; threadId: string },
+  ): void {
     this.stateDb.setMeta(
-      STAR_MAP_MANAGER_THREAD_META_KEY,
+      key,
       JSON.stringify({ backend: thread.backend, threadId: thread.threadId }),
     );
   }
@@ -7736,6 +7775,36 @@ export class SqliteOverlayStore implements RemoteThreadTargetStore {
       }
     }
     return results;
+  }
+
+  async listThreadArchiveStates(): Promise<ThreadOverlayState[]> {
+    const rows = this.stateDb.raw.prepare(
+      `SELECT payload FROM threads WHERE payload LIKE '%"archiveRetentionStartedAt"%' OR payload LIKE '%"worktreeSnapshots"%'`,
+    ).all() as Array<{ payload: string }>;
+    // Fail closed: malformed metadata must not hide another thread sharing a recovery ref.
+    return rows.map((row) => JSON.parse(row.payload) as ThreadOverlayState);
+  }
+
+  async observeArchivedThreads(records: Array<{ backend: ThreadOverlayState["backend"]; threadId: string }>, now: number): Promise<void> {
+    const updates = records.flatMap(({ backend, threadId }) => {
+      const key = buildThreadIdentityKey(backend, threadId);
+      const current = this.getThread(key) ?? { backend, threadId, executionMode: "default" as const, extraLinkedDirectories: [] };
+      if (current.archiveRetentionStartedAt !== undefined) return [];
+      return [{ key, state: { ...current, archiveRetentionStartedAt: now } }];
+    });
+    if (!updates.length) return;
+    this.stateDb.raw.transaction(() => {
+      for (const { key, state } of updates) this.putThread(key, state);
+    })();
+  }
+
+  async forgetThreadArchiveStates(records: Array<{ backend: ThreadOverlayState["backend"]; threadId: string }>): Promise<void> {
+    if (!records.length) return;
+    this.stateDb.raw.transaction(() => {
+      const remove = this.stateDb.raw.prepare("DELETE FROM threads WHERE thread_id = ?");
+      for (const record of records) remove.run(encodeThreadIdentityKeyForStorage(buildThreadIdentityKey(record.backend, record.threadId)));
+    })();
+    this.navigationOverlayCache = undefined;
   }
 
   private putThread(threadKey: string, state: ThreadOverlayState): void {
@@ -9379,6 +9448,9 @@ export type OverlayStoreLike = Pick<
 > & {
   setThreadCodexEnvironmentRuntime?: SqliteOverlayStore["setThreadCodexEnvironmentRuntime"];
   listThreadOverlaysWithCodexEnvironmentRuntime?: SqliteOverlayStore["listThreadOverlaysWithCodexEnvironmentRuntime"];
+  listThreadArchiveStates?: SqliteOverlayStore["listThreadArchiveStates"];
+  observeArchivedThreads?: SqliteOverlayStore["observeArchivedThreads"];
+  forgetThreadArchiveStates?: SqliteOverlayStore["forgetThreadArchiveStates"];
   upsertThreadMessageOrigin?: SqliteOverlayStore["upsertThreadMessageOrigin"];
   readThreadMessageOrigins?: SqliteOverlayStore["readThreadMessageOrigins"];
 };

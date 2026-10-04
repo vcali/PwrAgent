@@ -1,3 +1,4 @@
+import { registerNativeVoiceIpcHandlers } from "./ipc/native-voice";
 import { configureBundledGit } from "./bundled-git";
 import {
   applyRememberedLinuxPasswordStore,
@@ -495,6 +496,13 @@ function prewarmInitialThreadList(permit: ProviderDiscoveryPermit): void {
   // spawns `codex plugin marketplace` subprocesses and a full retention prune,
   // and the refresh above owns the event that releases the renderer's startup
   // hold. Contending with it would delay first paint to no purpose.
+  void startupProviderRefresh.then(() => {
+    getExistingDesktopBackendRegistry()?.startThreadArchiveSweeper();
+  }).catch((error) => {
+    mainLog.warn("startup thread archive sweeper initialization failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  });
   void startupProviderRefresh
     .then(async () =>
       await getDesktopBackendRegistry().prepareTokenMiserRuntimeAtStartup(),
@@ -976,20 +984,8 @@ function isWindowCreationBlocked(): boolean {
  * app.quit() re-closing this window during teardown, so there's no loop.
  */
 function quitAppOnMainWindowClose(window: BrowserWindow): void {
-  window.webContents.on("render-process-gone", (_event, details) => {
-    if (
-      details.reason === "clean-exit"
-      || mainProcessShutdownPromise
-      || mainProcessResourcesDisposed
-      || isUpdateInstallInProgress()
-    ) return;
-    const source = `main-renderer-${details.reason}`;
-    mainLog.error("main renderer lost; shutting down app", details);
-    // A dead renderer cannot answer the active-turn confirmation dialog.
-    beginQuitInProgress(source);
-    appQuitManager.allowImmediateQuit();
-    quitAfterResourceShutdown(source);
-  });
+  // Renderer termination is recovered by the window's recovery handler. It
+  // does not close the BrowserWindow or end main-owned turns and connections.
   window.on("close", (event) => {
     if (appQuitManager.isQuitAllowed()) {
       return;
@@ -1584,6 +1580,7 @@ export function bootstrapApp(): void {
     wireWindowControlsBridge();
     installWindowFrameSync(app);
     registerAppServerIpcHandlers();
+    registerNativeVoiceIpcHandlers();
     void startAppServerOwnerNavigation().catch((error) => {
       mainLog.warn("failed to initialize owner navigation metadata", { error: String(error) });
     });
