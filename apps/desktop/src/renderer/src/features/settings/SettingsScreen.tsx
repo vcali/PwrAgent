@@ -930,6 +930,11 @@ function SettingsSectionBody(props: {
             general: { notificationsEnabled },
           });
         }}
+        onThemedDockIconChange={async (themedDockIcon) => {
+          await props.settings.writeConfig({
+            general: { appearance: { themedDockIcon } },
+          });
+        }}
         onClearMessagingAcknowledgment={async () => {
           await props.settings.writeConfig({
             general: { messagingAcknowledgment: null },
