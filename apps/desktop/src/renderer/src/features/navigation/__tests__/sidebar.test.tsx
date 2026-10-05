@@ -1,6 +1,7 @@
 import { navigationQueryFixture } from "../../../test/navigation-query-fixture";
 import { createNavigationPageState } from "../../../lib/navigation-query-state";
 import type { NavigationQueryRequest } from "@pwragent/shared";
+import type { NavigationWindowResource } from "../../../lib/navigation-window-queries";
 import type { NavigationDirectoryView } from "../../../lib/navigation-loaded-rows";
 import "@testing-library/jest-dom/vitest";
 import {
@@ -248,6 +249,39 @@ function createDataTransfer(threadKey: string) {
 }
 
 const THREAD_PIN_POINTER_ID = 41;
+
+/** Keep the selected root in its exact query, outside the loaded pin range. */
+function offPageSelectedPinNavigation(
+  threads: NavigationThreadSummary[],
+  selected: NavigationThreadSummary,
+) {
+  const directory = { ...directories[0]!, threadKeys: threads.map(threadSummaryIdentityKey) };
+  const resources = new Map<string, NavigationWindowResource>();
+  const add = (id: string, query: NavigationQueryRequest["query"], population = threads) => {
+    const request: NavigationQueryRequest = { protocol: 2, consumer: "main-sidebar", query };
+    const page = navigationQueryFixture(request, { directories: [directory], threads: population });
+    resources.set(id, { id, loading: false, state: { ...createNavigationPageState(request), page } });
+    return page;
+  };
+  const directoryRows = add("directory-index", { kind: "directory-index" }).directories ?? [];
+  const pins = add(`directory-pins:${directory.key}`, { kind: "directory", directoryKey: directory.key, roots: "pinned" },
+    threads.filter((thread) => threadSummaryIdentityKey(thread) !== threadSummaryIdentityKey(selected)));
+  pins.complete = false;
+  pins.nextCursor = "more-pins";
+  add(`directory:${directory.key}`, { kind: "directory", directoryKey: directory.key, roots: "unpinned" });
+  const ownerInstanceId = selected.federation?.ref.target.scope === "remote"
+    ? selected.federation.ref.target.instanceId : undefined;
+  const exact = add(ownerInstanceId ? "selected-viewer-mount" : "selected-context", {
+    kind: "exact", includeAncestry: true,
+    identities: [{ backend: selected.source, threadId: selected.id, ownerInstanceId }],
+  });
+  exact.selectionDirectory = directoryRows[0];
+  return {
+    presentationReady: true, resources, directories: directoryRows, selectedDirectoryKeys: undefined, connected: true,
+    invalidate: () => undefined, refresh: async () => undefined, loadMore: async () => undefined,
+    rebaseline: async () => undefined, restart: async () => undefined, setVisibleAnchor: () => undefined,
+  };
+}
 
 function startThreadPinPointerDrag(
   element: Element,
@@ -1030,7 +1064,7 @@ describe("Sidebar", () => {
     expect(onAddProjectDirectory).toHaveBeenCalledTimes(1);
   });
 
-  it("groups sub-threads under their parent and persists collapse clicks", () => {
+  it("groups sub-threads under their parent and persists collapse clicks", async () => {
     const childThread = {
       ...sharedThread,
       id: "thread-review",
@@ -1061,11 +1095,13 @@ describe("Sidebar", () => {
     expect(screen.getByRole("button", { name: /^Cross-project cleanup/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Adversarial review" })).toBeInTheDocument();
 
-    fireEvent.click(
-      screen.getByRole("button", {
-        name: "Collapse sub-threads for Cross-project cleanup",
-      }),
-    );
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", {
+          name: "Collapse sub-threads for Cross-project cleanup",
+        }),
+      );
+    });
     expect(onSetSubthreadsCollapsed).toHaveBeenCalledWith(sharedThread, true);
   });
 
@@ -1123,7 +1159,7 @@ describe("Sidebar", () => {
     ).toBe("2");
   });
 
-  it("groups same-owner remote sub-threads and submits their drag order", () => {
+  it("groups same-owner remote sub-threads and submits their drag order", async () => {
     const target = { scope: "remote" as const, instanceId: "remote-owner" };
     const remoteParent: NavigationThreadSummary = {
       ...sharedThread,
@@ -1215,7 +1251,9 @@ describe("Sidebar", () => {
     };
     fireEvent.dragStart(source, { dataTransfer });
     fireEvent.dragOver(targetRow, { clientY: 75, dataTransfer });
-    fireEvent.drop(targetRow, { clientY: 75, dataTransfer });
+    await act(async () => {
+      fireEvent.drop(targetRow, { clientY: 75, dataTransfer });
+    });
 
     expect(onUpdateSubthreadOrder).toHaveBeenCalledWith(remoteParent, {
       threadId: "remote-child-a", anchorThreadId: "remote-child-b", placement: "before",
@@ -1502,6 +1540,14 @@ describe("Sidebar", () => {
 
     expect(container.querySelectorAll(".native-subagents__list")).toHaveLength(1);
     expect(container.querySelectorAll(".native-subagents__agent")).toHaveLength(3);
+    // A list holds only list items; status lines sit beside it.
+    const workerList = screen.getByRole("list", {
+      name: "Native Codex sub-agents for Coordinate the launch",
+    });
+    expect(within(workerList).getAllByRole("listitem")).toHaveLength(3);
+    expect(workerList.querySelector("p")).toBeNull();
+    // The rows from the navigation summary are already drawn.
+    expect(screen.queryByText("Loading sub-agents…")).not.toBeInTheDocument();
     expect(container.querySelectorAll(".native-subagents__status")).toHaveLength(1);
     expect(screen.getByLabelText("Working")).toBeInTheDocument();
     expect(screen.queryByLabelText("Idle")).not.toBeInTheDocument();
@@ -3112,7 +3158,7 @@ describe("Sidebar", () => {
     expect(within(threadRow).queryByText("local")).not.toBeInTheDocument();
   });
 
-  it("opens the directory launchpad from the plus button", () => {
+  it("opens the directory launchpad from the plus button", async () => {
     const onOpenLaunchpad = vi.fn(async () => undefined);
 
     render(
@@ -3132,11 +3178,13 @@ describe("Sidebar", () => {
       />
     );
 
-    fireEvent.click(
-      screen.getByRole("button", {
-        name: "Open new thread launchpad for PwrAgent",
-      })
-    );
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", {
+          name: "Open new thread launchpad for PwrAgent",
+        })
+      );
+    });
 
     expect(onOpenLaunchpad).toHaveBeenCalledWith(expect.objectContaining({ key: directories[0]!.key }), undefined);
   });
@@ -5901,7 +5949,9 @@ describe("Sidebar", () => {
     await waitFor(() => {
       expect(appendTarget).not.toHaveClass("is-drop-target-before");
     });
-    releaseThreadPinPointer({ x: 50, y: 150 });
+    await act(async () => {
+      releaseThreadPinPointer({ x: 50, y: 150 });
+    });
     expect(onReorderThreadPins).not.toHaveBeenCalled();
 
     startThreadPinPointerDrag(row!, { x: 50, y: 150 });
@@ -5913,7 +5963,9 @@ describe("Sidebar", () => {
       expect(appendTarget).toHaveClass("is-drop-target-before");
     });
 
-    releaseThreadPinPointer({ x: 50, y: 90 });
+    await act(async () => {
+      releaseThreadPinPointer({ x: 50, y: 90 });
+    });
     expect(onSetThreadPin).toHaveBeenCalledWith(sharedThread, true);
     expect(onReorderThreadPins).not.toHaveBeenCalled();
   });
@@ -6154,13 +6206,20 @@ describe("Sidebar", () => {
     );
   });
 
-  it("stops keeping a pin dropped after the pins when every pin is kept", async () => {
+  it.each(["local", "mounted remote", "off-page local", "off-page mounted remote"] as const)("stops keeping a %s pin dropped after the pins when every pin is kept", async (owner) => {
     const onReorderThreadPins = vi.fn(async () => undefined);
-    const keptFirst = {
+    const keptFirst: NavigationThreadSummary = {
       ...sharedThread,
       id: "thread-kept-first",
       title: "Release manager",
       pinnedRank: String(-(2 ** 40)),
+      ...(owner.includes("mounted remote") ? {
+        linkedDirectories: [{ id: "owner-repo", label: "PwrAgent", path: "/owner/github/PwrAgent", kind: "local" as const }],
+        federation: {
+          ref: { backend: "codex" as const, target: { scope: "remote" as const, instanceId: "peer" }, threadId: "thread-kept-first" },
+          instanceLabel: "Peer",
+        },
+      } : {}),
     };
     const keptSecond = {
       ...sharedThread,
@@ -6184,7 +6243,7 @@ describe("Sidebar", () => {
             ...directories[0]!,
             ...{
               threadKeys: [
-                "codex:thread-kept-first",
+                threadSummaryIdentityKey(keptFirst),
                 "codex:thread-kept-second",
                 "codex:thread-unpinned",
               ],
@@ -6194,8 +6253,10 @@ describe("Sidebar", () => {
         inboxThreads={[keptFirst, keptSecond, unpinned]}
         loading={false}
         creatingThread={undefined}
-        selectedItemKey="codex:thread-kept-first"
+        selectedItemKey={threadSummaryIdentityKey(keptFirst)}
         threads={[keptFirst, keptSecond, unpinned]}
+        pagedNavigation={owner.startsWith("off-page")
+          ? offPageSelectedPinNavigation([keptFirst, keptSecond, unpinned], keptFirst) : undefined}
         onBrowseModeChange={() => undefined}
         onCreateThread={async () => undefined}
         onOpenLaunchpad={async () => undefined}
@@ -6234,13 +6295,13 @@ describe("Sidebar", () => {
     releaseThreadPinPointer({ x: 50, y: 165 });
     await waitFor(() => {
       expect(onReorderThreadPins).toHaveBeenCalledWith([], {
-        key: "codex:thread-kept-first",
+        key: threadSummaryIdentityKey(keptFirst),
         keepAtTop: false,
       });
     });
   });
 
-  it("opens a ghost Keep at top slot above the pins while the lane is empty", async () => {
+  it.each(["local", "mounted remote", "off-page local", "off-page mounted remote"] as const)("opens a ghost Keep at top slot for a %s pin while the lane is empty", async (owner) => {
     const onReorderThreadPins = vi.fn(async () => undefined);
     const first = {
       ...sharedThread,
@@ -6248,11 +6309,18 @@ describe("Sidebar", () => {
       title: "Fresh pin",
       pinnedRank: "1024",
     };
-    const second = {
+    const second: NavigationThreadSummary = {
       ...sharedThread,
       id: "thread-second",
       title: "Release manager",
       pinnedRank: "2048",
+      ...(owner.includes("mounted remote") ? {
+        linkedDirectories: [{ id: "owner-repo", label: "PwrAgent", path: "/owner/github/PwrAgent", kind: "local" as const }],
+        federation: {
+          ref: { backend: "codex" as const, target: { scope: "remote" as const, instanceId: "peer" }, threadId: "thread-second" },
+          instanceLabel: "Peer",
+        },
+      } : {}),
     };
 
     const { container } = render(
@@ -6262,14 +6330,16 @@ describe("Sidebar", () => {
         directories={[
           {
             ...directories[0]!,
-            ...{ threadKeys: ["codex:thread-first", "codex:thread-second"] },
+            ...{ threadKeys: [threadSummaryIdentityKey(first), threadSummaryIdentityKey(second)] },
           },
         ]}
         inboxThreads={[first, second]}
         loading={false}
         creatingThread={undefined}
-        selectedItemKey="codex:thread-first"
+        selectedItemKey={owner.startsWith("off-page") ? threadSummaryIdentityKey(second) : threadSummaryIdentityKey(first)}
         threads={[first, second]}
+        pagedNavigation={owner.startsWith("off-page")
+          ? offPageSelectedPinNavigation([first, second], second) : undefined}
         onBrowseModeChange={() => undefined}
         onCreateThread={async () => undefined}
         onOpenLaunchpad={async () => undefined}
@@ -6321,7 +6391,7 @@ describe("Sidebar", () => {
     releaseThreadPinPointer({ x: 50, y: 55 });
     await waitFor(() => {
       expect(onReorderThreadPins).toHaveBeenCalledWith([], {
-        key: "codex:thread-second",
+        key: threadSummaryIdentityKey(second),
         keepAtTop: true,
       });
     });
@@ -6395,7 +6465,9 @@ describe("Sidebar", () => {
     await waitFor(() => {
       expect(appendTarget).toHaveClass("is-drop-target-before");
     });
-    releaseThreadPinPointer({ x: 50, y: 150 });
+    await act(async () => {
+      releaseThreadPinPointer({ x: 50, y: 150 });
+    });
     expect(onSetThreadPin).toHaveBeenCalledWith(sharedThread, true);
     expect(onReorderThreadPins).not.toHaveBeenCalled();
   });
@@ -6547,7 +6619,9 @@ describe("Sidebar", () => {
       expect(pinnedRow).not.toHaveClass("is-drop-target-after");
       expect(appendTarget).toHaveClass("is-drop-target-before");
     });
-    releaseThreadPinPointer({ x: 50, y: 115 });
+    await act(async () => {
+      releaseThreadPinPointer({ x: 50, y: 115 });
+    });
   });
 
   it("renders no pinned section or drag affordance in the Created lens", () => {
@@ -7955,7 +8029,7 @@ describe("Sidebar directory pinning", () => {
     ).toBeTruthy();
   });
 
-  it("pins an unpinned directory when it is dropped on the pinned divider", () => {
+  it("pins an unpinned directory when it is dropped on the pinned divider", async () => {
     const onSetDirectoryPin = vi.fn(async () => undefined);
     const onReorderDirectoryPins = vi.fn(async () => undefined);
     const pinned: NavigationDirectorySummary = {
@@ -7968,16 +8042,18 @@ describe("Sidebar directory pinning", () => {
       onReorderDirectoryPins,
     });
 
-    fireEvent.drop(
-      screen.getByRole("separator", { name: "Unpinned directories" }),
-      { dataTransfer: createDirectoryDataTransfer(projectBDirectory.key) },
-    );
+    await act(async () => {
+      fireEvent.drop(
+        screen.getByRole("separator", { name: "Unpinned directories" }),
+        { dataTransfer: createDirectoryDataTransfer(projectBDirectory.key) },
+      );
+    });
 
     expect(onSetDirectoryPin).toHaveBeenCalledWith(expect.objectContaining({ key: projectBDirectory.key }), true);
     expect(onReorderDirectoryPins).not.toHaveBeenCalled();
   });
 
-  it("reorders pinned directories when one is dropped on another pinned directory", () => {
+  it("reorders pinned directories when one is dropped on another pinned directory", async () => {
     const onReorderDirectoryPins = vi.fn(async () => undefined);
     const pinnedA: NavigationDirectorySummary = {
       ...projectADirectory,
@@ -8002,8 +8078,10 @@ describe("Sidebar directory pinning", () => {
     const headerA = pinnedASummary.closest(".directory-row__header");
     expect(headerA).not.toBeNull();
 
-    fireEvent.drop(headerA!, {
-      dataTransfer: createDirectoryDataTransfer(pinnedB.key),
+    await act(async () => {
+      fireEvent.drop(headerA!, {
+        dataTransfer: createDirectoryDataTransfer(pinnedB.key),
+      });
     });
 
     expect(onReorderDirectoryPins).toHaveBeenCalledWith([
@@ -8258,7 +8336,7 @@ describe("Sidebar directory pinning", () => {
     expect(onSetDirectoryPin).not.toHaveBeenCalled();
   });
 
-  it("suppresses the synthetic post-drag click on the directory summary button", () => {
+  it("suppresses the synthetic post-drag click on the directory summary button", async () => {
     // Regression: an earlier ref-based suppression flag could get
     // stuck `true` if `dragend` didn't fire (e.g., React detached
     // the listener during a re-render that moved the row between
@@ -8292,26 +8370,26 @@ describe("Sidebar directory pinning", () => {
     // of a reorder gesture). This stamps the suppression
     // timestamp via the section's onDrop handler.
     const sectionA = summary.closest(".directory-row") as HTMLElement;
-    fireEvent.drop(sectionA, {
-      dataTransfer: createDirectoryDataTransfer(pinnedB.key),
+    await act(async () => {
+      fireEvent.drop(sectionA, {
+        dataTransfer: createDirectoryDataTransfer(pinnedB.key),
+      });
     });
 
     // The synthetic post-drag click that browsers fire on the
     // element under the mouse should be suppressed — the row must
     // stay collapsed.
-    fireEvent.click(summary);
+    await act(async () => {
+      fireEvent.click(summary);
+    });
     expect(summary.getAttribute("aria-expanded")).toBe("false");
 
     // After the suppression window elapses, a normal click toggles
     // expand again. POST_DRAG_CLICK_SUPPRESS_MS is 150ms; wait
     // longer than that, then click.
-    return new Promise<void>((resolve) => {
-      setTimeout(() => {
-        fireEvent.click(summary);
-        expect(summary.getAttribute("aria-expanded")).toBe("true");
-        resolve();
-      }, 200);
-    });
+    await new Promise<void>((resolve) => setTimeout(resolve, 200));
+    await act(async () => { fireEvent.click(summary); });
+    expect(summary.getAttribute("aria-expanded")).toBe("true");
   });
 
   it("does not re-expand a user-collapsed directory when another directory is unpinned", async () => {
@@ -8734,9 +8812,11 @@ describe("Sidebar thread pinning Move items", () => {
     const remoteRow = screen
       .getByRole("button", { name: /Grok middle pin/i })
       .closest(".thread-row-shell") as HTMLElement;
-    fireEvent.click(
-      remoteRow.querySelector(".thread-row__overflow-button") as HTMLButtonElement,
-    );
+    await act(async () => {
+      fireEvent.click(
+        remoteRow.querySelector(".thread-row__overflow-button") as HTMLButtonElement,
+      );
+    });
 
     const moveUp = await screen.findByRole("menuitem", { name: /Move Up/i });
     const moveDown = await screen.findByRole("menuitem", {
@@ -8745,7 +8825,9 @@ describe("Sidebar thread pinning Move items", () => {
     expect(moveUp).toBeEnabled();
     expect(moveDown).toBeEnabled();
 
-    fireEvent.click(moveUp);
+    await act(async () => {
+      fireEvent.click(moveUp);
+    });
     expect(onReorderThreadPins).toHaveBeenCalledWith([
       "remote:peer-laptop:acp:grok:grok-middle",
       "codex:codex-top",
@@ -8753,7 +8835,7 @@ describe("Sidebar thread pinning Move items", () => {
     ], { key: "remote:peer-laptop:acp:grok:grok-middle", direction: "up" });
   });
 
-  it("invokes the reorder IPC on Cmd+Shift+ArrowDown on a focused pinned thread row", () => {
+  it("invokes the reorder IPC on Cmd+Shift+ArrowDown on a focused pinned thread row", async () => {
     // Locks the unified shortcut. The thread reorder shortcut
     // used to be plain Cmd+Arrow; it now matches the directory
     // reorder shortcut (Cmd+Shift+Arrow). A plain Cmd+Arrow
@@ -8796,15 +8878,19 @@ describe("Sidebar thread pinning Move items", () => {
     const topButton = screen.getByRole("button", { name: /Top pinned/i });
 
     // Old shortcut (Cmd alone) → must NOT fire.
-    fireEvent.keyDown(topButton, { key: "ArrowDown", metaKey: true });
+    await act(async () => {
+      fireEvent.keyDown(topButton, { key: "ArrowDown", metaKey: true });
+    });
     expect(onReorderThreadPins).not.toHaveBeenCalled();
 
     // New shortcut (Cmd + Shift) → fires the reorder, swapping
     // the top thread with the bottom one.
-    fireEvent.keyDown(topButton, {
-      key: "ArrowDown",
-      metaKey: true,
-      shiftKey: true,
+    await act(async () => {
+      fireEvent.keyDown(topButton, {
+        key: "ArrowDown",
+        metaKey: true,
+        shiftKey: true,
+      });
     });
     expect(onReorderThreadPins).toHaveBeenCalledWith([], { key: `codex:${pinnedTop.id}`, direction: "down" });
   });

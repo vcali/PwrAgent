@@ -39,10 +39,7 @@ import {
   CodexAuthProfileLoginButton,
 } from "./CodexAuthProfileSelect";
 import { AcpAgentsSettings } from "./AcpAgentsSettings";
-import {
-  DEFAULT_MODELS_FOCUS,
-  DefaultModelsSettings,
-} from "./DefaultModelsSettings";
+import { HelperModelSettings } from "./HelperModelSettings";
 import {
   ManagedRuntimeProgressStrip,
   useManagedRuntimeProgress,
@@ -133,7 +130,7 @@ export function ModelsSettings(props: {
   onSaveProviderThreadMigrations: (
     migrations: Record<string, DesktopProviderThreadModelMigration>,
   ) => Promise<boolean>;
-  /** Persist Settings → AI Providers → Default Models. */
+  /** Persist the Helper model row on Settings → AI Providers. */
   onSaveHelperModels?: (
     helperModels: DesktopHelperModelSettings,
   ) => Promise<unknown>;
@@ -542,20 +539,6 @@ export function ModelsSettings(props: {
       </SettingsSection>
   );
 
-  if (props.focus === DEFAULT_MODELS_FOCUS) {
-    return (
-      <DefaultModelsSettings
-        backends={backends}
-        settings={props.snapshot.models.helperModels ?? { helpers: {} }}
-        catalogRefresh={catalogRefresh}
-        catalogReading={refreshingCatalog}
-        catalogError={catalogError}
-        saving={props.saving}
-        onSave={async (helperModels) => await props.onSaveHelperModels?.(helperModels)}
-      />
-    );
-  }
-
   if (props.focus === "codex") {
     return (
       <SettingsSectionStack
@@ -620,7 +603,7 @@ export function ModelsSettings(props: {
       <SettingsPanelHead
         eyebrow="Models"
         title="AI providers"
-        help="Choose models for new threads, inspect discovered models, and configure provider credentials."
+        help="Choose models for new threads and for work PwrAgent starts on its own, inspect discovered models, and configure provider credentials."
       />
 
       <ProviderModelDefaultsSettings
@@ -636,6 +619,14 @@ export function ModelsSettings(props: {
         onSave={props.onSaveProviderDefaults}
         onSaveMigrations={props.onSaveProviderThreadMigrations}
         onSaveCodexFastAllowed={props.onSaveCodexFastAllowed}
+      />
+
+      <HelperModelSettings
+        backends={backends}
+        settings={props.snapshot.models.helperModels ?? { helpers: {} }}
+        catalogReading={refreshingCatalog}
+        saving={props.saving}
+        onSave={async (helperModels) => await props.onSaveHelperModels?.(helperModels)}
       />
 
       <SettingsSection
@@ -734,7 +725,7 @@ function ProviderDefaultsStrip(props: {
     items.push(`${effort} effort`);
   }
   if (props.codexFastAllowed !== undefined) {
-    items.push(props.codexFastAllowed ? "Fast mode allowed" : "Fast mode off");
+    items.push(props.codexFastAllowed ? "Faster speeds allowed" : "Standard speed only");
   }
   return (
     <>
@@ -1479,25 +1470,25 @@ function ProviderModelDefaultField(props: {
           {props.fastMode ? (
             <div className="settings-provider-defaults__fast">
               <div className="settings-provider-defaults__fast-copy">
-                <strong>Fast mode</strong>
+                <strong>Fast and Ultrafast</strong>
                 <span>
                   {props.fastMode.allowed
                     ? "Allowed for this profile. Existing threads keep their own choice."
-                    : "Prohibited for this profile. Codex is forced to non-Fast."}
+                    : "Prohibited for this profile. Codex uses Standard speed."}
                 </span>
               </div>
               {props.fastMode.pending ? (
                 <InlineActionConfirmation
                   applying={props.applying}
-                  confirmLabel="Turn Fast off"
+                  confirmLabel="Use Standard speed"
                   label={
                     props.fastMode.pending.kind === "disable"
-                      ? "Prohibit Fast for this profile?"
-                      : "Turn Fast off everywhere?"
+                      ? "Prohibit Fast and Ultrafast for this profile?"
+                      : "Use Standard speed everywhere?"
                   }
                   sub={`This will set ${props.fastMode.pending.threadCount} existing Codex thread${
                     props.fastMode.pending.threadCount === 1 ? "" : "s"
-                  } and future launchpads to non-Fast. Models, reasoning, prompts, and access settings stay unchanged.`}
+                  } and future launchpads to Standard speed. Models, reasoning, prompts, and access settings stay unchanged.`}
                   onCancel={props.fastMode.onCancel}
                   onConfirm={props.fastMode.onConfirm}
                 />
@@ -1506,7 +1497,7 @@ function ProviderModelDefaultField(props: {
                   <SettingsSwitch
                     checked={props.fastMode.allowed}
                     disabled={props.disabled}
-                    label="Allow Codex Fast mode"
+                    label="Allow Codex Fast and Ultrafast"
                     pending={fastAllowPending}
                     onChange={(allowed) =>
                       trackFastAllow(
@@ -1515,7 +1506,7 @@ function ProviderModelDefaultField(props: {
                       )}
                   />
                   <button
-                    aria-label="Turn Fast off everywhere"
+                    aria-label="Use Standard speed everywhere"
                     className="button button--secondary"
                     disabled={props.disabled || !props.fastMode.allowed}
                     type="button"

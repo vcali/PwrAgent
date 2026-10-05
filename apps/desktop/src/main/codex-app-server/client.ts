@@ -1,3 +1,5 @@
+import type { NativeVoiceNotification } from "./native-voice-protocol";
+import type { ThreadRealtimeStartParams } from "@pwrdrvr/codex-app-server-protocol/v2";
 import type {
   ListBackgroundTerminalsResponse,
   CodexBackgroundTerminal,
@@ -8,13 +10,17 @@ import type {
 } from "@pwrdrvr/codex-app-server-protocol/v2";
 import { listingDiagnostics } from "../diagnostics/listing-diagnostics";
 import { normalizeAutoReviewNotification } from "./auto-review";
+import { rememberBoundedMap } from "../bounded-map";
 import { nativeReviewTarget } from "../../shared/pull-request-review";
 import { ThreadListTextCache } from "./thread-list-text-cache";
 import { CODEX_SIGN_IN_REQUIRED, codexAuthState } from "../codex-auth-state";
 import { mkdir } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
+  buildSubAgentActivityDetail,
+  readCodexNativeSubAgentName,
   estimateTokenUsageCost,
   formatSearchCommandActionLabel,
   formatTokenUsagePriceFactor,
@@ -25,14 +31,20 @@ import {
   navigationQueryEventRequiresRefresh,
   normalizeCodexAsyncQuestions,
   parseCodexTurnErrorMessage,
+  readSubAgentActivity,
   resolveOpenAiPricingServiceTier,
   resolveHelperModel,
   resolveTokenUsagePriceUnavailableReason,
   shortenDerivedThreadTitle,
+  shortSubAgentThreadId,
+  subAgentActivitySummaryParts,
+  subAgentTargetLabel,
   type DesktopHelperModelSettings,
   type HelperModelId,
   type HelperModelResolution,
   type ThreadUsageLineRecord,
+  type ThreadPricingSnapshot,
+  type ThreadUsageTokenBreakdown,
 } from "@pwragent/shared";
 import type {
   AppServerAvailableCommandSummary,
@@ -301,7 +313,7 @@ const BASE64_IMAGE_BLOB_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
 
 type CodexClientOptions = {
   authenticationRecovery?: boolean;
-  /** The profile's Settings → Default Models choices, read per helper turn. */
+  /** The profile's helper model settings, read per helper turn. */
   readHelperModelSettings?: () => DesktopHelperModelSettings | undefined;
   command?: string;
   args?: string[];
@@ -513,6 +525,7 @@ const GENERATED_CODEX_NOTIFICATION_METHODS = new Set<string>([
   "serverRequest/resolved",
   "thread/compacted",
   "thread/archived",
+  "thread/deleted",
   "thread/unarchived",
   "skills/changed",
   "thread/name/updated",
@@ -675,6 +688,44 @@ function logSkillsChangedNotification(params: {
     initialized: params.initialized,
     expectedFollowup: "call skills/list when refreshed skill metadata is needed",
     payload: params.payload,
+  });
+}
+
+/**
+ * One line per MCP approval or login request, so a repeated prompt can be
+ * traced to what Codex asked for. `_meta` carries the tool's arguments, which
+ * can hold queries, paths, typed text, or tokenized URLs, so only the keys
+ * and Codex's own descriptors are logged, never a parameter value or the URL.
+ * Computer Use writes its own title ("Allow Computer Use to use "Electron"?"),
+ * which names the app; any other server may put arguments in the title.
+ */
+function logMcpElicitationRequest(params: unknown, requestId: string | undefined): void {
+  const record = asRecord(params);
+  const meta = asRecord(record?.["_meta"]);
+  const serverName = readStringFromRecord(record, "serverName");
+  const persist = meta?.["persist"];
+  const toolParamsDisplay = Array.isArray(meta?.["tool_params_display"])
+    ? meta["tool_params_display"] as unknown[]
+    : [];
+  codexClientLog.info("MCP elicitation request", {
+    threadId: readStringFromRecord(record, "threadId"),
+    turnId: readStringFromRecord(record, "turnId"),
+    requestId,
+    serverName,
+    mode: readStringFromRecord(record, "mode"),
+    approvalKind: readStringFromRecord(meta, "codex_approval_kind"),
+    connectorId: readStringFromRecord(meta, "connector_id"),
+    connectorName: readStringFromRecord(meta, "connector_name"),
+    riskLevel: readStringFromRecord(meta, "riskLevel"),
+    persist: typeof persist === "string" ? [persist] : readStringArray(persist),
+    paramNames: toolParamsDisplay.flatMap((entry) => {
+      const name = pickString(asRecord(entry) ?? {}, ["name", "key", "label", "display_name"]);
+      return name ? [name] : [];
+    }),
+    metaKeys: meta ? Object.keys(meta) : [],
+    ...(serverName === "cua_repl"
+      ? { message: readStringFromRecord(record, "message") }
+      : {}),
   });
 }
 
@@ -3432,8 +3483,13 @@ function stripShellWrapper(command: string | undefined): string | undefined {
   return collapsed || undefined;
 }
 
+/**
+ * Same separator as the live summary (`summarizeLiveActivity`), so a header
+ * does not change when the turn is read back. Not a comma: "Edited 2 files,
+ * +10, -3" already has commas inside it.
+ */
 function formatActivitySummary(parts: string[]): string {
-  return parts.join(", ");
+  return parts.join(" · ");
 }
 
 function formatElapsedMs(elapsedMs: number): string {
@@ -3939,6 +3995,7 @@ function isActivityItemType(itemType: string | undefined): boolean {
     normalized === "mcptoolcall" ||
     normalized === "dynamictoolcall" ||
     normalized === "collabagenttoolcall" ||
+    normalized === "subagentactivity" ||
     normalized === "websearch" ||
     normalized === "imageview" ||
     normalized === "imagegeneration"
@@ -4507,6 +4564,19 @@ function summarizeActivityItems(
   let status: AppServerThreadActivityStatus | undefined;
 
   for (const item of items) {
+    // Path-based worker reports. The renderer's live transcript builds the
+    // same row from the same shared builder, so the two merge by id.
+    const subAgentActivity = readSubAgentActivity(item);
+    if (subAgentActivity) {
+      status ??= "completed";
+      pushActivityDetail(
+        details,
+        detailsByLabel,
+        buildSubAgentActivityDetail(subAgentActivity),
+      );
+      continue;
+    }
+
     const itemId =
       pickString(item, ["id", "itemId", "item_id"]) ?? `activity-${details.length + 1}`;
     const itemStatus = normalizeActivityStatus(pickString(item, ["status"]));
@@ -4700,10 +4770,12 @@ function summarizeActivityItems(
         failedCollabCalls += 1;
       }
 
-      const label = formatCollabAgentToolLabel({ tool, receiverThreadIds, status: itemStatus });
+      const agents = collabAgentDetails(item, receiverThreadIds);
+      const label = formatCollabAgentToolLabel({ agents, tool, receiverThreadIds, status: itemStatus });
       const commandDetail = buildCollabAgentCommandDetail({
         item,
         label,
+        operation: collabAgentOperation(tool),
         receiverThreadIds,
         tool,
       });
@@ -4801,6 +4873,7 @@ function summarizeActivityItems(
   if (waitedAgents > 0) {
     summaryParts.push(`Waited on ${waitedAgents} agent${waitedAgents === 1 ? "" : "s"}`);
   }
+  summaryParts.push(...subAgentActivitySummaryParts(details));
   if (failedCollabCalls > 0) {
     summaryParts.push(
       `${failedCollabCalls} collaboration tool${failedCollabCalls === 1 ? "" : "s"} failed`
@@ -4832,6 +4905,7 @@ function readStringArray(value: unknown): string[] {
 }
 
 function formatCollabAgentToolLabel(params: {
+  agents: Array<{ name?: string; threadId: string }>;
   tool: string;
   receiverThreadIds: string[];
   status: AppServerThreadActivityStatus | undefined;
@@ -4839,7 +4913,7 @@ function formatCollabAgentToolLabel(params: {
   const targetCount = params.receiverThreadIds.length;
   const targetLabel =
     targetCount === 1
-      ? `agent ${shortAgentId(params.receiverThreadIds[0] ?? "")}`
+      ? subAgentTargetLabel(params.agents[0])
       : targetCount > 1
         ? `${targetCount} agents`
         : "agent";
@@ -4881,6 +4955,7 @@ function formatCollabAgentToolLabel(params: {
 function buildCollabAgentCommandDetail(params: {
   item: Record<string, unknown>;
   label: string;
+  operation: NonNullable<AppServerThreadCommandDetail["subAgent"]>["operation"];
   receiverThreadIds: string[];
   tool: string;
 }): AppServerThreadCommandDetail {
@@ -4911,7 +4986,7 @@ function buildCollabAgentCommandDetail(params: {
     subAgent: {
       backend: "codex",
       origin: "codex-native",
-      operation: collabAgentOperation(params.tool),
+      operation: params.operation,
       agents: collabAgentDetails(params.item, params.receiverThreadIds),
       ...(model ? { model } : {}),
       ...(reasoningEffort ? { reasoningEffort } : {}),
@@ -4922,7 +4997,7 @@ function buildCollabAgentCommandDetail(params: {
 
 function collabAgentOperation(
   tool: string,
-): "spawn" | "wait" | "send_input" | "resume" | "close" | "unknown" {
+): NonNullable<AppServerThreadCommandDetail["subAgent"]>["operation"] {
   switch (tool) {
     case "spawnAgent":
       return "spawn";
@@ -4955,9 +5030,7 @@ function collabAgentDetails(
       .map(asRecord)
       .find((value) => pickString(value ?? {}, ["threadId", "thread_id", "id"]) === threadId);
     const receiverThread = asRecord(receiver?.thread) ?? receiver;
-    const name =
-      readCollabAgentName(state) ??
-      readCollabAgentName(receiverThread);
+    const name = readCodexNativeSubAgentName(state, receiverThread);
     const status = pickString(state ?? {}, ["status", "state"]);
     const message = pickString(state ?? {}, ["message", "output", "summary"]);
     return {
@@ -4967,26 +5040,6 @@ function collabAgentDetails(
       ...(message ? { message: truncateActivityText(message, 1_000) } : {}),
     };
   });
-}
-
-function readCollabAgentName(
-  value: Record<string, unknown> | null | undefined,
-): string | undefined {
-  if (!value) {
-    return undefined;
-  }
-  const direct = pickString(value, ["agentNickname", "agent_nickname", "nickname"]);
-  if (direct) {
-    return direct.replace(/^@+/, "");
-  }
-  const source = asRecord(value.source);
-  const subAgent = asRecord(source?.subAgent) ?? asRecord(source?.sub_agent);
-  const spawn =
-    asRecord(subAgent?.thread_spawn) ??
-    asRecord(subAgent?.threadSpawn) ??
-    asRecord(source?.thread_spawn) ??
-    asRecord(source?.threadSpawn);
-  return pickString(spawn ?? {}, ["agentNickname", "agent_nickname"]);
 }
 
 function formatCollabAgentStates(
@@ -5022,7 +5075,7 @@ function indentCollabAgentMessage(message: string): string {
 }
 
 function shortAgentId(agentId: string): string {
-  return agentId.length > 8 ? agentId.slice(0, 8) : agentId;
+  return shortSubAgentThreadId(agentId);
 }
 
 function truncateActivityText(text: string, maxLength: number): string {
@@ -5356,7 +5409,7 @@ export function extractThreadReplayFromReadResult(
     extractConversationMessages(value),
     entries,
   );
-  const agentName = extractCodexNativeAgentName(value);
+  const agentName = readCodexNativeSubAgentName(value);
   let lastUserMessage: string | undefined;
   let lastAssistantMessage: string | undefined;
 
@@ -5385,25 +5438,6 @@ export function extractThreadReplayFromReadResult(
   };
 }
 
-function extractCodexNativeAgentName(value: unknown): string | undefined {
-  const record = asRecord(value);
-  if (!record) {
-    return undefined;
-  }
-  const thread = asRecord(record.thread) ?? asRecord(record.session) ?? record;
-  const direct = pickString(thread, ["agentNickname", "agent_nickname", "nickname"]);
-  if (direct) {
-    return direct.replace(/^@+/, "");
-  }
-  const source = asRecord(thread.source) ?? asRecord(record.source);
-  const subAgent = asRecord(source?.subAgent) ?? asRecord(source?.sub_agent);
-  const spawn =
-    asRecord(subAgent?.thread_spawn) ??
-    asRecord(subAgent?.threadSpawn) ??
-    asRecord(source?.thread_spawn) ??
-    asRecord(source?.threadSpawn);
-  return pickString(spawn ?? {}, ["agentNickname", "agent_nickname"]);
-}
 
 function extractThreadIdFromValue(value: unknown): string | undefined {
   const record = asRecord(value);
@@ -5687,6 +5721,8 @@ function extractModelOptions(value: unknown): BackendModelOption[] {
           "supports_reasoning",
         ]) ?? (pickReasoningEfforts(modelRecord)?.length === 0 ? false : undefined),
         supportsFast: pickModelSupportsFast(modelRecord),
+        serviceTiers: pickModelServiceTierIds(modelRecord)
+          ?? pickModelAdditionalSpeedTiers(modelRecord),
         supportsSteering: pickBoolean(modelRecord, [
           "supportsSteering",
           "supports_steering",
@@ -5869,6 +5905,7 @@ function extractGeneratedModelOptions(
           (effort) => effort.reasoningEffort,
         ),
         supportsReasoning: model.supportedReasoningEfforts.length > 0,
+        serviceTiers: serviceTierIds,
         supportsFast:
           serviceTierIds.includes("priority")
           || additionalSpeedTiers.includes("fast"),
@@ -6114,6 +6151,10 @@ function readCodexNativeSubAgent(
   }
 
   const depth = pickNumber(spawn ?? {}, ["depth"]);
+  const agentPath =
+    pickString(record, ["agentPath", "agent_path"]) ??
+    pickString(sessionRecord ?? {}, ["agentPath", "agent_path"]) ??
+    pickString(spawn ?? {}, ["agentPath", "agent_path"]);
   const agentNickname =
     pickString(record, ["agentNickname", "agent_nickname"]) ??
     pickString(sessionRecord ?? {}, ["agentNickname", "agent_nickname"]) ??
@@ -6126,6 +6167,7 @@ function readCodexNativeSubAgent(
   return {
     parentThreadId,
     ...(depth !== undefined ? { depth } : {}),
+    ...(agentPath ? { agentPath } : {}),
     ...(agentNickname ? { agentNickname } : {}),
     ...(agentRole ? { agentRole } : {}),
   };
@@ -6225,6 +6267,7 @@ function extractThreadsFromValue(value: unknown, textCache: ThreadListTextCache)
       id: threadId,
       ...text,
       ...(threadStatus ? { threadStatus } : {}),
+      isPinned: pickBoolean(record, ["isPinned", "is_pinned"]),
       originator,
       path: rolloutPath,
       projectKey,
@@ -6288,6 +6331,7 @@ function buildThreadDiscoveryPayloads(
   cursor?: string,
   limit = 50,
   sourceKinds?: CodexThreadListParams["sourceKinds"],
+  ancestorThreadId?: string,
 ): CodexThreadListParams[] {
   const searchTerm = filter?.trim() || undefined;
   const baseParams: CodexThreadListParams = {
@@ -6297,7 +6341,13 @@ function buildThreadDiscoveryPayloads(
     sortKey: "updated_at",
     sourceKinds: sourceKinds ?? ["cli", "vscode"],
     useStateDbOnly: true,
+    ...(ancestorThreadId ? { ancestorThreadId } : {}),
   };
+
+  // A scoped recovery must never fall back to the global worker collection.
+  if (ancestorThreadId) {
+    return [{ ...baseParams, searchTerm }];
+  }
 
   return [
     {
@@ -6510,7 +6560,7 @@ function normalizeCodexServiceTier(
   if (normalized === "fast" || normalized === "priority") {
     return "priority";
   }
-  if (normalized === "flex") {
+  if (normalized === "flex" || normalized === "ultrafast") {
     return normalized;
   }
   return undefined;
@@ -6520,6 +6570,9 @@ function resolveCodexServiceTier(params: {
   fastMode?: boolean;
   serviceTier?: string | null;
 }): string | null | undefined {
+  if (params.serviceTier === "ultrafast") {
+    return "ultrafast";
+  }
   if (params.fastMode === true) {
     return "priority";
   }
@@ -7392,9 +7445,11 @@ async function requestThreadListPages(params: {
   filter?: string;
   limit?: number;
   maxPages?: number;
+  requireComplete?: boolean;
   requestTimeoutMs: number;
   deadlineAt?: number;
   sourceKinds?: CodexThreadListParams["sourceKinds"];
+  ancestorThreadId?: string;
 }): Promise<RawCodexThreadSummary[]> {
   const pages: RawCodexThreadSummary[] = [];
   const seenCursors = new Set<string>();
@@ -7423,6 +7478,7 @@ async function requestThreadListPages(params: {
         cursor,
         requestedLimit,
         params.sourceKinds,
+        params.ancestorThreadId,
       ),
       timeoutMs: params.requestTimeoutMs,
       deadlineAt: params.deadlineAt,
@@ -7450,6 +7506,7 @@ async function requestThreadListPages(params: {
       break;
     }
     if (seenCursors.has(nextCursor)) {
+      if (params.requireComplete) throw new Error("Thread discovery returned a repeated cursor; archive eligibility is incomplete.");
       terminalReason = "repeated-cursor";
       break;
     }
@@ -7503,6 +7560,13 @@ async function ensureCodexThreadTitleWorkspace(): Promise<string> {
   return CODEX_THREAD_TITLE_WORKSPACE_DIR;
 }
 
+type NativeVoiceCatalogProof = {
+  dynamicTools: unknown;
+  cwd?: string;
+  runtime?: CodexThreadEnvironmentRuntime;
+  defaultModeRequestUserInput?: boolean;
+};
+
 export class CodexAppServerClient {
   private readonly rawConnection: JsonRpcConnection;
   // All ordinary RPCs, including continuations of multi-request operations,
@@ -7514,6 +7578,10 @@ export class CodexAppServerClient {
   private pendingCloses = 0;
   private serverGeneration = 0;
   private readonly runningTurnIdsByThread = new Map<string, string>();
+  private readonly pricingSnapshotCache = new Map<string, { updatedAt?: number; tokens: ThreadUsageTokenBreakdown; serviceTier?: string }>();
+  private readonly pricingSnapshotReads = new Map<string, Promise<ThreadPricingSnapshot>>();
+  private pricingSnapshotReaderQueue: Promise<void> = Promise.resolve();
+  private cancelPricingSnapshotReader?: () => Promise<void>;
   // Bumped whenever a turn may have ended (a terminal, a thread status change,
   // a helper turn's cleanup, or a close). History recovery waits on it rather
   // than on a clock when another turn still runs on this process.
@@ -7548,6 +7616,8 @@ export class CodexAppServerClient {
   private initializationPromise: Promise<void> | null = null;
   private initializeResult: InitializeResult | null = null;
   private availableHelperModels: BackendModelOption[] = [];
+  private readonly realtimeListeners = new Set<(event: NativeVoiceNotification) => void>();
+  private readonly realtimeDisconnectListeners = new Set<() => void>();
   /** A `model/list` completed, so an empty catalog really is empty. */
   private helperModelsRead = false;
   /** The first helper turn's catalog read, shared by turns that start with it. */
@@ -7577,6 +7647,13 @@ export class CodexAppServerClient {
       request: AppServerPendingRequestNotification
     ) => Promise<unknown> | unknown
   >();
+  // Only thread/start in this live process proves the initial catalog. Forks
+  // and persisted IDs do not. Settings are acknowledged again at admission.
+  private readonly freshNativeVoiceThreads = new Map<string, NativeVoiceCatalogProof>();
+  // Admission proves the loaded catalog, independently of first-turn rollout
+  // bookkeeping. Owned realtime handoffs do not replace that catalog.
+  private readonly admittedNativeVoiceThreads = new Map<string, NativeVoiceCatalogProof>();
+  private readonly ownedRealtimeThreads = new Set<string>();
   private readonly pendingFirstTurnThreadResults = new Map<string, unknown>();
   private readonly pendingFirstTurnShellEnvironments = new Map<string, string | undefined>();
   private readonly helperThreadIds = new Set<string>();
@@ -7664,7 +7741,10 @@ export class CodexAppServerClient {
         : enrichThreadDirectory);
     this.rawConnection.setNotificationHandler(async (method, params) => {
       const isKnownCodexMethod = isKnownCodexNotificationMethod(method);
-      if (!isKnownCodexMethod) {
+      // Realtime is routed to live voice below, never logged: its payloads
+      // carry the operator's spoken words and session SDP, which stay memory
+      // only.
+      if (!isKnownCodexMethod && !method.startsWith("thread/realtime/")) {
         logUnhandledCodexMessage({
           kind: "notification",
           method,
@@ -7701,15 +7781,41 @@ export class CodexAppServerClient {
             ...(error ? { error } : {}),
           });
           this.mcpStartupStatusByContext.set(contextKey, statuses);
+          if (status === "failed") {
+            codexClientLog.error("MCP server startup failed", {
+              serverName: name,
+              ...(threadId ? { threadId } : {}),
+              ...(error ? { error } : {}),
+            });
+          }
         }
       }
 
+      // Realtime is ephemeral audio/control traffic. Keep it off ordinary
+      // transcript, federation and persistence paths.
+      if (method.startsWith("thread/realtime/")) {
+        const event = { method, params } as NativeVoiceNotification;
+        if (method === "thread/realtime/closed") {
+          const threadId = pickString(asRecord(params) ?? {}, ["threadId", "thread_id"]);
+          if (threadId) this.ownedRealtimeThreads.delete(threadId);
+        }
+        for (const listener of this.realtimeListeners) listener(event);
+        return;
+      }
       const normalized = normalizeServerNotification(
         method,
         params,
       );
       if (navigationQueryEventRequiresRefresh(method)) this.invalidateThreadListings(normalized);
       const helperThreadId = extractThreadIdFromNotification(normalized, params);
+      if (helperThreadId && (normalized.method === "turn/started" || method === "thread/closed")) {
+        this.freshNativeVoiceThreads.delete(helperThreadId);
+        this.pendingFirstTurnThreadResults.delete(helperThreadId);
+        this.pendingFirstTurnShellEnvironments.delete(helperThreadId);
+        if (method === "thread/closed" || !this.ownedRealtimeThreads.has(helperThreadId)) {
+          this.admittedNativeVoiceThreads.delete(helperThreadId);
+        }
+      }
       if (helperThreadId && this.helperThreadIds.has(helperThreadId)) {
         this.handleHelperThreadNotification(normalized.method, normalized);
         if (isLiveTurnActivityMethod(method, normalized.method)) {
@@ -7772,6 +7878,10 @@ export class CodexAppServerClient {
         throw new Error(`No desktop request handler registered for ${method}`);
       }
 
+      if (method === "mcpServer/elicitation/request") {
+        logMcpElicitationRequest(params, rpcId == null ? undefined : String(rpcId));
+      }
+
       if (!isHandledServerRequestMethod(method)) {
         logUnhandledCodexMessage({
           kind: "request",
@@ -7799,6 +7909,10 @@ export class CodexAppServerClient {
     // A restart waiting out its backoff must not hold close open. Its
     // initialization sees the new close generation and gives up.
     this.cancelRestartBackoff?.();
+    // Snapshot resumes own a separate writer. Release its notification waiter
+    // and transport before the lifecycle barrier drains the admitted read.
+    const stoppedReader = this.cancelPricingSnapshotReader?.();
+    void stoppedReader?.catch(() => undefined);
     // Stop the transport now: pending RPC responses must not hold shutdown
     // (or a recovery waiting to drain those RPCs) until their timeouts expire.
     const stopped = this.stopTransport();
@@ -7960,6 +8074,7 @@ export class CodexAppServerClient {
   }
 
   private resetConnectionState(helperTurnError: Error): void {
+    for (const listener of this.realtimeDisconnectListeners) listener();
     this.initialized = false;
     this.tokenMiserActivationNegotiated = false;
     this.runningTurnIdsByThread.clear();
@@ -7970,6 +8085,9 @@ export class CodexAppServerClient {
     this.rejectHelperTurnWaiters(helperTurnError);
     this.invalidateThreadListings();
     this.threadListTextCache.clear();
+    this.freshNativeVoiceThreads.clear();
+    this.admittedNativeVoiceThreads.clear();
+    this.ownedRealtimeThreads.clear();
     this.pendingFirstTurnThreadResults.clear();
     this.pendingFirstTurnShellEnvironments.clear();
     this.recordedThreadNames.clear();
@@ -8251,6 +8369,39 @@ export class CodexAppServerClient {
       });
       return { recovered: recoveryResult! };
     });
+  }
+
+  onRealtimeEvent(listener: (event: NativeVoiceNotification) => void): () => void {
+    this.realtimeListeners.add(listener);
+    return () => { this.realtimeListeners.delete(listener); };
+  }
+
+  onRealtimeDisconnect(listener: () => void): () => void {
+    this.realtimeDisconnectListeners.add(listener);
+    return () => { this.realtimeDisconnectListeners.delete(listener); };
+  }
+
+  async startRealtime(params: ThreadRealtimeStartParams): Promise<void> {
+    await this.ensureInitialized();
+    this.ownedRealtimeThreads.add(params.threadId);
+    try {
+      await this.connection.request("thread/realtime/start", params, 20_000);
+    } catch (error) {
+      this.ownedRealtimeThreads.delete(params.threadId);
+      throw error;
+    }
+  }
+
+  async stopRealtime(threadId: string): Promise<void> {
+    // Never restart a disconnected backend merely to stop voice.
+    if (!this.initialized || this.pendingCloses > 0) return;
+    await this.connection.request("thread/realtime/stop", { threadId }, 10_000);
+    this.ownedRealtimeThreads.delete(threadId);
+  }
+
+  async appendRealtimeText(threadId: string, text: string): Promise<void> {
+    if (!this.initialized || this.pendingCloses > 0) throw new Error("Voice backend disconnected.");
+    await this.connection.request("thread/realtime/appendText", { threadId, text, role: "user" }, 10_000);
   }
 
   onNotification(
@@ -8740,6 +8891,7 @@ export class CodexAppServerClient {
     filter?: string;
     limit?: number;
     maxPages?: number;
+    requireComplete?: boolean;
     skipArchivedMetadataRefresh?: boolean;
     deadlineAt?: number;
   }, diagnostics?: JsonRpcObserverDiagnostics): Promise<AppServerThreadSummary[]> {
@@ -8753,6 +8905,7 @@ export class CodexAppServerClient {
       params?.archived === true, params?.enrichDirectories ?? true,
       params?.filter?.trim() || "", params?.limit, params?.maxPages,
       params?.skipArchivedMetadataRefresh === true, params?.deadlineAt,
+      params?.requireComplete === true,
     ]);
     const existing = this.pendingThreadListings.get(key);
     if (existing) {
@@ -8788,6 +8941,7 @@ export class CodexAppServerClient {
         filter: params?.filter,
         limit: params?.limit,
         maxPages: params?.maxPages,
+        requireComplete: params?.requireComplete,
         requestTimeoutMs: requestParams.timeoutMs,
         deadlineAt: params?.deadlineAt,
       });
@@ -8805,6 +8959,7 @@ export class CodexAppServerClient {
         filter: params?.filter,
         limit: params?.limit,
         maxPages: params?.maxPages,
+        requireComplete: params?.requireComplete,
         requestTimeoutMs: requestParams.timeoutMs,
         deadlineAt: params?.deadlineAt,
       }),
@@ -8833,14 +8988,18 @@ export class CodexAppServerClient {
    * the shorter display horizon after grouping nested workers.
    */
   async listNativeSubAgentThreads(params?: {
+    ancestorThreadId?: string;
     filter?: string;
     limit?: number;
+    /** Housekeeping needs every descendant before archiving a parent. */
+    all?: boolean;
+    archived?: boolean;
   }, diagnostics?: JsonRpcObserverDiagnostics): Promise<AppServerThreadSummary[]> {
     await this.ensureInitialized();
 
     const nativeThreads = await requestThreadListPages({
       textCache: this.threadListTextCache,
-      archived: false,
+      archived: params?.archived === true,
       client: this.connection,
       diagnostics,
       filter: params?.filter,
@@ -8851,9 +9010,11 @@ export class CodexAppServerClient {
           CODEX_NATIVE_SUBAGENT_DISCOVERY_LIMIT,
         ),
       ),
-      maxPages: 1,
+      maxPages: params?.all ? undefined : 1,
+      requireComplete: params?.all,
       requestTimeoutMs: this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
-      sourceKinds: ["subAgentThreadSpawn"],
+      sourceKinds: ["subAgent", "subAgentThreadSpawn"],
+      ancestorThreadId: params?.ancestorThreadId,
     });
 
     return await this.enrichThreads(
@@ -9231,7 +9392,7 @@ export class CodexAppServerClient {
   }
 
   /**
-   * The model and effort one helper turn runs, by the shared Default Models
+   * The model and effort one helper turn runs, by the shared helper model
    * rule. Reuses the catalog from the last `model/list`, so a title, diff, or
    * tool-output summary never fetches a list of its own; the catalog is read
    * once only while nothing has been listed yet. Refresh updates it.
@@ -9364,6 +9525,88 @@ export class CodexAppServerClient {
     });
   }
 
+  async readThreadPricingSnapshot(threadId: string): Promise<ThreadPricingSnapshot> {
+    await this.ensureInitialized();
+    const existing = this.pricingSnapshotReads.get(threadId);
+    if (existing) return await existing;
+    const pending = this.runAdmittedRequest(async () => {
+      const result = await this.connection.request("thread/read", { threadId, includeTurns: false },
+        this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS);
+      const thread = asRecord(asRecord(result)?.thread);
+      if (thread?.id !== threadId) return {};
+      const model = pickString(thread, ["model"]);
+      const updatedAt = pickNumber(thread, ["updatedAt"]);
+      const cached = this.pricingSnapshotCache.get(threadId);
+      if (cached && updatedAt !== undefined && cached.updatedAt === updatedAt) return {
+        model, tokens: cached.tokens, ...(cached.serviceTier ? { serviceTier: cached.serviceTier } : {}),
+      };
+
+      // A resume emits saved cumulative usage, but also acquires the writer.
+      // Use a short-lived isolated process so the snapshot cannot become an
+      // observed turn charge or keep another app from opening the thread.
+      const closeGeneration = this.closeGeneration;
+      const read = this.pricingSnapshotReaderQueue.then(async () => {
+        if (this.pendingCloses > 0 || closeGeneration !== this.closeGeneration) return { model };
+        const reader = new CodexAppServerClient({ ...this.options, connectionObserver: undefined, authenticationRecovery: false });
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let tokens: ThreadUsageTokenBreakdown | undefined;
+        let received = false;
+        let cancelled = false;
+        let readerClose: Promise<void> | undefined;
+        let finish!: () => void;
+        const receivedUsage = new Promise<void>((resolve) => { finish = resolve; });
+        const closeReader = () => readerClose ??= reader.close();
+        const cancelReader = () => {
+          cancelled = true;
+          if (timer) clearTimeout(timer);
+          finish();
+          return closeReader();
+        };
+        this.cancelPricingSnapshotReader = cancelReader;
+        const unsubscribe = reader.onNotification((notification) => {
+          if (notification.method !== "thread/tokenUsage/updated" || notification.params.threadId !== threadId) return;
+          tokens = readTokenUsageBreakdown(asRecord(asRecord(notification.params.tokenUsage)?.total) ?? {});
+          received = true;
+          finish();
+        });
+        try {
+          await reader.ensureInitialized();
+          if (cancelled) return { model };
+          const resumed = asRecord(await reader.connection.request("thread/resume", { threadId, excludeTurns: true },
+            this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS));
+          if (!received && !cancelled) {
+            // Bound compatibility with servers that do not emit a snapshot.
+            // Supported servers satisfy this through the notification, not a delay.
+            timer = setTimeout(finish, this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS);
+            await receivedUsage;
+          }
+          if (cancelled) return { model };
+          const serviceTier = pickString(resumed ?? {}, ["serviceTier"]);
+          if (tokens && updatedAt !== undefined) rememberBoundedMap(this.pricingSnapshotCache, threadId, { updatedAt, tokens, serviceTier }, 1_000);
+          return { model: pickString(resumed ?? {}, ["model"]) ?? model, tokens, ...(serviceTier ? { serviceTier } : {}) };
+        } catch (error) {
+          // Another app may still own the writer. Keep counts unknown and
+          // let a later explicit panel read try again after that app closes.
+          codexClientLog.debug("historical pricing snapshot unavailable", { threadId, error: String(error) });
+          return { model };
+        } finally {
+          if (timer) clearTimeout(timer);
+          unsubscribe();
+          if (this.cancelPricingSnapshotReader === cancelReader) this.cancelPricingSnapshotReader = undefined;
+          await closeReader();
+        }
+      });
+      this.pricingSnapshotReaderQueue = read.then(() => undefined, () => undefined);
+      return await read;
+    });
+    this.pricingSnapshotReads.set(threadId, pending);
+    try {
+      return await pending;
+    } finally {
+      this.pricingSnapshotReads.delete(threadId);
+    }
+  }
+
   async readThreadActivity(params: {
     threadId: string;
     turnId: string;
@@ -9384,6 +9627,20 @@ export class CodexAppServerClient {
     const entry = replay.entries.find((candidate) => candidate.type === "activity" && candidate.id === params.entryId);
     if (!entry || entry.type !== "activity") throw new Error("Activity details are no longer available. Reload the thread.");
     return entry;
+  }
+
+  async readThreadSummary(threadId: string): Promise<AppServerThreadSummary> {
+    await this.ensureInitialized();
+    const result = await requestWithThreadMetadataReadRetry(async () =>
+      await this.connection.request("thread/read", { threadId, includeTurns: false },
+        this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS),
+    );
+    const summaries = await this.enrichThreads(extractThreadsFromValue({ data: [asRecord(result)?.thread] }, this.threadListTextCache), {
+      enrichDirectories: false,
+    });
+    const thread = summaries.find((summary) => summary.id === threadId);
+    if (!thread) throw new Error(`Thread metadata was not found: ${threadId}`);
+    return { ...thread, linkedDirectories: buildProjectKeyLinkedDirectories(thread.projectKey) };
   }
 
   async listBackgroundTerminals(threadId: string): Promise<ListBackgroundTerminalsResponse> {
@@ -9510,6 +9767,30 @@ export class CodexAppServerClient {
     return extractThreadReplayFromReadResult(result, { threadId: params.threadId });
   }
 
+  /**
+   * The model and effort Codex reports for a thread: its configured settings
+   * while loaded, otherwise the latest persisted ones. Turns are not read.
+   */
+  async readThreadModelSettings(params: {
+    threadId: string;
+  }): Promise<{ model?: string; reasoningEffort?: string } | undefined> {
+    await this.ensureInitialized();
+    const result = await this.connection.request(
+      "thread/read",
+      buildThreadReadPayload({ threadId: params.threadId }),
+      this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+    );
+    const thread = asRecord(asRecord(result)?.thread);
+    if (!thread || thread.id !== params.threadId) {
+      return undefined;
+    }
+    const model = pickString(thread, ["model"]);
+    const reasoningEffort = pickString(thread, ["reasoningEffort", "reasoning_effort"]);
+    return model || reasoningEffort
+      ? { ...(model ? { model } : {}), ...(reasoningEffort ? { reasoningEffort } : {}) }
+      : undefined;
+  }
+
   /** Export bytes through Codex; never open or parse its private storage. */
   async exportThreadForHandoff(threadId: string): Promise<import("@pwragent/shared").ThreadHandoffExport> {
     await this.ensureInitialized();
@@ -9533,14 +9814,65 @@ export class CodexAppServerClient {
   }
 
   /**
+   * A stock runtime can reuse its acknowledged catalog across owned realtime
+   * handoffs. First-turn rollout bookkeeping is separate from catalog proof.
+   * Unknown turns, mutations and reset revoke admission; drift needs refresh.
+   */
+  async prepareFreshNativeVoiceThread(params: Parameters<CodexAppServerClient["refreshThreadTools"]>[0]): Promise<boolean> {
+    await this.ensureInitialized();
+    const admitted = this.admittedNativeVoiceThreads.get(params.threadId);
+    const fresh = admitted ?? this.freshNativeVoiceThreads.get(params.threadId);
+    if (!fresh || (!admitted && !this.pendingFirstTurnThreadResults.has(params.threadId))) return false;
+    const payload = buildThreadStartPayload({
+      ...params, pwrdrvrTokenMiser: params.pwrdrvrTokenMiser ?? undefined,
+      bundledToolsDirectory: this.options.bundledToolsDirectory,
+    }, this.getProtocolCompatibility());
+    if (!isDeepStrictEqual(fresh.dynamicTools, payload.dynamicTools ?? [])
+      || fresh.cwd !== payload.cwd
+      || !isDeepStrictEqual(fresh.runtime, params.codexEnvironmentRuntime)
+      || fresh.defaultModeRequestUserInput !== params.defaultModeRequestUserInput) return false;
+
+    // thread/start has no effort field. Even an unchanged overlay can require
+    // an effort update; await all effective settings, including permissions,
+    // before automatic realtime handoffs can run a coding turn.
+    await this.connection.request("thread/settings/update", {
+      ...buildThreadSettingsUpdatePayload(params),
+      threadId: params.threadId,
+      approvalPolicy: payload.approvalPolicy,
+      approvalsReviewer: payload.approvalsReviewer,
+      sandboxPolicy: buildCodexSandboxPolicy(params.sandbox),
+    }, this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS);
+    const current = admitted
+      ? this.admittedNativeVoiceThreads.get(params.threadId)
+      : this.freshNativeVoiceThreads.get(params.threadId);
+    if (current !== fresh) return false;
+    this.admittedNativeVoiceThreads.set(params.threadId, fresh);
+    return true;
+  }
+
+  /**
    * Refresh the catalog without starting inference. The registry negotiates
    * dynamicToolsResumeField and reserves the idle thread before calling this.
    */
-  async refreshThreadTools(params: {
-    threadId: string;
+  async refreshThreadTools(params: Parameters<typeof buildThreadResumePayloads>[0] & {
     dynamicTools: CodexDynamicToolSpec[];
   }): Promise<void> {
+    await this.prepareIdleNativeVoiceThread(params);
+  }
+
+  /**
+   * Restore a PwrAgent-owned director's persisted catalog on stock Codex.
+   * This does not acknowledge or replace it with the current tool catalog.
+   * The registry restricts this path to the remembered Voice manager.
+   */
+  async resumeNativeVoiceThread(params: Omit<Parameters<CodexAppServerClient["refreshThreadTools"]>[0], "dynamicTools">): Promise<void> {
+    await this.prepareIdleNativeVoiceThread({ ...params, dynamicTools: undefined });
+  }
+
+  private async prepareIdleNativeVoiceThread(params: Parameters<typeof buildThreadResumePayloads>[0]): Promise<void> {
     await this.ensureInitialized();
+    this.freshNativeVoiceThreads.delete(params.threadId);
+    this.admittedNativeVoiceThreads.delete(params.threadId);
     const connection = this.createThreadOperationConnection();
     const current = await requestWithFallbacks({
       client: connection,
@@ -9551,12 +9883,29 @@ export class CodexAppServerClient {
     if (readThreadStatus(current) === "active") {
       throw new Error("Wait for the current turn to finish or stop it, then change Agent thread status.");
     }
+    const [resumePayload] = buildThreadResumePayloads({
+      ...params, bundledToolsDirectory: this.options.bundledToolsDirectory,
+    }, this.getProtocolCompatibility());
     await requestWithFallbacks({
       client: connection,
       methods: ["thread/resume"],
-      payloads: buildThreadResumePayloads(params, this.getProtocolCompatibility()),
+      payloads: [resumePayload],
       timeoutMs: this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
     });
+    // Rejoining a loaded thread preserves its model/effort. Automatic voice
+    // handoffs have no turn/start settings override, so update the live thread
+    // explicitly and await acknowledgement before admitting realtime.
+    const settings = buildThreadSettingsUpdatePayload(params);
+    if (settings || params.approvalPolicy || params.approvalsReviewer || params.sandbox) {
+      const payload: CodexThreadSettingsUpdateParams = {
+        ...settings, threadId: params.threadId,
+        approvalPolicy: resumePayload.approvalPolicy as CodexThreadSettingsUpdateParams["approvalPolicy"],
+        approvalsReviewer: resumePayload.approvalsReviewer,
+        sandboxPolicy: buildCodexSandboxPolicy(params.sandbox),
+      };
+      await connection.request("thread/settings/update", payload,
+        this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS);
+    }
   }
 
   async injectThreadItems(params: {
@@ -9597,18 +9946,13 @@ export class CodexAppServerClient {
   }): Promise<{ threadId: string }> {
     await this.ensureInitialized();
 
+    const startPayload = buildThreadStartPayload({
+      ...params, bundledToolsDirectory: this.options.bundledToolsDirectory,
+    }, this.getProtocolCompatibility());
     const result = await requestWithFallbacks({
       client: this.connection,
       methods: ["thread/start"],
-      payloads: [
-        buildThreadStartPayload(
-          {
-            ...params,
-            bundledToolsDirectory: this.options.bundledToolsDirectory,
-          },
-          this.getProtocolCompatibility(),
-        ),
-      ],
+      payloads: [startPayload],
       timeoutMs: this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
     });
 
@@ -9617,6 +9961,12 @@ export class CodexAppServerClient {
       throw new Error("codex app server thread/start did not return threadId");
     }
 
+    this.freshNativeVoiceThreads.set(threadId, {
+      dynamicTools: structuredClone(startPayload.dynamicTools ?? []),
+      cwd: params.cwd?.trim() || undefined,
+      runtime: structuredClone(params.codexEnvironmentRuntime),
+      defaultModeRequestUserInput: params.defaultModeRequestUserInput,
+    });
     this.pendingFirstTurnThreadResults.set(threadId, result);
     this.pendingFirstTurnShellEnvironments.set(
       threadId,
@@ -9739,6 +10089,10 @@ export class CodexAppServerClient {
     }
     let resumeResult = pendingFirstTurnResult;
     if (!pendingFirstTurnResult || refreshPendingFirstTurn) {
+      // Resume can replace the catalog or environment even if input
+      // preparation or turn/start later fails. Drop proof before sending it.
+      this.freshNativeVoiceThreads.delete(params.threadId);
+      this.admittedNativeVoiceThreads.delete(params.threadId);
       const resume = requestWithFallbacks({
         client: connection,
         methods: ["thread/resume"],
@@ -9825,6 +10179,8 @@ export class CodexAppServerClient {
 
     const threadId = extractThreadIdFromValue(result) ?? params.threadId;
     const turnId = extractTurnIdFromValue(result) ?? `pending:${threadId}`;
+    this.freshNativeVoiceThreads.delete(params.threadId);
+    this.admittedNativeVoiceThreads.delete(params.threadId);
     this.pendingFirstTurnThreadResults.delete(params.threadId);
     this.pendingFirstTurnShellEnvironments.delete(params.threadId);
     await this.recordDerivedThreadNameWithCodex({
@@ -9852,7 +10208,7 @@ export class CodexAppServerClient {
    * generation path; the output record is identified by `isMatch`.
    */
   async generateStructuredObject(params: {
-    /** Which Default Models row picks the model. */
+    /** Which helper is running, for its per-helper override and effort. */
     helper: HelperModelId;
     /** Overrides the row for this call only, when Codex offers it. */
     model?: string;
@@ -10256,6 +10612,11 @@ export class CodexAppServerClient {
     await this.ensureInitialized();
     const connection = this.createThreadOperationConnection();
 
+    // Resume and settings updates can mutate the loaded thread even when
+    // review/start fails. Revoke catalog admission before either request.
+    this.freshNativeVoiceThreads.delete(params.threadId);
+    this.admittedNativeVoiceThreads.delete(params.threadId);
+
     const pendingFirstTurn = this.pendingFirstTurnThreadResults.has(
       params.threadId,
     );
@@ -10405,6 +10766,15 @@ export class CodexAppServerClient {
     return {
       threadId: params.threadId,
     };
+  }
+
+  async deleteThread(params: { threadId: string }): Promise<{ threadId: string }> {
+    await this.ensureInitialized();
+    await requestWithFallbacks({
+      client: this.connection, methods: ["thread/delete"], payloads: [params],
+      timeoutMs: this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+    });
+    return { threadId: params.threadId };
   }
 
   async restoreThread(params: { threadId: string }): Promise<{ threadId: string }> {
@@ -10669,7 +11039,7 @@ export class CodexAppServerClient {
     };
   }
 
-  private async runAdmittedRequest(work: () => Promise<unknown>): Promise<unknown> {
+  private async runAdmittedRequest<T>(work: () => Promise<T>): Promise<T> {
     if (this.pendingCloses > 0) throw new Error("codex app server client closed");
     const generation = this.closeGeneration;
     while (this.lifecycleBarrier) {

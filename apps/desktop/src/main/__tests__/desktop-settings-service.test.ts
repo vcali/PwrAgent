@@ -1485,6 +1485,33 @@ describe("DesktopSettingsService", () => {
     expect(reopened.resolveTokenMiserPollingReviewsEnabled()).toBe(true);
   });
 
+  it("defaults diagnostic capture off and persists their toggle", async () => {
+    const configPath = path.join(createTempRoot(), "config.toml");
+    const service = new DesktopSettingsService({
+      configPath,
+      env: {},
+      secretStore: new MemoryDesktopSecretStore(),
+    });
+    expect(service.resolveTokenMiserDiagnosticsEnabled()).toBe(false);
+    const projection = await service.readSettingsProjection();
+    expect(projection.experimental.tokenMiserDiagnosticsEnabled)
+      .toEqual({ value: false, source: "default" });
+    // The same folder the registry's collector writes, shown even while off.
+    expect(projection.runtime.tokenMiserDiagnosticsDirectory).toBe(
+      path.join(path.dirname(configPath), "state", "token-miser", "diagnostics"),
+    );
+    await service.writeConfigPatchTargeted({
+      experimental: { tokenMiserDiagnosticsEnabled: true },
+    });
+    expect(service.resolveTokenMiserDiagnosticsEnabled()).toBe(true);
+    const reopened = new DesktopSettingsService({
+      configPath,
+      env: {},
+      secretStore: new MemoryDesktopSecretStore(),
+    });
+    expect(reopened.resolveTokenMiserDiagnosticsEnabled()).toBe(true);
+  });
+
   it("defaults Token Miser unavailable with inherited thread use on", async () => {
     const root = createTempRoot();
     const configPath = path.join(root, "config.toml");
@@ -2946,6 +2973,7 @@ describe("DesktopSettingsService", () => {
           theme: "light",
           darkTheme: "solarized-dark",
           lightTheme: "catppuccin-latte",
+          themedDockIcon: false,
           density: "compact",
           sidebarTextSize: "lg",
         },
@@ -2957,6 +2985,7 @@ describe("DesktopSettingsService", () => {
     expect(writtenFile).toContain('theme = "light"');
     expect(writtenFile).toContain('dark_theme = "solarized-dark"');
     expect(writtenFile).toContain('light_theme = "catppuccin-latte"');
+    expect(writtenFile).toContain("themed_dock_icon = false");
     expect(writtenFile).toContain('density = "compact"');
     expect(writtenFile).toContain('sidebar_text_size = "lg"');
 
@@ -2971,6 +3000,10 @@ describe("DesktopSettingsService", () => {
     });
     expect(afterWrite.general.appearance.lightTheme).toEqual({
       value: "catppuccin-latte",
+      source: "config",
+    });
+    expect(afterWrite.general.appearance.themedDockIcon).toEqual({
+      value: false,
       source: "config",
     });
     expect(afterWrite.general.appearance.density).toEqual({
@@ -2998,6 +3031,7 @@ describe("DesktopSettingsService", () => {
           theme: "system",
           darkTheme: "tangerine-dark",
           lightTheme: "tangerine-light",
+          themedDockIcon: true,
           density: "mission-control",
           sidebarTextSize: "md",
         },
@@ -3008,6 +3042,7 @@ describe("DesktopSettingsService", () => {
     expect(restoredFile).not.toContain('theme = "');
     expect(restoredFile).not.toContain("dark_theme");
     expect(restoredFile).not.toContain("light_theme");
+    expect(restoredFile).not.toContain("themed_dock_icon");
     expect(restoredFile).not.toContain('density = "');
     expect(restoredFile).not.toContain('sidebar_text_size = "');
 
@@ -3015,6 +3050,10 @@ describe("DesktopSettingsService", () => {
     expect(afterRestore.general.appearance.theme.source).toBe("default");
     expect(afterRestore.general.appearance.darkTheme.source).toBe("default");
     expect(afterRestore.general.appearance.lightTheme.source).toBe("default");
+    expect(afterRestore.general.appearance.themedDockIcon).toEqual({
+      value: true,
+      source: "default",
+    });
     expect(afterRestore.general.appearance.density.source).toBe("default");
     expect(afterRestore.general.appearance.sidebarTextSize.source).toBe(
       "default",

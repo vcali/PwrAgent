@@ -8,6 +8,7 @@ import {
   type TokenMiserServiceOptions,
 } from "../token-miser/token-miser-service";
 import { TestTokenMiserStore as TokenMiserStore } from "./token-miser-test-store";
+import { TokenMiserDiagnostics } from "../token-miser/token-miser-diagnostics";
 import { resolveAgentToolCatalogs } from "../agent-tools/agent-tool-catalog-registry";
 import { buildPwrAgentToolSearchDefinition } from "../agent-tools/pwragent-tool-search";
 import { buildMcpGatewayToolDefinitions } from "../agent-tools/pwragent-mcp-gateway-tools";
@@ -35,6 +36,144 @@ afterEach(async () => {
 });
 
 describe("TokenMiserService", () => {
+  it.each([
+    { toolName: "pwragent", input: { tool: "call_mcp_tool", connectionId: "one", toolName: "lookup" }, expected: 'mcp:["one","lookup"]' },
+    { toolName: "pwragent", input: { tool: "call_mcp_tool", arguments: { connectionId: "one", toolName: "lookup" } }, expected: 'mcp:["one","lookup"]' },
+    { toolName: "Bash", input: { name: "get_profile", command: "true" }, expected: "Bash" },
+    { toolName: "pwragent", input: { tool: 123, name: "", operation: null }, expected: "pwragent" },
+  ])("preserves attribution for $expected", async ({ toolName, input, expected }) => {
+    const store = await createStore();
+    const diagnostics = new TokenMiserDiagnostics({ filePath: "unused", isEnabled: () => true });
+    const record = vi.spyOn(diagnostics, "recordInvocation");
+    const service = new TokenMiserService({
+      store, diagnostics, isEnabled: () => true, thresholdCharacters: 9,
+      generateSummary: async () => ({ status: "failed", reason: "small output" }),
+    });
+    try {
+      await service.preparePostToolUse({ ...payload("ok"), tool_name: toolName, tool_input: input });
+      expect(record).toHaveBeenCalledWith(expect.objectContaining({ toolName: expected }));
+    } finally { await diagnostics.close(); }
+  });
+
+  it.each(["tool", "name", "operation"].flatMap((field) =>
+    [false, true].map((nested) => ({ field, nested }))
+  ))("classifies dispatched retrievals through $field (nested: $nested)", async ({ field, nested }) => {
+    const store = await createStore();
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "miser-dispatch-"));
+    temporaryDirectories.push(directory);
+    const file = path.join(directory, "diagnostics.jsonl");
+    const diagnostics = new TokenMiserDiagnostics({ filePath: file, isEnabled: () => true, sampleEvery: 1 });
+    const service = new TokenMiserService({
+      store, diagnostics, isEnabled: () => true, thresholdCharacters: 9,
+      generateSummary: async () => ({ status: "ok", object: {
+        disposition: "summarize", summary: "Host result", usefulDetails: [],
+      } }),
+    });
+    try {
+      const seed = await service.preparePostToolUse({
+        ...payload("fixture host result"), tool_name: "pwragent", tool_input: { [field]: "read_thread" },
+      });
+      await seed!.staged.commit();
+      for (const tool of ["read_all_token_miser_output", "read_token_miser_output", "summarize_token_miser_output"]) {
+        const request = { ...payload("expired retrieval"), tool_name: "pwragent", tool_input: { [field]: tool, objectId: "missing" } };
+        if (nested) await service.captureNestedPostToolUse({ ...request, is_code_mode_nested: true });
+        else expect(await service.preparePostToolUse(request)).toBeUndefined();
+      }
+      diagnostics.endTurn("thread-1");
+      await diagnostics.close();
+      const [row] = (await fs.readFile(file, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+      expect(row.category).toBe("summarized_no_recovery_observed");
+      const attempts = row.events.filter((event: { kind: string }) => event.kind === "retrieval_attempt");
+      expect(attempts.map((event: { data: { toolName: string; retrievalMode: string; codeMode: boolean } }) => event.data))
+        .toEqual([
+          expect.objectContaining({ toolName: "pwragent.read_all_token_miser_output", retrievalMode: "all_requested", codeMode: nested }),
+          expect.objectContaining({ toolName: "pwragent.read_token_miser_output", retrievalMode: "some_requested", codeMode: nested }),
+          expect.objectContaining({ toolName: "pwragent.summarize_token_miser_output", retrievalMode: "focused_summary_requested", codeMode: nested }),
+        ]);
+    } finally { await diagnostics.close(); }
+  });
+
+  it.each(["tool", "name", "operation"].flatMap((field) =>
+    [false, true].map((grouped) => ({ field, grouped }))
+  ))("distinguishes dispatched gate identities through $field (grouped: $grouped)", async ({ field, grouped }) => {
+    const store = await createStore();
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "miser-dispatch-"));
+    temporaryDirectories.push(directory);
+    const file = path.join(directory, "diagnostics.jsonl");
+    const diagnostics = new TokenMiserDiagnostics({ filePath: file, isEnabled: () => true, sampleEvery: 1 });
+    const service = new TokenMiserService({
+      store, diagnostics, isEnabled: () => true, thresholdCharacters: 9, codeModeGroupingVersion: () => 1,
+      generateSummary: async () => ({ status: "ok", object: {
+        disposition: "summarize", summary: "Host result", usefulDetails: [],
+        ...(grouped ? { members: [{ toolCallId: "nested-1", summary: "Thread result" }] } : {}),
+      } }),
+    });
+    const dispatched = (tool: string, output: string) => ({
+      ...payload(output), tool_name: "pwragent", tool_input: { [field]: tool },
+    });
+    try {
+      const seed = dispatched("read_thread", "fixture host result");
+      let prepared;
+      if (grouped) {
+        await service.captureNestedPostToolUse({
+          ...seed, is_code_mode_nested: true, token_miser_grouping_version: 1,
+          code_mode_cell_id: "cell-1", code_mode_tool_call_id: "nested-1",
+        });
+        prepared = await service.prepareCodeModeOutput(codeModePayload([{ type: "input_text", text: "fixture host result" }]));
+      } else prepared = await service.preparePostToolUse(seed);
+      await prepared!.staged.commit();
+      for (const tool of ["get_profile", "list_threads", "get_thread_status", "read_thread", "read_thread", "read_thread"]) {
+        const request = dispatched(tool, "ok");
+        if (grouped) await service.captureNestedPostToolUse({ ...request, is_code_mode_nested: true });
+        else expect(await service.preparePostToolUse(request)).toBeUndefined();
+      }
+      diagnostics.endTurn("thread-1");
+      await diagnostics.close();
+      const [row] = (await fs.readFile(file, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+      expect(row).toMatchObject({ category: "suspected_retry_burst", repeats: 3, exactRepeats: 3 });
+      const gate = row.events.find((event: { kind: string }) => event.kind === "gate");
+      expect(gate.data.invocations).toEqual([expect.objectContaining({ toolName: "pwragent.read_thread" })]);
+      expect(row.events.filter((event: { kind: string }) => event.kind === "tool")
+        .map((event: { data: { toolName: string } }) => event.data.toolName)).toEqual([
+        "pwragent.read_thread", "pwragent.get_profile", "pwragent.list_threads", "pwragent.get_thread_status",
+        "pwragent.read_thread", "pwragent.read_thread", "pwragent.read_thread",
+      ]);
+    } finally { await diagnostics.close(); }
+  });
+
+  it("captures gates only after acceptance, once, and ignores discarded proposals", async () => {
+    const store = await createStore();
+    const diagnostics = new TokenMiserDiagnostics({ filePath: "unused", isEnabled: () => true });
+    const recordGate = vi.spyOn(diagnostics, "recordGate").mockImplementation(() => undefined);
+    const service = new TokenMiserService({
+      store, diagnostics, isEnabled: () => true, thresholdCharacters: 9,
+      generateSummary: async () => ({ status: "ok", object: {
+        disposition: "summarize", summary: "Four records", usefulDetails: [],
+      } }),
+    });
+    try {
+      const discarded = await service.preparePostToolUse(payload("1\n2\n3\n4000"));
+      await discarded!.staged.persist();
+      expect(recordGate).not.toHaveBeenCalled();
+      await discarded!.staged.discard();
+      const accepted = await service.preparePostToolUse({
+        ...payload("1\n2\n3\n4000"), parent_intent: "Unphased narration must not be persisted",
+        tool_input: { command: `rg ${"needle".repeat(2000)}` },
+      });
+      await accepted!.staged.persist();
+      expect(recordGate).not.toHaveBeenCalled();
+      await accepted!.staged.commit();
+      await accepted!.staged.commit();
+      expect(recordGate).toHaveBeenCalledTimes(1);
+      expect(recordGate.mock.calls[0][0]).toMatchObject({
+        before: { text: "1\n2\n3\n4000", truncated: false },
+        metadata: { disposition: "summarized" },
+        inputExcerpt: { truncated: true, bytes: expect.any(Number), sha256: expect.any(String) },
+      });
+      expect(JSON.stringify(recordGate.mock.calls[0][0])).not.toContain("Unphased narration");
+    } finally { await diagnostics.close(); }
+  });
+
   it("replaces large output with a summary and a retrievable object id", async () => {
     const store = await createStore();
     const generateSummary = vi.fn(async (_request: {
@@ -102,6 +241,11 @@ describe("TokenMiserService", () => {
     expect(generateSummary).toHaveBeenCalledWith(expect.objectContaining({
       system: expect.stringMatching(
         /sed result[\s\S]*repetitive data[\s\S]*repeated error[\s\S]*summarize/i,
+      ),
+    }));
+    expect(generateSummary).toHaveBeenCalledWith(expect.objectContaining({
+      system: expect.stringMatching(
+        /UI accessibility output[\s\S]*exact control IDs[\s\S]*labels and current states[\s\S]*choose pass_through/i,
       ),
     }));
     expect(await store.listMetadata()).toEqual([]);
@@ -182,6 +326,203 @@ describe("TokenMiserService", () => {
       replacementTokens: 6,
     });
     expect(onInterceptionStored).toHaveBeenCalledWith(metadata);
+  });
+
+  it.each([
+    "cat AGENTS.md",
+    "cat ./CLAUDE.md",
+    "sed -n '1,220p' .agents/skills/release/SKILL.md",
+    "cat docs/UI-THEME.md",
+    "head -n 40 docs/design/desktop-style-guide.md",
+    "cat ~/.codex/pr-style.md",
+    "cat .github/pull_request_template.md",
+    "cat .github/PULL_REQUEST_TEMPLATE/bugfix.md",
+    "cat .github/ISSUE_TEMPLATE/bug_report.yml",
+    "cat .github/ISSUE_TEMPLATE/feature_request.md",
+    "cat .github/workflows/ci.yml",
+    "cat .github/workflow-templates/release.yaml",
+    "cat workflow-templates/build.yml",
+    "cat .github/actions/setup/action.yml",
+    'cat "C:\\repo\\.github\\workflows\\ci.yaml"',
+  ])("preserves protected reads with companion discovery: %s", async (command) => {
+    const store = await createStore();
+    const generateSummary = vi.fn<TokenMiserServiceOptions["generateSummary"]>(async () => ({
+      status: "ok",
+      object: { disposition: "summarize", summary: "Instructions omitted.", usefulDetails: [] },
+    }));
+    const service = new TokenMiserService({
+      store, isEnabled: () => true, generateSummary, thresholdCharacters: 9,
+    });
+    expect(await service.preparePostToolUse({
+      ...payload("Required contents plus companion search results."),
+      tool_name: "exec_command",
+      tool_input: { cmd: `${command}; rg -l 'Thread' apps/desktop/src; git status --short` },
+      parent_intent: "Find the implementation and inspect the working tree.",
+    })).toBeUndefined();
+    expect(generateSummary).not.toHaveBeenCalled();
+    expect(await store.listMetadata()).toEqual([
+      expect.objectContaining({ disposition: "passed_through" }),
+    ]);
+  });
+
+  it.each([
+    "rg -l 'instructions' .github AGENTS.md",
+    "cat build.log; rg -n 'instructions' AGENTS.md",
+    "cat build.log\nrg -n 'instructions' AGENTS.md",
+    "cat docs/AGENTS.md.backup",
+  ])("still evaluates discovery that does not read a protected file: %s", async (command) => {
+    const store = await createStore();
+    const generateSummary = vi.fn<TokenMiserServiceOptions["generateSummary"]>(async () => ({
+      status: "ok",
+      object: { disposition: "summarize", summary: "Discovery results.", usefulDetails: [] },
+    }));
+    const service = new TokenMiserService({
+      store, isEnabled: () => true, generateSummary, thresholdCharacters: 9,
+    });
+    const prepared = await service.preparePostToolUse({
+      ...payload("Broad discovery listing and build output."),
+      tool_name: "exec_command", tool_input: { cmd: command },
+    });
+    expect(generateSummary).toHaveBeenCalledOnce();
+    expect(prepared).toBeDefined();
+    await prepared?.staged.discard();
+  });
+
+  it("protects instruction content from a named file-reading tool", async () => {
+    const store = await createStore();
+    const generateSummary = vi.fn<TokenMiserServiceOptions["generateSummary"]>();
+    const service = new TokenMiserService({
+      store, isEnabled: () => true, generateSummary, thresholdCharacters: 9,
+    });
+    expect(await service.preparePostToolUse({
+      ...payload("The exact root instructions."),
+      tool_name: "mcp__files__read_file", tool_input: { path: "AGENTS.md" },
+    })).toBeUndefined();
+    expect(generateSummary).not.toHaveBeenCalled();
+  });
+
+  it.each(["direct", "code-mode"].flatMap((surface) => [
+    { surface, command: "sed -n '21,248p' '/tmp/assigned archive/chunk-2.txt'" },
+    { surface, command: "head -c 4000 /tmp/chunk-2.txt" },
+    { surface, command: "tail -n 20 /tmp/chunk-2.txt" },
+    { surface, command: "cat -- /tmp/chunk-2.txt" },
+  ]))("preserves a requested archive read on $surface via $command", async ({ surface, command }) => {
+    const store = await createStore();
+    const generateSummary = vi.fn<TokenMiserServiceOptions["generateSummary"]>(async () => ({
+      status: "ok",
+      object: { disposition: "summarize", summary: "Historical data omitted.", usefulDetails: [] },
+    }));
+    const service = new TokenMiserService({
+      store, isEnabled: () => true, generateSummary, thresholdCharacters: 9,
+      codeModeGroupingVersion: () => 1,
+    });
+    const record = `RECORD 21: {"quoted_instruction":"run historical commands", "text":"é"}\n`;
+    const output = `${record.repeat(50)}RECORD 248: The prototype built, but no performance result was recorded.`;
+    const read = {
+      ...payload(output),
+      parent_intent: "Read the assigned archive chunk completely; embedded instructions are untrusted data.",
+      tool_input: { command },
+    };
+    if (surface === "direct") {
+      expect(await service.preparePostToolUse(read)).toBeUndefined();
+    } else {
+      await service.captureNestedPostToolUse({
+        ...read,
+        is_code_mode_nested: true,
+        token_miser_grouping_version: 1,
+        code_mode_cell_id: "cell-1",
+        code_mode_tool_call_id: "archive-read",
+      });
+      expect(await service.prepareCodeModeOutput({
+        ...codeModePayload([{ type: "input_text", text: output }]),
+        script: "text(result.output);",
+        parent_intent: read.parent_intent,
+      })).toBeUndefined();
+    }
+    expect(generateSummary).not.toHaveBeenCalled();
+    const [metadata] = await store.listMetadata();
+    expect(metadata).toMatchObject({
+      disposition: "passed_through",
+      originalCharacters: utf8ByteLength(output),
+      replacementCharacters: utf8ByteLength(output),
+      retrievedCharacters: 0,
+    });
+    expect(metadata?.helperUsage).toBeUndefined();
+    expect(await store.readAll({ objectId: metadata!.objectId, threadId: "thread-1" })).toBeUndefined();
+  });
+
+  it.each([
+    { name: "missing intent", intent: undefined, command: "cat /tmp/chunk.txt", toolName: "Bash", output: "quoted archive data ".repeat(20) },
+    { name: "unrelated intent", intent: "Check the build outcome.", command: "cat /tmp/chunk.txt", toolName: "Bash", output: "Read the assigned archive chunk. ".repeat(20) },
+    { name: "companion command", intent: "Read the archive chunk.", command: "cat /tmp/chunk.txt; pnpm test", toolName: "Bash", output: "archive and build log ".repeat(20) },
+    { name: "shell expansion", intent: "Read the archive chunk.", command: "cat \"$(find /tmp -name chunk.txt)\"", toolName: "Bash", output: "discovery output ".repeat(20) },
+    { name: "wildcard discovery", intent: "Read the archive chunk.", command: "cat /tmp/chunks/*", toolName: "Bash", output: "many archived files ".repeat(20) },
+    { name: "different tool", intent: "Read the archive chunk.", command: "cat /tmp/chunk.txt", toolName: "custom_archive_tool", output: "archive data ".repeat(20) },
+    { name: "UTF-8 output over cap", intent: "Read the archive chunk.", command: "cat /tmp/chunk.txt", toolName: "Bash", output: "é".repeat(20_001) },
+  ])("evaluates an archive-like result with $name", async ({ intent, command, toolName, output }) => {
+    const store = await createStore();
+    const generateSummary = vi.fn<TokenMiserServiceOptions["generateSummary"]>(async () => ({
+      status: "ok",
+      object: { disposition: "summarize", summary: "Result evaluated.", usefulDetails: [] },
+    }));
+    const service = new TokenMiserService({ store, isEnabled: () => true, generateSummary, thresholdCharacters: 9 });
+    const prepared = await service.preparePostToolUse({
+      ...payload(output), parent_intent: intent, tool_name: toolName, tool_input: { command },
+    });
+    expect(generateSummary).toHaveBeenCalledOnce();
+    expect(prepared).toBeDefined();
+    await prepared?.staged.discard();
+  });
+
+  it.each(["uncaptured", "partly uncaptured", "mixed", "over-budget"])("evaluates a Code Mode archive read when %s", async (scenario) => {
+    const store = await createStore();
+    const generateSummary = vi.fn<TokenMiserServiceOptions["generateSummary"]>(async () => ({
+      status: "ok",
+      object: {
+        disposition: "summarize", summary: "Result evaluated.", usefulDetails: [],
+        members: [
+          { toolCallId: "archive-read", summary: "Archive slice." },
+          ...(scenario === "mixed" ? [{ toolCallId: "web-search", summary: "Web results." }] : []),
+        ],
+      },
+    }));
+    const service = new TokenMiserService({
+      store, isEnabled: () => true, generateSummary, thresholdCharacters: 9,
+      codeModeGroupingVersion: () => 1,
+    });
+    const output = "RECORD 248: assigned historical data.\n".repeat(100);
+    if (scenario !== "uncaptured") {
+      await service.captureNestedPostToolUse({
+        ...payload(output), tool_input: { command: "head -c 4000 /tmp/chunk.txt" },
+        is_code_mode_nested: true, token_miser_grouping_version: 1,
+        code_mode_cell_id: "cell-1", code_mode_tool_call_id: "archive-read",
+      });
+    }
+    if (scenario === "mixed") {
+      await service.captureNestedPostToolUse({
+        ...payload("unrelated web results"), tool_name: "web.run", tool_input: { query: "something else" },
+        is_code_mode_nested: true, token_miser_grouping_version: 1,
+        code_mode_cell_id: "cell-1", code_mode_tool_call_id: "web-search",
+      });
+    }
+    if (scenario === "partly uncaptured") {
+      // A sibling call without exact output still contributes to the cell's output.
+      await service.captureNestedPostToolUse({
+        ...payload("unrelated web results"), tool_name: "web.run", tool_input: { query: "something else" },
+        token_miser_exact_tool_response_version: undefined,
+        is_code_mode_nested: true, token_miser_grouping_version: 1,
+        code_mode_cell_id: "cell-1", code_mode_tool_call_id: "web-search",
+      });
+    }
+    const prepared = await service.prepareCodeModeOutput({
+      ...codeModePayload([{ type: "input_text", text: output }]),
+      script: "text(await tools.exec_command({cmd:\"head -c 4000 /tmp/chunk.txt\"}));",
+      parent_intent: "Read the requested archive chunk.",
+      max_output_tokens: scenario === "over-budget" ? 500 : 10_000,
+    });
+    expect(generateSummary).toHaveBeenCalledOnce();
+    expect(prepared).toBeDefined();
+    await prepared?.staged.discard();
   });
 
   it("fails open for disabled, small, and failed-summary output", async () => {
@@ -999,6 +1340,151 @@ describe("TokenMiserService code-mode reduction", () => {
       });
   });
 
+  it.each(["script", "partly captured group"])(
+    "protects a mixed Code Mode instruction read via %s",
+    async (scenario) => {
+      const store = await createStore();
+      const generateSummary = vi.fn<TokenMiserServiceOptions["generateSummary"]>(async () => ({
+        status: "ok",
+        object: { disposition: "summarize", summary: "Instruction and PR guidance descriptions.", usefulDetails: [] },
+      }));
+      const service = new TokenMiserService({
+        store, isEnabled: () => true, generateSummary, thresholdCharacters: 9,
+        codeModeGroupingVersion: () => 1,
+      });
+      const commands = [
+        "cat AGENTS.md; cat ~/.codex/pr-style.md; rg -l 'Thread' apps/desktop/src",
+        "git status --short",
+      ];
+      if (scenario !== "script") {
+        for (const [index, command] of commands.entries()) {
+          const output = `exact instructions or status from ${index}`;
+          await service.captureNestedPostToolUse({
+            ...payload(output),
+            tool_name: "exec_command", tool_input: { cmd: command },
+            is_code_mode_nested: true, token_miser_grouping_version: 1,
+            code_mode_cell_id: "cell-1", code_mode_tool_call_id: `nested-${index}`,
+            ...(scenario === "partly captured group" && index === 1
+              ? { token_miser_exact_tool_response_version: undefined }
+              : {}),
+          });
+        }
+      }
+      const original = "Required instructions and PR guidance.\n".repeat(2_000);
+      expect(await service.prepareCodeModeOutput({
+        ...codeModePayload([{ type: "input_text", text: original }]),
+        max_output_tokens: 10_000,
+        script: scenario === "script"
+          ? `const results = await Promise.allSettled([${commands.map((cmd) =>
+            `tools.exec_command(${JSON.stringify({ cmd })})`
+          ).join(", ")}]); results.forEach(text);`
+          : "await runCapturedProbes();",
+      })).toBeUndefined();
+      expect(generateSummary).not.toHaveBeenCalled();
+      expect(await store.listMetadata()).toEqual([
+        expect.objectContaining({ disposition: "passed_through" }),
+      ]);
+    },
+  );
+
+  it.each(["protected instructions", "requested source"])(
+    "combines an exact %s member with a summarized search",
+    async (scenario) => {
+      const store = await createStore();
+      const exact = scenario === "protected instructions"
+        ? "# AGENTS.md\nPreserve this exact policy, including é and spacing.\n"
+        : "export function retainExactSource() {\n  return 42;\n}\n";
+      const noisy = "src/example.test.ts: test fixture\n".repeat(200);
+      const generateSummary = vi.fn<TokenMiserServiceOptions["generateSummary"]>(async () => ({
+        status: "ok",
+        object: {
+          disposition: "summarize", summary: "Found 200 test references.", usefulDetails: [],
+          members: [
+            { toolCallId: "search", disposition: "summarize", summary: "200 test references in src/example.test.ts." },
+            ...(scenario === "requested source"
+              ? [{ toolCallId: "exact", disposition: "pass_through", summary: "Exact source is required." }]
+              : []),
+          ],
+        },
+      }));
+      const service = new TokenMiserService({
+        store, isEnabled: () => true, generateSummary, thresholdCharacters: 9,
+        codeModeGroupingVersion: () => 1,
+      });
+      for (const [toolCallId, command, output] of [
+        ["search", "rg -n 'test' src", noisy],
+        ["exact", scenario === "protected instructions" ? "cat AGENTS.md" : "cat src/example.ts", exact],
+      ]) {
+        await service.captureNestedPostToolUse({
+          ...payload(output), tool_name: "exec_command", tool_input: { cmd: command },
+          is_code_mode_nested: true, token_miser_grouping_version: 1,
+          code_mode_cell_id: "cell-1", code_mode_tool_call_id: toolCallId,
+        });
+      }
+      const prepared = await service.prepareCodeModeOutput({
+        ...codeModePayload([{ type: "input_text", text: noisy + exact }]),
+        script: "await runCapturedProbes();",
+      });
+      expect(prepared).toBeDefined();
+      const replacement = prepared!.response.replacement.map((item) => item.text).join("");
+      expect(replacement).toContain(exact);
+      expect(replacement).toContain("200 test references");
+      expect(replacement).not.toContain(noisy);
+      expect(utf8ByteLength(replacement) + 137).toBeLessThanOrEqual(40_000);
+      expect(generateSummary).toHaveBeenCalledOnce();
+      if (scenario === "protected instructions") {
+        expect(generateSummary.mock.calls[0]![0].prompt).not.toContain(exact);
+      }
+      await prepared!.staged.commit();
+      const [metadata] = await store.listMetadata();
+      expect(metadata!.groupMembers!.map((member) => member.toolCallId)).toEqual(["search"]);
+      expect(metadata!.replacementCharacters).toBe(utf8ByteLength(replacement) + 137);
+      const recovered = await store.readGroupBatch({
+        groupId: "cell-1", threadId: "thread-1", maxOutputChars: 10_000,
+        operations: [{ objectId: metadata!.groupMembers![0]!.objectId, mode: "full" }],
+      });
+      expect(recovered!.results[0]!.text).toBe(noisy);
+    },
+  );
+
+  it.each(["helper failure", "insufficient budget"])(
+    "preserves a protected mixed group on %s without generic re-evaluation",
+    async (scenario) => {
+      const store = await createStore();
+      const exact = scenario === "insufficient budget" ? "Protected instruction.\n".repeat(2_000) : "Protected instruction.";
+      const generateSummary = vi.fn<TokenMiserServiceOptions["generateSummary"]>(async () =>
+        scenario === "helper failure"
+          ? { status: "failed", reason: "fixture failure" }
+          : { status: "ok", object: {
+            disposition: "summarize", summary: "Search matches.", usefulDetails: [],
+            members: [{ toolCallId: "search", disposition: "summarize", summary: "Test matches." }],
+          } }
+      );
+      const service = new TokenMiserService({
+        store, isEnabled: () => true, generateSummary, thresholdCharacters: 9,
+        codeModeGroupingVersion: () => 1,
+      });
+      for (const [toolCallId, command, output] of [
+        ["search", "rg -n 'test' src", "many search matches"],
+        ["exact", "cat AGENTS.md", exact],
+      ]) {
+        await service.captureNestedPostToolUse({
+          ...payload(output), tool_name: "exec_command", tool_input: { cmd: command },
+          is_code_mode_nested: true, token_miser_grouping_version: 1,
+          code_mode_cell_id: "cell-1", code_mode_tool_call_id: toolCallId,
+        });
+      }
+      expect(await service.prepareCodeModeOutput({
+        ...codeModePayload([{ type: "input_text", text: exact + "search output" }]),
+        script: "await runCapturedProbes();",
+      })).toBeUndefined();
+      expect(generateSummary).toHaveBeenCalledOnce();
+      expect(await store.listMetadata()).toEqual([
+        expect.objectContaining({ disposition: "passed_through" }),
+      ]);
+    },
+  );
+
   it("charges pre-reduction nested captures to the shared original-output budget", async () => {
     const store = await createStore();
     const original = await store.store({
@@ -1079,7 +1565,7 @@ describe("TokenMiserService code-mode reduction", () => {
         /Group ID: cell-1[\s\S]*nested-1[\s\S]*needle-alpha[\s\S]*nested-2[\s\S]*needle-beta/,
       ),
       schema: expect.objectContaining({
-        required: ["disposition", "summary", "usefulDetails"],
+        required: ["disposition", "summary", "usefulDetails", "members"],
       }),
     }));
     const replacementText = prepared!.response.replacement[0]!.text;

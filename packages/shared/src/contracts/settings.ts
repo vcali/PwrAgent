@@ -1,3 +1,4 @@
+import type { DesktopThreadArchivePolicy } from "../thread-archive-policy";
 import type { MessagingToolUpdateMode } from "./messaging";
 import type { AppServerBackendKind } from "./normalized-app-server";
 import type { FederationTarget } from "./federation";
@@ -319,6 +320,7 @@ export const DESKTOP_DARK_THEMES = [
   "solarized-dark",
   "gray-dark",
   "blue-dark",
+  "phosphor-dark",
 ] as const;
 export type DesktopDarkTheme = (typeof DESKTOP_DARK_THEMES)[number];
 export const DESKTOP_DARK_THEME_DEFAULT: DesktopDarkTheme = "tangerine-dark";
@@ -715,6 +717,9 @@ export type DesktopAppearanceSnapshot = {
   theme: DesktopSettingsValue<DesktopAppearanceTheme>;
   darkTheme: DesktopSettingsValue<DesktopDarkTheme>;
   lightTheme: DesktopSettingsValue<DesktopLightTheme>;
+  /** macOS: a running instance's Dock icon follows its dark theme, so two
+   *  profiles in two themes are told apart in the Dock. On by default. */
+  themedDockIcon: DesktopSettingsValue<boolean>;
   density: DesktopSettingsValue<DesktopAppearanceDensity>;
   sidebarTextSize: DesktopSettingsValue<DesktopTextSize>;
   transcriptTextSize: DesktopSettingsValue<DesktopTextSize>;
@@ -1112,6 +1117,12 @@ export type DesktopSettingsSnapshot = {
         observedAt: number;
       };
     };
+    /**
+     * Where opt-in Token Miser diagnostic samples are written. The folder
+     * exists only after the first batch, and saved files outlive the switch,
+     * so Settings shows it whether or not capture is on.
+     */
+    tokenMiserDiagnosticsDirectory?: string;
     messaging: {
       disabled: boolean;
       disabledReason?: string;
@@ -1184,6 +1195,7 @@ export type DesktopSettingsSnapshot = {
     tokenMiserFocusedSummariesEnabled?: DesktopSettingsValue<boolean>;
     /** Opt-in helper review for ambiguous poll-shaped parent activity. */
     tokenMiserPollingReviewsEnabled?: DesktopSettingsValue<boolean>;
+    tokenMiserDiagnosticsEnabled?: DesktopSettingsValue<boolean>;
     /**
      * Shows the experimental Tool calls tab in the thread context rail.
      * The desktop app may still collect tool metrics while this is disabled;
@@ -1440,6 +1452,7 @@ export type DesktopSettingsSnapshot = {
   };
   applications: DesktopApplicationsSnapshot;
   worktrees: {
+    archive?: DesktopThreadArchivePolicy;
     storage: DesktopSettingsValue<DesktopWorktreeStorageLocation>;
     effectivePath: string;
   };
@@ -1465,6 +1478,7 @@ export type DesktopSettingsConfigPatch = {
       theme?: DesktopAppearanceTheme;
       darkTheme?: DesktopDarkTheme;
       lightTheme?: DesktopLightTheme;
+      themedDockIcon?: boolean;
       density?: DesktopAppearanceDensity;
       sidebarTextSize?: DesktopTextSize;
       transcriptTextSize?: DesktopTextSize;
@@ -1489,6 +1503,7 @@ export type DesktopSettingsConfigPatch = {
     codexToolDiscovery?: boolean;
     tokenMiserFocusedSummariesEnabled?: boolean;
     tokenMiserPollingReviewsEnabled?: boolean;
+    tokenMiserDiagnosticsEnabled?: boolean;
     threadToolAccounting?: boolean;
     codexDefaultModeRequestUserInput?: boolean;
     codexSkillQuestionsWarningDismissed?: boolean;
@@ -1696,6 +1711,7 @@ export type DesktopSettingsConfigPatch = {
     };
   };
   worktrees?: {
+    archive?: Partial<DesktopThreadArchivePolicy>;
     storage?: DesktopWorktreeStorageLocation;
   };
 };
@@ -2190,6 +2206,8 @@ export type OpenPathRequest = {
 export type OpenPathResponse = {
   opened: boolean;
   error?: string;
+  /** Set when nothing exists at the path, so callers need not parse `error`. */
+  missing?: true;
 };
 
 export type ReadMarkdownFileRequest = {

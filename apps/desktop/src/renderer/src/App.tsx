@@ -51,6 +51,7 @@ import { SidebarResizeHandle } from "./features/navigation/SidebarResizeHandle";
 import { useThreadJump } from "./features/navigation/useThreadJump";
 import { AppTitleBar } from "./features/chrome/AppTitleBar";
 import { buildFederationThreadTargets } from "./features/chrome/federation-thread-targets";
+import { FederationDisplayLabelsProvider, federationLocalDisplayLabel } from "./lib/federation-display-label";
 import { buildThreadHandoffTargets } from "./features/federation/thread-handoff-targets";
 import {
   SendThreadToMachineDialog,
@@ -90,8 +91,7 @@ import {
 } from "./features/thread-detail/context-panels/context-tab";
 import { ThreadPlaceholderHeader } from "./features/thread-detail/ThreadPlaceholderHeader";
 import { handoffLaunchpadComposer } from "./features/composer/launchpad-composer-handoff";
-import { useComposerDraftStore } from "./features/composer/useComposerDraftStore";
-import { useDurableComposerDraftStore } from "./features/composer/useDurableComposerDraftStore";
+import { useRecoverableState, useRecoverableComposerDraftStore } from "./lib/RendererRecoveryState";
 import { readBootstrapLayoutPreferences } from "./lib/layout-preferences";
 import { useAppearance, type AppearanceController } from "./lib/useAppearance";
 import { useBackendSummaries } from "./lib/useBackendSummaries";
@@ -133,10 +133,11 @@ import { useScheduledThreadActionProjection } from "./lib/useScheduledThreadActi
 import { useIndependentQueueProjection } from "./lib/useIndependentQueueProjection";
 import { useThreadQueuedMessageIndicators } from "./lib/useThreadQueuedMessageIndicators";
 import { useThreadDraftIndicators, useUnassignedThreadDraftCount } from "./lib/useThreadDraftIndicators";
-import { copyText } from "./lib/copy-text";
+import { copyTextAsCodeBlock } from "./lib/copy-text";
 import { resolveThreadWorkingStatePath } from "./lib/thread-working-state-path";
 import { CodexConfigWarningBanner } from "./features/codex-config/CodexConfigWarningBanner";
 import type { AppNoticeToastNotice } from "./features/notifications/AppNoticeToast";
+import { turnFailureAcknowledgements, turnFailureNoticeId, turnFailureScopeKey } from "./features/notifications/turn-failure-acknowledgements";
 import { AppNoticeStack } from "./features/notifications/AppNoticeStack";
 import {
   buildNoStartupBackendNotice,
@@ -202,6 +203,14 @@ import {
 } from "../../shared/github-pr-access";
 import { buildLocalThreadDiagnosticsInfo } from "../../shared/local-diagnostics-info";
 import { AppUpdateBanner } from "./features/update/AppUpdateBanner";
+import { isNativeVoiceApi, useNativeVoiceNotices } from "./features/native-voice/NativeVoice";
+import {
+  DirectorVoiceButton,
+  DirectorVoicePanel,
+  operatorFocusFor,
+  useOperatorFocusPublisher,
+  useDirectorVoiceShortcut,
+} from "./features/native-voice/DirectorVoice";
 import { AutomationsScreen } from "./features/automations/AutomationsScreen";
 import {
   ThreadSearchPanel,
@@ -395,7 +404,7 @@ function DesktopAppShell(props: {
   const [actionRunsDock, setActionRunsDock] = useState<ActionRunsDock>(
     DEFAULT_ACTION_RUNS_DOCK,
   );
-  const [mainView, setMainViewState] = useState<MainView>("thread");
+  const [mainView, setMainViewState] = useRecoverableState<MainView>("app.mainView", "thread");
   const mainViewRef = useRef<MainView>(mainView);
   // The control that opened Settings or Automations. The layer covers the
   // sidebar and main, which go inert under it, so focus returns here on
@@ -523,6 +532,9 @@ function DesktopAppShell(props: {
   const showAppNotice = useCallback((notice: AppNoticeToastNotice): void => {
     dispatchAppNotice({ type: "show", notice });
   }, []);
+  useEffect(() => turnFailureAcknowledgements.subscribeDismissals((id) => {
+    dispatchAppNotice({ type: "dismiss", id });
+  }), []);
   const codexProfiles = props.settings.snapshot?.models?.codex?.profiles;
   const activeCodexProfileRef = useRef(codexProfiles);
   activeCodexProfileRef.current = codexProfiles;
@@ -673,7 +685,7 @@ function DesktopAppShell(props: {
     refresh: refreshFederationHealth,
   } = useFederationHealth({
     desktopApi,
-    enabled: !readRendererFederationTarget(),
+    enabled: true,
   });
   const newThreadFederationTargets = useMemo(
     () =>
@@ -1396,10 +1408,24 @@ function DesktopAppShell(props: {
           typeof rawMessage === "string" && rawMessage.trim()
             ? rawMessage
             : "The agent turn failed.";
+        const identity = {
+          backend: event.backend,
+          threadId: params.threadId ?? "unknown",
+          turnId: params.turnId ?? "unknown",
+          ...(instanceId ? { instanceId } : {}),
+        };
+        const noticeId = turnFailureNoticeId(identity);
+        const scope = turnFailureScopeKey(identity.backend, identity.threadId, instanceId);
+        if (!turnFailureAcknowledgements.report(scope, noticeId, errorMessage)) return;
         dispatchAppNotice({
           type: "backend-error",
           signal: {
             kind: "turn-failed",
+            onDismiss: () => {
+              if (!turnFailureAcknowledgements.dismiss(noticeId)) {
+                dispatchAppNotice({ type: "dismiss", id: noticeId });
+              }
+            },
             errorNoticeContext: event.errorNoticeContext,
             originLabel: instanceId ? `Remote instance: ${instanceId}` : "This machine",
             onCodexLogin: openCodexLogin,
@@ -1414,6 +1440,17 @@ function DesktopAppShell(props: {
             ),
           },
         });
+        return;
+      }
+      if (event.notification.method === "thread/turnQueue/updated") {
+        const params = event.notification.params;
+        if ((params.status === "blocked" || params.status === "failed")
+          && typeof params.errorMessage === "string") {
+          turnFailureAcknowledgements.reportQueueFailure(
+            turnFailureScopeKey(event.backend, params.threadId, instanceId),
+            params.errorMessage,
+          );
+        }
         return;
       }
       if (
@@ -1610,11 +1647,7 @@ function DesktopAppShell(props: {
   const profiles = usePwrAgentProfiles(desktopApi);
   const refreshProfiles = profiles.refresh;
   const runtimeIdentity = useRuntimeIdentity(desktopApi);
-  const baseComposerDraftStore = useComposerDraftStore();
-  const composerDraftStore = useDurableComposerDraftStore(
-    baseComposerDraftStore,
-    desktopApi,
-  );
+  const composerDraftStore = useRecoverableComposerDraftStore(desktopApi);
   const providerModelDefaults = useMemo(() => settings.snapshot?.models
     ? settings.snapshot.models.providerDefaults ?? {}
     : undefined, [settings.snapshot]);
@@ -1705,7 +1738,7 @@ function DesktopAppShell(props: {
       ]) => {
         const federationHealth =
           refreshedFederationHealth ?? liveFederationHealth;
-        void copyText(
+        void copyTextAsCodeBlock(
           buildLocalThreadDiagnosticsInfo(
             thread
               ? {
@@ -1741,6 +1774,32 @@ function DesktopAppShell(props: {
     threads: navigation.threads,
     retainedRemoteThreads: recentRemoteThreads,
   });
+  // Director voice and the focus it resolves "this thread" against are local
+  // surfaces: a federation window fronts a peer's threads, not this machine.
+  const directorVoiceApi =
+    !readRendererFederationTarget() && isNativeVoiceApi(desktopApi) && desktopApi.openVoiceManager
+      ? desktopApi
+      : undefined;
+  useDirectorVoiceShortcut(directorVoiceApi);
+  useNativeVoiceNotices(
+    isNativeVoiceApi(desktopApi) ? desktopApi : undefined,
+    showAppNotice,
+    dismissAppNotice,
+  );
+  const operatorFocus = useMemo(
+    () => operatorFocusFor({
+      view: mainView,
+      lens: navigation.browseMode,
+      thread: navigation.selectedThread,
+      launchpad: navigation.selectedLaunchpad,
+    }),
+    [mainView, navigation.browseMode, navigation.selectedThread, navigation.selectedLaunchpad],
+  );
+  useOperatorFocusPublisher(directorVoiceApi, operatorFocus);
+  const directorVoiceControl = useMemo(
+    () => directorVoiceApi ? <DirectorVoiceButton api={directorVoiceApi} /> : undefined,
+    [directorVoiceApi],
+  );
   const selectedThreadFederationTarget =
     navigation.selectedThread?.federation?.ref.target;
   const selectedLaunchpadFederationTarget =
@@ -2633,14 +2692,23 @@ function DesktopAppShell(props: {
   );
   const selectedLaunchpadForMachine = navigation.selectedLaunchpad;
   const launchpadMachine = ((): LaunchpadMachineControl | undefined => {
-    // The chip offers a choice only where there is one: a window with no
-    // peers to start on keeps today's chip row exactly.
-    if (!selectedLaunchpadForMachine || newThreadFederationTargets.length === 0) {
+    const windowTarget = readRendererFederationTarget();
+    // A viewer must name its owner even before health arrives or when it has
+    // no other peers. Ordinary local windows need the chip only with peers.
+    if (!selectedLaunchpadForMachine
+      || (!windowTarget && newThreadFederationTargets.length === 0)) {
       return undefined;
     }
+    const windowOwner = windowTarget
+      ? buildFederationThreadTargets(liveFederationHealth).find((candidate) =>
+          candidate.instanceId === windowTarget.instanceId)
+      : undefined;
     const launchpadTarget = selectedLaunchpadForMachine.federationTarget;
+    // Undefined is the window's default owner, including in a remote viewer.
+    // Normalize an explicitly stamped owner to the same dropdown choice.
     const currentInstanceId =
       launchpadTarget && isRemoteFederationTarget(launchpadTarget)
+        && launchpadTarget.instanceId !== windowTarget?.instanceId
         ? launchpadTarget.instanceId
         : undefined;
     const projectRow = navigation.selectedDirectory;
@@ -2666,15 +2734,29 @@ function DesktopAppShell(props: {
     );
     return {
       ...(currentInstanceId ? { currentInstanceId } : {}),
-      local: {
-        label: liveFederationHealth?.localLabel ?? "This machine",
-        ...(liveFederationHealth?.localCelestialIcon
-          ? { celestialIcon: liveFederationHealth.localCelestialIcon }
-          : {}),
-        ...(liveFederationHealth?.instanceId
-          ? { instanceId: liveFederationHealth.instanceId }
-          : {}),
-      },
+      local: windowTarget
+        ? {
+            label: windowOwner?.label
+              ?? readRendererFederationLabel()
+              ?? windowTarget.instanceId,
+            ...(windowOwner?.shortLabel ? { shortLabel: windowOwner.shortLabel } : {}),
+            instanceId: windowTarget.instanceId,
+            remote: true,
+            ...(windowOwner ? { availability: windowOwner.availability } : {}),
+            ...(windowOwner?.celestialIcon
+              ? { celestialIcon: windowOwner.celestialIcon }
+              : {}),
+          }
+        : {
+            label: liveFederationHealth?.localLabel ?? "This machine",
+            shortLabel: federationLocalDisplayLabel(liveFederationHealth),
+            ...(liveFederationHealth?.localCelestialIcon
+              ? { celestialIcon: liveFederationHealth.localCelestialIcon }
+              : {}),
+            ...(liveFederationHealth?.instanceId
+              ? { instanceId: liveFederationHealth.instanceId }
+              : {}),
+          },
       targets: newThreadFederationTargets,
       project,
       localHasProject:
@@ -2695,6 +2777,7 @@ function DesktopAppShell(props: {
     };
   })();
   const mastheadActions = {
+    voiceControl: directorVoiceControl,
     addingProjectDirectory: navigation.pickingDirectory,
     automationsActive: mainView === "automations",
     settingsActive: mainView === "settings",
@@ -3196,6 +3279,7 @@ function DesktopAppShell(props: {
   };
 
   return (
+    <FederationDisplayLabelsProvider health={liveFederationHealth}>
     <TranscriptLinkProvider
       localInstanceId={liveFederationHealth?.instanceId}
       activeThread={navigation.selectedThread}
@@ -3241,6 +3325,7 @@ function DesktopAppShell(props: {
         style={{ "--sidebar-width": `${sidebarWidthRef.current}px` } as CSSProperties}
       >
         <Sidebar
+          mastheadVoiceControl={directorVoiceControl}
           inert={layerView !== undefined}
           directoryDisclosure={navigation.directoryDisclosure}
           pendingLaunchpadCreations={navigation.pendingLaunchpadCreations}
@@ -3296,7 +3381,7 @@ function DesktopAppShell(props: {
             });
           }}
           newThreadFederationTargets={newThreadFederationTargets}
-          localMachineLabel={liveFederationHealth?.localLabel}
+          localMachineLabel={federationLocalDisplayLabel(liveFederationHealth)}
           checkFederationTargetProject={checkFederationTargetProject}
           onCreateThreadOnFederationTarget={createThreadOnFederationTarget}
           onSendThreadToMachine={threadHandoffTargets.length > 0
@@ -3726,8 +3811,19 @@ function DesktopAppShell(props: {
             dismissNotice={dismissAppNotice}
           />
         </AppNoticeStack>
+        {directorVoiceApi ? (
+          <DirectorVoicePanel
+            api={directorVoiceApi}
+            desktopApi={desktopApi}
+            focus={navigation.selectedThread}
+            launchpad={navigation.selectedLaunchpad}
+            onOpenThread={(threadId) => showThreadFromLink({ backend: "codex", threadId })}
+          />
+        ) : null}
       </div>
+
     </TranscriptLinkProvider>
+    </FederationDisplayLabelsProvider>
   );
 }
 

@@ -314,10 +314,11 @@ General → Appearance sets them.
 | Dark theme | Light theme | Origin |
 |---|---|---|
 | `tangerine-dark` (default) | `tangerine-light` (default) | PwrAgent. The bare `:root` / `:root[data-theme="light"]` blocks. |
-| `catppuccin-mocha` | `catppuccin-latte` | [Catppuccin](https://catppuccin.com), tuned to the lowest compliant contrast. |
-| `solarized-dark` | `solarized-light` | [Solarized](https://ethanschoonover.com/solarized/), canonical surfaces and terminal, text moved only as far as AA needs. |
+| `catppuccin-mocha` | `catppuccin-latte` | [Catppuccin](https://catppuccin.com) ([MIT](https://catppuccin.com/licensing/)), tuned to the lowest compliant contrast. |
+| `solarized-dark` | `solarized-light` | [Solarized](https://ethanschoonover.com/solarized/) ([MIT](https://github.com/altercation/solarized/blob/master/LICENSE)), canonical surfaces and terminal, text moved only as far as AA needs. |
 | `gray-dark` | `gray-light` | PwrAgent. Neutral charcoal or light-gray surfaces with the Tangerine accent. |
 | `blue-dark` | `blue-light` | PwrAgent. Navy or pale-blue surfaces with a blue accent. |
+| `phosphor-dark` | (none) | PwrAgent, after a green-phosphor CRT terminal. Phosphor green on green-tinted near-black. Dark only. |
 
 Each non-default theme is one `:root[data-color-theme="<id>"]` block in
 `app.css`, and `data-color-theme` is set only while that theme renders.
@@ -361,11 +362,25 @@ Per theme:
   `base01` is 2.4:1. Text, accent, and semantic colors therefore move in
   lightness only, by the least that clears the floor, with a tighter
   ladder (5.75 / 5.05 / 4.55). The dark accent is Solarized yellow, because
-  orange cannot clear AA as text on `base03`.
+  orange cannot clear AA as text on `base03`. With only two background
+  tones per scheme, hover sits midway between them, and Light's raised
+  surface sits just above `base3`, so neither disappears into the surface
+  under it.
 - **Gray** and **Blue** are PwrAgent designs, and keep their designed values
   wherever those already clear the floor. Blue is an explicit product
   choice. Its navy surfaces stay low-saturation, so the anti-pattern below
   against saturated navy dashboards still holds.
+- **Phosphor** is a PwrAgent design after a green-phosphor CRT terminal, and
+  an explicit product request. Its accent and terminal ink are phosphor
+  green `#00ff41`, on green-tinted near-black surfaces, with red for danger
+  and blue for info. It is a palette, not a costume. There is no code
+  rain, glow, or scanline effect, so the anti-patterns below against
+  novelty-terminal cosplay and decorative glows still hold. It borrows no
+  published palette and so carries no license notice. Only muted text moved
+  from its designed value to clear the floor.
+- **A theme may be dark only.** Phosphor has no light half, so picking it
+  offers no pair for the light scheme, and the operator's light theme stays
+  as it was.
 
 The theme contract test checks all of this. It reads `app.css` and fails if
 a theme drops a token, misses the floor, breaks a ladder, or if

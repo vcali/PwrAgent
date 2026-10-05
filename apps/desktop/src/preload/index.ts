@@ -10,6 +10,13 @@ import {
 } from "../shared/ipc";
 import type { ReceivingFolderRequest, ReceivingFolderResponse } from "../shared/federation-receiving-folder";
 import { SETTINGS_RECEIVING_FOLDER_CHANNEL } from "../shared/ipc";
+import {
+  NATIVE_VOICE_CAPABILITY_CHANNEL, NATIVE_VOICE_START_CHANNEL, NATIVE_VOICE_STOP_CHANNEL,
+  NATIVE_VOICE_TEXT_CHANNEL, NATIVE_VOICE_EVENT_CHANNEL,
+  NATIVE_VOICE_OPEN_MANAGER_CHANNEL, OPERATOR_FOCUS_PUBLISH_CHANNEL,
+  type NativeVoiceStart, type NativeVoiceTarget, type NativeVoiceText, type NativeVoiceEvent,
+  type OpenVoiceManagerResponse,
+} from "../shared/native-voice";
 import { USAGE_ACTIVITY_ANALYZE_CHANNEL } from "../shared/ipc";
 import { USAGE_ACTIVITY_READ_CHANNEL } from "../shared/ipc";
 import { USAGE_ACTIVITY_OPEN_THREAD_CHANNEL, USAGE_ACTIVITY_OPEN_WINDOW_CHANNEL } from "../shared/ipc";
@@ -174,6 +181,7 @@ import type {
   PrAutoDispatchBudgetStatus,
   CodexAppServerRestartResult,
   CodexAppServerRestartStatus,
+  DesktopThreadArchiveSweepStatus,
   CheckThreadBranchDriftRequest,
   CheckThreadBranchDriftResponse,
   CompactThreadRequest,
@@ -454,6 +462,7 @@ import type {
   ReadStarMapWorkspaceResponse,
   SetStarMapCardPositionRequest,
   OpenStarMapManagerRequest,
+  OperatorFocusSnapshot,
   OpenStarMapManagerResponse,
   OpenStarMapWindowRequest,
   StarMapCommand,
@@ -660,6 +669,9 @@ import {
   APP_SERVER_GET_CODEX_RESTART_STATUS_CHANNEL,
   APP_SERVER_RESTART_CODEX_CHANNEL,
   CODEX_RESTART_STATUS_CHANGED_EVENT_CHANNEL,
+  APP_SERVER_GET_THREAD_ARCHIVE_SWEEP_STATUS_CHANNEL,
+  APP_SERVER_RUN_THREAD_ARCHIVE_SWEEP_CHANNEL,
+  THREAD_ARCHIVE_SWEEP_STATUS_CHANGED_EVENT_CHANNEL,
   GITHUB_PR_SAML_ENFORCEMENT_EVENT_CHANNEL,
   MANAGED_GROK_SIGNATURE_REJECTED_EVENT_CHANNEL,
   MANAGED_RUNTIME_PROGRESS_EVENT_CHANNEL,
@@ -1056,6 +1068,17 @@ const subscribeToAgentEvent = createEventSubscriptionMultiplexer<AgentEvent>(
 let federationJumpSearchRequestSequence = 0;
 
 const desktopApi = Object.freeze({
+  nativeVoiceCapability: () => ipcRenderer.invoke(NATIVE_VOICE_CAPABILITY_CHANNEL),
+  startNativeVoice: (request: NativeVoiceStart) => ipcRenderer.invoke(NATIVE_VOICE_START_CHANNEL, request),
+  stopNativeVoice: (request: NativeVoiceTarget) => ipcRenderer.invoke(NATIVE_VOICE_STOP_CHANNEL, request),
+  sendNativeVoiceText: (request: NativeVoiceText) => ipcRenderer.invoke(NATIVE_VOICE_TEXT_CHANNEL, request),
+  openVoiceManager: (): Promise<OpenVoiceManagerResponse> => ipcRenderer.invoke(NATIVE_VOICE_OPEN_MANAGER_CHANNEL),
+  publishOperatorFocus: (focus: OperatorFocusSnapshot): Promise<void> => ipcRenderer.invoke(OPERATOR_FOCUS_PUBLISH_CHANNEL, focus),
+  onNativeVoiceEvent: (callback: (event: NativeVoiceEvent) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, notification: NativeVoiceEvent) => callback(notification);
+    ipcRenderer.on(NATIVE_VOICE_EVENT_CHANNEL, listener);
+    return () => { ipcRenderer.removeListener(NATIVE_VOICE_EVENT_CHANNEL, listener); };
+  },
   ping: () => "pong",
   replayFixtureActive: Boolean(process.env.PWRAGENT_REPLAY_FIXTURE_PATH),
   // Clipboard writes go through the main process: the sandboxed preload's
@@ -1517,6 +1540,10 @@ const desktopApi = Object.freeze({
     await ipcRenderer.invoke(APP_SERVER_GET_CODEX_RESTART_STATUS_CHANNEL),
   restartCodex: async (): Promise<CodexAppServerRestartResult> =>
     await ipcRenderer.invoke(APP_SERVER_RESTART_CODEX_CHANNEL),
+  getThreadArchiveSweepStatus: async (): Promise<DesktopThreadArchiveSweepStatus> =>
+    await ipcRenderer.invoke(APP_SERVER_GET_THREAD_ARCHIVE_SWEEP_STATUS_CHANNEL),
+  runThreadArchiveSweep: async (): Promise<DesktopThreadArchiveSweepStatus> =>
+    await ipcRenderer.invoke(APP_SERVER_RUN_THREAD_ARCHIVE_SWEEP_CHANNEL),
   listBackends: async (
     request?: ListBackendsRequest
   ): Promise<ListBackendsResponse> =>
@@ -2722,6 +2749,18 @@ const desktopApi = Object.freeze({
     ipcRenderer.on(CODEX_RESTART_STATUS_CHANGED_EVENT_CHANNEL, listener);
     return () => {
       ipcRenderer.off(CODEX_RESTART_STATUS_CHANGED_EVENT_CHANNEL, listener);
+    };
+  },
+  onThreadArchiveSweepStatusChanged: (
+    callback: (status: DesktopThreadArchiveSweepStatus) => void,
+  ): (() => void) => {
+    const listener = (
+      _event: Electron.IpcRendererEvent,
+      status: DesktopThreadArchiveSweepStatus,
+    ) => callback(status);
+    ipcRenderer.on(THREAD_ARCHIVE_SWEEP_STATUS_CHANGED_EVENT_CHANNEL, listener);
+    return () => {
+      ipcRenderer.off(THREAD_ARCHIVE_SWEEP_STATUS_CHANGED_EVENT_CHANNEL, listener);
     };
   },
   onGithubPrSamlEnforcement: (

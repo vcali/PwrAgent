@@ -6,6 +6,7 @@ import type {
   AppServerBackendScope,
   AppServerBuiltinBackendKind,
   AppServerBackendKind,
+  AppServerPendingRequestNotification,
   AppServerThreadActivityDetail,
   AppServerThreadActivityEntry,
   AppServerThreadImagePart,
@@ -312,6 +313,7 @@ export type ThreadAdmissionState = {
     threadId: ThreadIdentifier;
     turnId: string;
   };
+  pendingRequest?: AppServerPendingRequestNotification;
   thread?: NavigationThreadSummary;
   threadStatus?: AppServerThreadStatus;
 };
@@ -348,7 +350,8 @@ export type TokenMiserSubAgentAccounting = {
 };
 
 export type ThreadActiveSubAgent = Pick<ThreadSubAgentSummary,
-  "monitorId" | "task" | "status" | "createdAt" | "updatedAt" | "monitorThreadId" | "monitorTurnId"
+  | "monitorId" | "task" | "status" | "createdAt" | "updatedAt" | "monitorThreadId" | "monitorTurnId"
+  | "agentName"
 >;
 
 export type ThreadSubAgentSummary = {
@@ -2694,6 +2697,10 @@ export type ThreadOverlayState = {
    * they do not reappear after refresh or restart.
    */
   archiveTombstonedAt?: number;
+  /** A restore counts as activity even when the provider keeps its old timestamp. */
+  archiveRestoredAt?: number;
+  /** Durable start of the current archived retention period. */
+  archiveRetentionStartedAt?: number;
   retainedBranchDriftPairs?: ThreadBranchDriftPair[];
   extraLinkedDirectories: LinkedDirectorySummary[];
   worktreeSnapshots?: WorktreeSnapshotSummary[];
