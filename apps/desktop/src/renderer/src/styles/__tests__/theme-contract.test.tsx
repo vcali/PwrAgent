@@ -2424,7 +2424,13 @@ describe("Tangerine Terminal theme contract", () => {
 });
 
 describe("color theme contract", () => {
-  const DARK_THEMES = ["catppuccin-mocha", "solarized-dark", "gray-dark", "blue-dark"];
+  const DARK_THEMES = [
+    "catppuccin-mocha",
+    "solarized-dark",
+    "gray-dark",
+    "blue-dark",
+    "matrix-dark",
+  ];
   const LIGHT_THEMES = ["catppuccin-latte", "solarized-light", "gray-light", "blue-light"];
   const blockFor = (theme: string): Record<string, string> =>
     extractTokensForSelector(css, `:root[data-color-theme="${theme}"]`);
