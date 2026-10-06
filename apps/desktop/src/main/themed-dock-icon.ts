@@ -1,21 +1,27 @@
 import { release } from "node:os";
 import { join } from "node:path";
-import { app, nativeImage } from "electron";
-import type { DesktopDarkTheme } from "@pwragent/shared";
+import { app, nativeImage, nativeTheme } from "electron";
+import type {
+  DesktopAppearanceTheme,
+  DesktopDarkTheme,
+  DesktopLightTheme,
+} from "@pwragent/shared";
 import { DESKTOP_DARK_THEME_DEFAULT } from "@pwragent/shared";
 import { getMainLogger } from "./log";
 
 /**
- * macOS: a running instance's Dock icon follows its profile's dark theme, so
+ * macOS: a running instance's Dock icon follows its profile's color theme, so
  * two instances on two profiles in two themes are told apart in the Dock.
  * Each instance is its own Dock tile (the Dock menu's Open Profile launches
  * with `createsNewApplicationInstance`), and each reads its own profile's
  * config, so the icon is per instance with no coordination.
  *
- * The dark theme, not the theme on screen: a profile's icon should not flip
- * with the OS appearance, and the shipped icon is a dark tile. Tangerine
- * keeps the app's own icon, and so does an instance with
- * `[general.appearance] themed_dock_icon = false`.
+ * The icon follows the theme on screen: the dark theme in dark mode, the
+ * light theme in light mode, so the Dock matches the window. Every icon is a
+ * dark tile (the shipped icon is one), so a light theme shows its family's
+ * tile: Blue light shows the blue icon, Catppuccin Latte the Catppuccin one.
+ * Tangerine keeps the app's own icon in either mode, and so does an instance
+ * with `[general.appearance] themed_dock_icon = false`.
  *
  * Only the running Dock tile changes. The icon a stopped app shows is the
  * bundle's, which this does not touch.
@@ -47,6 +53,36 @@ export function drawsLiquidGlassIcons(darwinRelease: string = release()): boolea
   return Number(darwinRelease.split(".")[0]) >= 25;
 }
 
+/** The dark theme whose icon a light theme shows: its own family's tile. */
+const LIGHT_THEME_DOCK_ICON: Record<DesktopLightTheme, DesktopDarkTheme> = {
+  "tangerine-light": "tangerine-dark",
+  "catppuccin-latte": "catppuccin-mocha",
+  "solarized-light": "solarized-dark",
+  "gray-light": "gray-dark",
+  "blue-light": "blue-dark",
+};
+
+export type ThemedDockIconAppearance = {
+  theme: DesktopAppearanceTheme;
+  darkTheme: DesktopDarkTheme;
+  lightTheme: DesktopLightTheme;
+  themedDockIcon: boolean;
+};
+
+/**
+ * The theme whose icon the Dock shows: the one on screen, as
+ * `native-appearance.ts` resolves it, mapped to its family's dark tile.
+ */
+export function dockIconTheme(
+  appearance: Pick<ThemedDockIconAppearance, "theme" | "darkTheme" | "lightTheme">,
+  systemDark: boolean,
+): DesktopDarkTheme {
+  const light =
+    appearance.theme === "light"
+    || (appearance.theme === "system" && !systemDark);
+  return light ? LIGHT_THEME_DOCK_ICON[appearance.lightTheme] : appearance.darkTheme;
+}
+
 /**
  * The icon file a dark theme shows, relative to the icon directory, or null
  * for the app's own icon.
@@ -63,13 +99,23 @@ export function themedDockIconFile(
 /** The last file applied: undefined until one is, null for the app icon. */
 let applied: string | null | undefined;
 
-export function syncThemedDockIcon(appearance: {
-  darkTheme: DesktopDarkTheme;
-  themedDockIcon: boolean;
-}): void {
+/** The last appearance synced, so an OS appearance change can re-sync. */
+let lastAppearance: ThemedDockIconAppearance | undefined;
+let systemAppearanceListenerInstalled = false;
+
+export function syncThemedDockIcon(appearance: ThemedDockIconAppearance): void {
   if (process.platform !== "darwin" || !app?.dock) return;
+  lastAppearance = appearance;
+  if (!systemAppearanceListenerInstalled) {
+    // "system" follows the OS appearance, which changes without a config
+    // write, so the icon is re-synced when it does.
+    systemAppearanceListenerInstalled = true;
+    nativeTheme.on("updated", () => {
+      if (lastAppearance) syncThemedDockIcon(lastAppearance);
+    });
+  }
   const file = themedDockIconFile(
-    appearance.darkTheme,
+    dockIconTheme(appearance, nativeTheme.shouldUseDarkColors),
     appearance.themedDockIcon,
     drawsLiquidGlassIcons(),
   );
@@ -103,4 +149,6 @@ export function syncThemedDockIcon(appearance: {
 
 export function resetThemedDockIconForTests(): void {
   applied = undefined;
+  lastAppearance = undefined;
+  systemAppearanceListenerInstalled = false;
 }

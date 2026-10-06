@@ -417,7 +417,7 @@ export function GeneralSettings(props: {
                 checked={themedDockIcon.value}
                 disabled={props.saving}
                 label="Match Dock icon to theme"
-                sub="While PwrAgent runs, its Dock icon wears the dark theme, so instances on different profiles are easy to tell apart."
+                sub="While PwrAgent runs, its Dock icon wears the theme on screen, so instances on different profiles are easy to tell apart."
                 source={sourceBadge(themedDockIcon)}
                 onChange={(next) => {
                   return props.onThemedDockIconChange(next);
