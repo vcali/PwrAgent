@@ -250,6 +250,7 @@ function profileSummary(
     },
     default: name === "default",
     profileDir: `/home/example/.pwragent/profiles/${name}`,
+    showInMenu: true,
   };
 }
 
@@ -390,7 +391,7 @@ describe("App", () => {
       expect(selection.toString()).toBe("Keep this paragraph selected.");
       expect(scroll.scrollTop).toBe(640);
       expect(readMarkdownFile).toHaveBeenCalledTimes(1);
-      expect(screen.queryByText("Loading document...")).not.toBeInTheDocument();
+      expect(screen.queryByText("Loading file…")).not.toBeInTheDocument();
     }
     selection.removeAllRanges();
   });
@@ -2121,6 +2122,29 @@ describe("App", () => {
     });
   });
 
+  it("waits for startup settings before reading a buffered Codex config warning", async () => {
+    const readSettings = vi.fn(async () => await new Promise<never>(() => {}));
+    const getLatestCodexConfigWarning = vi.fn(async () => ({
+      event: {
+        backend: "codex" as const,
+        notification: {
+          method: "configWarning" as const,
+          params: { summary: "Unsupported fixture feature", details: null },
+        },
+      },
+    }));
+    Object.defineProperty(window, "pwragent", {
+      configurable: true,
+      value: ownerApi({ readSettings, getLatestCodexConfigWarning }),
+    });
+
+    render(<App />);
+    await waitFor(() => expect(readSettings).toHaveBeenCalledOnce());
+    await flushReactUpdates();
+    expect(getLatestCodexConfigWarning).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
   it("surfaces a buffered Codex config warning captured before renderer subscription", async () => {
     const trustCodexProject = vi.fn(
       async (request: { projectPath: string; configPath?: string }) => ({
@@ -2284,6 +2308,7 @@ describe("App", () => {
           darkTheme: { value: "tangerine-dark", source: "default" },
           lightTheme: { value: "tangerine-light", source: "default" },
           themedDockIcon: { value: true, source: "default" },
+          terminalMinimumContrast: { value: false, source: "default" },
           density: { value: "mission-control", source: "default" },
           sidebarTextSize: { value: "md", source: "default" },
           transcriptTextSize: { value: "md", source: "default" },
@@ -2639,6 +2664,7 @@ describe("App", () => {
               darkTheme: { value: "tangerine-dark", source: "default" },
               lightTheme: { value: "tangerine-light", source: "default" },
               themedDockIcon: { value: true, source: "default" },
+              terminalMinimumContrast: { value: false, source: "default" },
               density: { value: "mission-control", source: "default" },
               sidebarTextSize: { value: "md", source: "default" },
               transcriptTextSize: { value: "md", source: "default" },
@@ -3631,6 +3657,7 @@ describe("App", () => {
                 darkTheme: { value: "tangerine-dark", source: "default" },
                 lightTheme: { value: "tangerine-light", source: "default" },
                 themedDockIcon: { value: true, source: "default" },
+                terminalMinimumContrast: { value: false, source: "default" },
                 density: { value: "mission-control", source: "default" },
                 sidebarTextSize: { value: "md", source: "default" },
                 transcriptTextSize: { value: "md", source: "default" },
@@ -3779,6 +3806,7 @@ describe("App", () => {
                 darkTheme: { value: "tangerine-dark", source: "default" },
                 lightTheme: { value: "tangerine-light", source: "default" },
                 themedDockIcon: { value: true, source: "default" },
+                terminalMinimumContrast: { value: false, source: "default" },
                 density: { value: "mission-control", source: "default" },
                 sidebarTextSize: { value: "md", source: "default" },
                 transcriptTextSize: { value: "md", source: "default" },
@@ -3903,6 +3931,7 @@ describe("App", () => {
                 darkTheme: { value: "tangerine-dark", source: "default" },
                 lightTheme: { value: "tangerine-light", source: "default" },
                 themedDockIcon: { value: true, source: "default" },
+                terminalMinimumContrast: { value: false, source: "default" },
                 density: { value: "mission-control", source: "default" },
                 sidebarTextSize: { value: "md", source: "default" },
                 transcriptTextSize: { value: "md", source: "default" },
@@ -4014,6 +4043,7 @@ describe("App", () => {
                 darkTheme: { value: "tangerine-dark", source: "default" },
                 lightTheme: { value: "tangerine-light", source: "default" },
                 themedDockIcon: { value: true, source: "default" },
+                terminalMinimumContrast: { value: false, source: "default" },
                 density: { value: "mission-control", source: "default" },
                 sidebarTextSize: { value: "md", source: "default" },
                 transcriptTextSize: { value: "md", source: "default" },
@@ -4115,6 +4145,7 @@ describe("App", () => {
                 darkTheme: { value: "tangerine-dark", source: "default" },
                 lightTheme: { value: "tangerine-light", source: "default" },
                 themedDockIcon: { value: true, source: "default" },
+                terminalMinimumContrast: { value: false, source: "default" },
                 density: { value: "mission-control", source: "default" },
                 sidebarTextSize: { value: "md", source: "default" },
                 transcriptTextSize: { value: "md", source: "default" },
@@ -4214,6 +4245,7 @@ describe("App", () => {
                 darkTheme: { value: "tangerine-dark", source: "default" },
                 lightTheme: { value: "tangerine-light", source: "default" },
                 themedDockIcon: { value: true, source: "default" },
+                terminalMinimumContrast: { value: false, source: "default" },
                 density: { value: "mission-control", source: "default" },
                 sidebarTextSize: { value: "md", source: "default" },
                 transcriptTextSize: { value: "md", source: "default" },
@@ -4361,6 +4393,7 @@ describe("App", () => {
                 darkTheme: { value: "tangerine-dark", source: "default" },
                 lightTheme: { value: "tangerine-light", source: "default" },
                 themedDockIcon: { value: true, source: "default" },
+                terminalMinimumContrast: { value: false, source: "default" },
                 density: { value: "mission-control", source: "default" },
                 sidebarTextSize: { value: "md", source: "default" },
                 transcriptTextSize: { value: "md", source: "default" },

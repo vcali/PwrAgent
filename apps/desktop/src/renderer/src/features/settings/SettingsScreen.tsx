@@ -281,6 +281,9 @@ export function SettingsScreen(props: {
    *  registry id under "models", a platform kind under "messaging").
    *  Ignored without `initialSection`. */
   initialSubsection?: string;
+  /** Profiles → New Profile…: open the Profiles pane's create form. */
+  profileCreateRequested?: boolean;
+  onProfileCreateRequestHandled?: () => void;
   onClose?: () => void;
   onOpenThread?: (target: {
     backend: AppServerBackendKind;
@@ -830,6 +833,8 @@ export function SettingsScreen(props: {
                 onOpenRoute={openRoute}
                 onOpenThread={props.onOpenThread}
                 onShowNotice={props.onShowNotice}
+                onProfileCreateRequestHandled={props.onProfileCreateRequestHandled}
+                profileCreateRequested={props.profileCreateRequested}
                 profiles={props.profiles}
                 section={section}
                 settings={props.settings}
@@ -866,6 +871,8 @@ function SettingsSectionBody(props: {
     threadId: string;
   }) => void;
   onShowNotice?: (notice: AppNoticeToastNotice) => void;
+  onProfileCreateRequestHandled?: () => void;
+  profileCreateRequested?: boolean;
   profiles?: PwrAgentProfilesState;
   section: SettingsSection;
   settings: DesktopSettingsState;
@@ -936,6 +943,11 @@ function SettingsSectionBody(props: {
         onThemedDockIconChange={async (themedDockIcon) => {
           await props.settings.writeConfig({
             general: { appearance: { themedDockIcon } },
+          });
+        }}
+        onTerminalMinimumContrastChange={async (terminalMinimumContrast) => {
+          await props.settings.writeConfig({
+            general: { appearance: { terminalMinimumContrast } },
           });
         }}
         onClearMessagingAcknowledgment={async () => {
@@ -1437,7 +1449,9 @@ function SettingsSectionBody(props: {
   if (props.section === "profiles") {
     return (
       <ProfilesSettings
+        createRequested={props.profileCreateRequested}
         desktopApi={props.desktopApi}
+        onCreateRequestHandled={props.onProfileCreateRequestHandled}
         profiles={props.profiles}
         snapshot={props.snapshot}
         onSettingsChanged={props.settings.refresh}
@@ -1499,6 +1513,11 @@ function SettingsSectionBody(props: {
           models: { helperModels },
         });
       }}
+      onSaveDecisionModels={async (decisionModels) => {
+        return await props.settings.writeConfig({
+          models: { decisionModels },
+        });
+      }}
       onSaveCodexFastAllowed={async (allowFast) => {
         return await props.settings.writeConfig({
           models: {
@@ -1510,6 +1529,13 @@ function SettingsSectionBody(props: {
         return await props.settings.writeConfig({
           models: {
             codex: { managedBuilds },
+          },
+        });
+      }}
+      onManagedCodexBuildChannelChange={async (managedBuildChannel) => {
+        return await props.settings.writeConfig({
+          models: {
+            codex: { managedBuildChannel },
           },
         });
       }}

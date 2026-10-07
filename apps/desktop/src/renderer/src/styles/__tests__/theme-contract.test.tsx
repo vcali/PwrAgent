@@ -87,6 +87,79 @@ function readZIndex(rule: string): number {
   return Number(rule.match(/z-index:\s*(\d+);/)?.[1] ?? Number.NaN);
 }
 
+interface CssRule {
+  selector: string;
+  body: string;
+  line: number;
+}
+
+/**
+ * Every innermost `selector { body }` block in a stylesheet, in source
+ * order, with the 1-based line its selector starts on. Comments are blanked
+ * first, so a brace in prose cannot open a block. An at-rule wrapper such as
+ * `@media` contributes its inner rules, not itself. For the whole-file
+ * sweeps that hold a token to its role, where `extractRuleBody` (first
+ * top-level match) would see one rule of many.
+ */
+function collectRules(source: string): CssRule[] {
+  const text = source.replace(/\/\*[\s\S]*?\*\//g, (comment) =>
+    comment.replace(/[^\n]/g, " "),
+  );
+  const rules: CssRule[] = [];
+  const open: Array<{ preludeStart: number; brace: number; line: number; nested: boolean }> = [];
+  let preludeStart = 0;
+  let preludeLine = 0;
+  let line = 1;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (char === "\n") {
+      line += 1;
+    } else if (char === "{") {
+      if (open.length > 0) {
+        open[open.length - 1].nested = true;
+      }
+      open.push({ preludeStart, brace: index, line: preludeLine, nested: false });
+      preludeStart = index + 1;
+      preludeLine = 0;
+    } else if (char === "}") {
+      const block = open.pop();
+      if (block && !block.nested) {
+        rules.push({
+          selector: text.slice(block.preludeStart, block.brace).trim().replace(/\s+/g, " "),
+          body: text.slice(block.brace + 1, index),
+          line: block.line,
+        });
+      }
+      preludeStart = index + 1;
+      preludeLine = 0;
+    } else if (char === ";" && open.length === 0) {
+      preludeStart = index + 1;
+      preludeLine = 0;
+    } else if (preludeLine === 0 && !/\s/.test(char)) {
+      preludeLine = line;
+    }
+  }
+  return rules;
+}
+
+/**
+ * The class names on each selector's subject, the compound after its last
+ * combinator, one array per selector in the list. Parenthesized arguments
+ * and attribute values are dropped first: a class inside `:not(…)` does not
+ * name the element, and a comma or space inside `:is(…)` or `[…="…"]` does
+ * not split the selector.
+ */
+function subjectClasses(selectorList: string): string[][] {
+  let flat = selectorList.replace(/\[[^\]]*\]/g, "[]");
+  while (/\([^()]*\)/.test(flat)) {
+    flat = flat.replace(/\([^()]*\)/g, "");
+  }
+  return flat.split(",").map((selector) => {
+    const subject = selector.trim().split(/\s*[>+~]\s*|\s+/).pop() ?? "";
+    return [...subject.matchAll(/\.([\w-]+)/g)].map(([, name]) => name);
+  });
+}
+
 function expandHex(hex: string): string {
   const normalized = hex.replace("#", "");
   if (normalized.length === 3) {
@@ -338,47 +411,59 @@ describe("Tangerine Terminal theme contract", () => {
     ).toMatch(/height:\s*24px;/);
     expect(
       extractRuleBody(css, ".thread-row__actions .thread-row__chip--add-reaction"),
-    ).toMatch(/height:\s*24px;[\s\S]*min-width:\s*24px;/);
+    ).toMatch(/height:\s*24px;/);
 
-    // The in-title unpin control is a real 24x24 target too (axe's
+    // The title-line unpin control is a real 24x24 target too (axe's
     // target-size rule gives no inline exception to flex-item buttons);
-    // its negative margins collapse the layout footprint back to the
-    // 18px line slot, so the heading's geometry doesn't move.
-    expect(extractRuleBody(css, ".thread-row__heading-pin")).toMatch(
+    // the actions' negative block margin collapses the layout footprint
+    // back to the title's line, so the card's height doesn't move.
+    expect(extractRuleBody(css, ".thread-row__pin")).toMatch(
       /width:\s*24px;[\s\S]*height:\s*24px;/,
     );
 
-    // A 24px target is worthless while something paints over it — the
-    // pinned-row hover reserve keeps the revealed cluster off the
-    // in-title unpin pin. Pinned (all five reveal arms + the value + the
-    // cluster-side literals it is derived from) so a cluster resize or a
-    // dropped keyboard arm revisits the derivation in the rule's comment
-    // in the same commit.
+    // The pin must not move when the row is hovered: a pin that slid left
+    // as the pointer arrived turned clicks on the title into unpins. It
+    // holds still because nothing right of it changes width — the
+    // timestamp and the kebab share one lane, floored at the kebab's
+    // width so the lane is as wide at rest as on hover. Pin the floor to
+    // the kebab's own width so resizing one without the other fails here
+    // instead of sliding the pin again.
+    const kebabWidth = css.match(
+      /(?:^|\n)\.thread-row__overflow-button \{[^}]*width:\s*(\d+)px;/,
+    )?.[1];
+    expect(kebabWidth).toBe("26");
+    expect(extractRuleBody(css, ".thread-row__time-lane")).toMatch(
+      new RegExp(`min-width:\\s*${kebabWidth}px;`),
+    );
     expect(
       extractRuleBody(
         css,
-        ".thread-row-shell:hover .thread-row--pinned .thread-row__heading,\n"
-          + ".thread-row-shell:has(.thread-row__overflow-button:focus-visible) .thread-row--pinned .thread-row__heading,\n"
-          + ".thread-row-shell:has(.thread-row__chip--add-reaction:focus-visible) .thread-row--pinned .thread-row__heading,\n"
-          + ".thread-row-shell:has(.thread-row__chip--add-reaction.is-open) .thread-row--pinned .thread-row__heading,\n"
-          + ".thread-row-shell:has(.thread-row__overflow-button[aria-expanded=\"true\"]) .thread-row--pinned .thread-row__heading",
+        ".thread-row__time-lane > .thread-row__time,\n.thread-row__time-lane > .thread-row__overflow-button",
       ),
-    ).toMatch(/padding-right:\s*46px;/);
+    ).toMatch(/grid-area:\s*1 \/ 1;/);
+    // At rest the hover controls must have zero area, not merely zero
+    // opacity: axe's target-size rule measures invisible controls, and a
+    // border left on a zero-width chip is a 2px target.
+    expect(extractRuleBody(css, ".thread-row__pin-button")).toMatch(
+      /width:\s*0;[\s\S]*border-width:\s*0;/,
+    );
+    expect(
+      extractRuleBody(css, ".thread-row__actions .thread-row__chip.thread-row__chip--add-reaction"),
+    ).toMatch(/border-width:\s*0;/);
+    // The hover controls grow from zero width; caught mid-growth they are
+    // under 24px. Reduced motion (which the a11y gate emulates) must drop
+    // the size transition so they open at full size.
+    const reducedMotionGrowth = css.match(
+      /@media \(prefers-reduced-motion: reduce\) \{\s*\.thread-row__actions \.thread-row__chip--add-reaction,\s*\.thread-row__pin-button \{([^}]*)\}/,
+    )?.[1];
+    expect(reducedMotionGrowth).toBeDefined();
+    expect(reducedMotionGrowth).toMatch(/transition-property:/);
+    expect(reducedMotionGrowth).not.toMatch(/width|margin/);
+    // The 24px controls give their overhang back at every title notch, so
+    // revealing them never changes the card's height.
     expect(extractRuleBody(css, ".thread-row__actions")).toMatch(
-      /right:\s*11px;[\s\S]*gap:\s*4px;/,
+      /margin-block:\s*calc\(\(var\(--sidebar-title-size\) \* 1\.25 \+ 2px - 24px\) \/ 2\);/,
     );
-    // The cluster's 11px offset and the reserve inequality's first term
-    // both derive from the card's inline padding (10px + 1px border), so
-    // that literal belongs in the same pin set: shrink the card padding
-    // and 11/46 stay green while the kebab drifts off the content edge
-    // and the pin loses its clearance.
-    expect(extractRuleBody(css, ".thread-row")).toMatch(
-      /padding:\s*4px 10px;/,
-    );
-    // Not extractRuleBody: the bare selector would match the shared
-    // pin+kebab chrome rule first; this anchors the standalone width
-    // rule's own body.
-    expect(css).toMatch(/(?:^|\n)\.thread-row__overflow-button \{[^}]*width:\s*26px;/);
 
     // And the open-thread overlay keeps the explicit floor the old
     // in-flow button carried: at the XS title notch a chipless card
@@ -552,6 +637,15 @@ describe("Tangerine Terminal theme contract", () => {
       // `.composer-tiptap-input` as a CSS string and drawn by the last
       // paragraph's ::after. Content, not theme.
       "composer-inline-hint",
+      // The file preview's horizontal inset, defined on `.file-preview` and
+      // set per surface (the dialog and the Files window pad differently).
+      // The notice, the line gutter and the table all read it. Geometry, not
+      // theme.
+      "file-preview-inset",
+      // The gap between usage chart bars, defined on `.usage-timeline__plot`.
+      // The bars and the slice card's inline position both read it, so the
+      // card cannot drift off its bar. Geometry, not theme.
+      "usage-bar-gap",
     ]);
     const tokenReferences = [...css.matchAll(/var\(--([a-z0-9-]+)\)/g)].map(
       ([, token]) => token
@@ -666,6 +760,80 @@ describe("Tangerine Terminal theme contract", () => {
     ).toContain("border-color: var(--danger-border);");
   });
 
+  it("keeps the Codex config warning card neutral with a readable amber eyebrow", () => {
+    // The card was tinted 8% amber with an amber border, which read as a
+    // beige panel in the blue themes. The eyebrow carries the warning, in
+    // the text token, since --status-warning is the dot-and-stroke amber.
+    const card = extractRuleBody(css, ".codex-config-warning-banner");
+    expect(card).toContain("border: 1px solid var(--border-subtle);");
+    expect(card).toContain("background: var(--bg-panel-elevated);");
+    expect(card).not.toContain("--status-warning");
+    expect(extractRuleBody(css, ".codex-config-warning-banner__eyebrow"))
+      .toContain("color: var(--status-warning-text);");
+  });
+
+  it("keeps every floating surface frame out of the status tones", () => {
+    // State by emphasis and badges, not colored panels (desktop style
+    // guide). The status tones are per-theme hues, so a frame drawn in one
+    // changes character with the theme: blue-dark's salmon --danger-base
+    // turned the detach-PR dialog into an orange box (#2600), and an 8%
+    // amber tint turned the Codex config warning into a beige panel in
+    // blue-light (#2620). The accent tokens follow each theme's own hue and
+    // stay allowed; the update banner frames itself in them on purpose.
+    const rules = collectRules(css);
+    const frames: string[][] = [];
+    for (const rule of rules) {
+      const fixed = /(?:^|[;{\s])position:\s*fixed\b/.test(rule.body);
+      for (const classes of subjectClasses(rule.selector)) {
+        if (fixed && classes.length > 0) {
+          frames.push(classes);
+        }
+        // A dialog inside a fixed scrim is the frame the eye reads, though
+        // only its modal parent is fixed. `__element` parts are its contents.
+        for (const name of classes) {
+          if (/dialog|modal|banner|toast/.test(name) && !name.includes("__")) {
+            frames.push([name]);
+          }
+        }
+      }
+    }
+    const isFrame = (classes: string[]): boolean =>
+      frames.some((frame) => frame.every((name) => classes.includes(name)));
+    // A walker that found nothing would pass everything.
+    for (const selector of [".pr-detach-warning-dialog", ".codex-config-warning-banner", ".app-notice-toast", ".jump-palette"]) {
+      expect(isFrame(subjectClasses(selector)[0]), `${selector} is a floating frame`).toBe(true);
+    }
+
+    const statusTone =
+      /var\(--(?:status-(?:warning|error|ok)|danger|success|info|warning|savings)(?:-[a-z0-9-]+)?\)/;
+    const frameDeclaration =
+      /(?:^|[;{\s])((?:border(?:-(?:top|right|bottom|left))?|outline)(?:-color)?|background(?:-color)?)\s*:\s*([^;]+)/g;
+    const offenders: string[] = [];
+    for (const rule of rules) {
+      if (!subjectClasses(rule.selector).some(isFrame)) {
+        continue;
+      }
+      for (const [, property, value] of rule.body.matchAll(frameDeclaration)) {
+        if (statusTone.test(value)) {
+          offenders.push(`app.css:${rule.line} ${rule.selector} { ${property}: ${value.trim()} }`);
+        }
+      }
+    }
+    expect(offenders, "floating frames drawn in a status tone").toEqual([]);
+  });
+
+  it("colors warning text with --status-warning-text, never the stroke token", () => {
+    // --status-warning is for dots, strokes, and meters (UI-THEME.md).
+    // Tangerine light gives text its own darker amber, because the stroke
+    // amber fails AA as type; every other theme aliases the two.
+    const offenders = collectRules(css).flatMap((rule) =>
+      [...rule.body.matchAll(/(?:^|[;{\s])color\s*:\s*([^;]+)/g)]
+        .filter(([, value]) => /var\(--status-warning\)/.test(value))
+        .map(([, value]) => `app.css:${rule.line} ${rule.selector} { color: ${value.trim()} }`),
+    );
+    expect(offenders, "color: reads --status-warning instead of --status-warning-text").toEqual([]);
+  });
+
   it("carries notice tone on the title-row dot, not the card", () => {
     // State by emphasis and badges, not colored panels (desktop style guide):
     // the card is neutral in every tone, and the dot and countdown carry it.
@@ -686,6 +854,61 @@ describe("Tangerine Terminal theme contract", () => {
         extractRuleBody(css, `.app-notice-toast[data-tone="${tone}"] .app-notice-toast__timer`),
       ).toContain(`var(${token})`);
     }
+  });
+
+  it("carries inline notice tone on the label, not the panel", () => {
+    // Every theme's danger and warning hues are warm, so a panel tinted with
+    // them read as a salmon or beige box in blue and the other cool themes.
+    // Each frame is a neutral card; a dot, title, eyebrow, icon, or the
+    // line's own text carries the tone. Text may wear a tone token; the
+    // frame's border and fill may not.
+    const statusFill = /--(danger|warning|success|info|status)-|--accent-(soft|border)/;
+    const frameDeclarations = (rule: string) =>
+      rule.match(/^\s*(border|background)[a-z-]*:[^;]*;/gm)?.join("\n") ?? "";
+    for (const selector of [
+      ".settings-archive-banner",
+      ".settings-plugin-notice",
+      ".federation-disconnected-banner",
+      ".settings-inline-notice",
+      ".rbac-callout",
+      ".sidebar-error,\n.transcript-error",
+      ".thread-search__error",
+      ".settings-list-validation__item",
+      ".pr-activity__notice",
+    ]) {
+      const frame = extractRuleBody(css, selector);
+      expect(frame, selector).toContain("border: 1px solid var(--border-subtle);");
+      expect(frame, selector).toContain("background: var(--bg-panel-elevated);");
+      expect(frameDeclarations(frame), selector).not.toMatch(statusFill);
+    }
+    const settled = extractRuleBody(
+      css,
+      ".managed-progress--ok,\n.managed-progress--error,\n.managed-progress--notice",
+    );
+    expect(settled).toContain("border-color: var(--border-subtle);");
+    expect(settled).toContain("background: var(--bg-panel-elevated);");
+    // A modifier may recolor the line, never refill the frame.
+    for (const selector of [
+      ".settings-plugin-notice--success",
+      ".settings-plugin-notice--error",
+      ".settings-mcp-probe--ok",
+      ".settings-mcp-probe--err",
+    ]) {
+      expect(frameDeclarations(extractRuleBody(css, selector)), selector).toBe("");
+    }
+    expect(css).not.toMatch(/\n\.settings-panel--error\s*\{/);
+    expect(css).not.toMatch(/\n\.rbac-callout\.is-danger\s*\{/);
+
+    expect(extractRuleBody(css, ".settings-archive-banner__text b"))
+      .toContain("color: var(--danger-text);");
+    expect(extractRuleBody(css, ".settings-panel--error .settings-panel__header .eyebrow"))
+      .toContain("color: var(--danger-text);");
+    expect(extractRuleBody(css, ".pr-activity__notice-title"))
+      .toContain("color: var(--status-warning-text);");
+    expect(extractRuleBody(css, ".rbac-callout.is-danger .rbac-callout__icon"))
+      .toContain("color: var(--danger-text);");
+    expect(extractRuleBody(css, ".federation-disconnected-banner__dot"))
+      .toContain("background: var(--status-warning);");
   });
 
   it("sizes a notice to its content and scrolls only the text", () => {
@@ -799,6 +1022,27 @@ describe("Tangerine Terminal theme contract", () => {
     expect(css).toMatch(
       /\.settings-titlebar \.messaging-status-bar,\s*\.settings-titlebar \.messaging-status-bar \*\s*\{[\s\S]*?-webkit-app-region:\s*no-drag;[\s\S]*?\}/,
     );
+  });
+
+  it("keeps everything inside a title-strip control out of the drag region", () => {
+    // `.thread-header *` and `.settings-titlebar *` make every descendant a
+    // drag region. Opting out only the control left its icon one, so the
+    // breadcrumb's project caret took clicks and hover only at its edges.
+    expect(css).toMatch(
+      /\.thread-header button,\s*\.thread-header button \*,\s*\.thread-header input,\s*\.thread-header a,\s*\.thread-header a \*,\s*\.thread-header select\s*\{\s*-webkit-app-region:\s*no-drag;\s*\}/,
+    );
+    expect(css).toMatch(
+      /\.settings-titlebar button,\s*\.settings-titlebar button \*,[\s\S]*?\.settings-titlebar \[role="button"\] \*\s*\{\s*-webkit-app-region:\s*no-drag;\s*\}/,
+    );
+  });
+
+  it("lets the breadcrumb's project link shrink beside the thread title", () => {
+    // `overflow: clip` is not a scroll container, so without an explicit
+    // `min-width: 0` the flex item's minimum is the whole unwrapped name, and
+    // a narrow header squeezed the thread title to 0px instead.
+    const rule = extractRuleBody(css, ".thread-header__eyebrow--link");
+    expect(rule).toMatch(/overflow:\s*clip;/);
+    expect(rule).toMatch(/min-width:\s*0;/);
   });
 
   it("keeps the header machine chip and its menu out of the drag region", () => {
@@ -1085,9 +1329,14 @@ describe("Tangerine Terminal theme contract", () => {
   });
 
   it("keeps hidden thread row actions from stealing row clicks", () => {
-    const actionsRule = extractRuleBody(css, ".thread-row__actions");
-
-    expect(actionsRule).toContain("pointer-events: none;");
+    // The actions inherit the title line's pointer transparency; each
+    // hover control opts back in only while it is revealed.
+    expect(extractRuleBody(css, ".thread-row__header")).toContain(
+      "pointer-events: none;",
+    );
+    expect(
+      extractRuleBody(css, ".thread-row__pin-button,\n.thread-row__overflow-button"),
+    ).toContain("pointer-events: none;");
     expect(css).toMatch(
       /\.thread-row-shell:hover \.thread-row__chip--add-reaction,\s*\.thread-row__chip--add-reaction:focus-visible,\s*\.thread-row__chip--add-reaction\.is-open\s*\{[\s\S]*?pointer-events:\s*auto;[\s\S]*?\}/
     );
@@ -1096,16 +1345,23 @@ describe("Tangerine Terminal theme contract", () => {
     );
   });
 
-  it("hides thread row timestamps behind focused or open row actions", () => {
-    // Pins the FULL six-selector fade list (it once silently grew a
-    // pin-button arm this regex didn't describe, so the test matched a
-    // suffix and stopped being the authoritative statement of the
-    // list). The pinned-row heading reserve mirrors this state set —
-    // its own pin lives with the target-size block above. The last arm
-    // is ⋮ with its menu open: focus has moved into the menu, so without
-    // it the trigger faded out from under the menu it opened.
+  it("hides thread row timestamps exactly while the kebab in their lane shows", () => {
+    // Pins the FULL fade list. The last arm is ⋮ with its menu open:
+    // focus has moved into the menu, so without it the time faded back
+    // in under the trigger of the menu it opened. Scoped to the lane, so
+    // the reaction chip and the pin, which no longer cover the time,
+    // leave it alone, and a kebab-less Starting or Draft row keeps its
+    // label on hover.
+    expect(
+      extractRuleBody(
+        css,
+        ".thread-row-shell:hover .thread-row__time-lane > .thread-row__time,\n"
+          + ".thread-row__time-lane:has(> .thread-row__overflow-button:focus-visible) > .thread-row__time,\n"
+          + ".thread-row__time-lane:has(> .thread-row__overflow-button[aria-expanded=\"true\"]) > .thread-row__time",
+      ),
+    ).toMatch(/opacity:\s*0;/);
     expect(css).toMatch(
-      /\.thread-row-shell:has\(\.thread-row__pin-button:focus-visible\) \.thread-row__time,\s*\.thread-row-shell:hover \.thread-row__time,\s*\.thread-row-shell:has\(\.thread-row__overflow-button:focus-visible\) \.thread-row__time,\s*\.thread-row-shell:has\(\.thread-row__chip--add-reaction:focus-visible\) \.thread-row__time,\s*\.thread-row-shell:has\(\.thread-row__chip--add-reaction\.is-open\) \.thread-row__time,\s*\.thread-row-shell:has\(\.thread-row__overflow-button\[aria-expanded="true"\]\) \.thread-row__time\s*\{[\s\S]*?opacity:\s*0;[\s\S]*?\}/
+      /\.thread-row-shell:hover \.thread-row__overflow-button,\s*\.thread-row__overflow-button:focus-visible,\s*\.thread-row__overflow-button\[aria-expanded="true"\]\s*\{[\s\S]*?opacity:\s*1;[\s\S]*?\}/
     );
   });
 
@@ -1177,20 +1433,21 @@ describe("Tangerine Terminal theme contract", () => {
     expect(css).not.toMatch(/\.star-map-card:focus-visible\s*\{/);
   });
 
-  // The card's title band has no room for an outset ring. The hover cluster
-  // and the subthread toggle sit 1-6px below the card's outer edge, and the
-  // in-title pin's 24px box overhangs its 18px line slot by 3px. At their
+  // The card's title band has no room for an outset ring. The subthread
+  // toggle and the title line's 24px controls sit 1-6px below the card's
+  // outer edge (the controls overhang their 18px line by 3px at md). At their
   // old 1px and 2px offsets, every one of those rings crossed the card's
   // top edge at some title-size notch. The kebab's ring crossed it by 2px
   // at md and was drawn over the selected card's border. One shared rule
-  // rings all five inset. The cluster also needs its `top` to count the
-  // card's border: it is positioned against the shell, whose edge is the
-  // card's OUTER edge. Without the border it sat on that border at the xs
-  // notch, and even an inset ring landed on the border there.
+  // rings all five inset. The subthread toggle also needs its `top` to count
+  // the card's border: it is positioned against the shell, whose edge is the
+  // card's OUTER edge. Without the border the old absolutely positioned
+  // actions cluster sat on that border at the xs notch, and even an inset
+  // ring landed on the border there.
   it("keeps the thread card's title-band focus rings inside the card", () => {
     const controls = [
       ".thread-row__subthread-toggle",
-      ".thread-row__heading-pin",
+      ".thread-row__pin",
       ".thread-row__pin-button",
       ".thread-row__chip--add-reaction",
       ".thread-row__overflow-button",
@@ -1223,15 +1480,12 @@ describe("Tangerine Terminal theme contract", () => {
     const cardBorder = Number(card.match(/border:\s*(\d+)px\s+solid/)?.[1]);
     const cardBlockPadding = Number(card.match(/padding:\s*(\d+)px\s/)?.[1]);
     expect(cardBorder).toBeGreaterThan(0);
-    for (const selector of [
-      ".thread-row__actions",
-      ".thread-row__subthread-toggle",
-    ]) {
-      const titleBandStart = Number(
-        extractRuleBody(css, selector).match(/top:\s*round\(calc\((\d+)px \+/)?.[1],
-      );
-      expect(titleBandStart, selector).toBe(cardBorder + cardBlockPadding);
-    }
+    const titleBandStart = Number(
+      extractRuleBody(css, ".thread-row__subthread-toggle").match(
+        /top:\s*round\(calc\((\d+)px \+/,
+      )?.[1],
+    );
+    expect(titleBandStart).toBe(cardBorder + cardBlockPadding);
   });
 
   it("does not pull an unpinned first directory thread under the sticky header", () => {
@@ -2839,6 +3093,29 @@ describe("color theme contract", () => {
       "terminal-ansi-yellow": "#f9e2af",
       "terminal-ansi-white": "#bac2de",
     });
+  });
+
+  it("gives Gray and Blue their own ANSI colors, readable on their canvas", () => {
+    // Gray and Blue have no upstream terminal. Borrowing Tangerine's, which
+    // is tuned for pure black and pure white, put yellow and bright green
+    // near 2:1 on both light canvases and red under 3:1 on Gray Dark.
+    const ansi = [
+      "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
+    ].flatMap((color) => [color, `bright-${color}`]);
+    for (const theme of ["gray-dark", "gray-light", "blue-dark", "blue-light"]) {
+      const light = LIGHT_THEMES.includes(theme);
+      const block = blockFor(theme);
+      for (const color of ansi) {
+        expect(block[`terminal-ansi-${color}`], `${theme}: ${color}`).toMatch(/^#[0-9a-f]{6}$/);
+        // Black on a dark canvas and bright white on a light one are drawn
+        // as backgrounds (VS Code's convention), not as text.
+        if (color === (light ? "bright-white" : "black")) continue;
+        expect(
+          contrastRatio(block[`terminal-ansi-${color}`], themes[theme]["terminal-bg"]),
+          `${theme}: ${color}`,
+        ).toBeGreaterThanOrEqual(4.5);
+      }
+    }
   });
 
   it("puts --button-text and --accent-on ink only on --accent-fill", () => {

@@ -3019,6 +3019,7 @@ function rememberCollapsedDirectoryWithPinnedThread(params: {
   directoryPath: string;
   registry: DesktopBackendRegistry;
   threadId?: string;
+  collapsed?: boolean;
 }): void {
   const threadId = params.threadId ?? "thread-pinned";
   params.registry.rememberCompleteNavigationSnapshot(buildNavigationSnapshot({
@@ -3028,7 +3029,7 @@ function rememberCollapsedDirectoryWithPinnedThread(params: {
     directoryOverlayByKey: {
       [params.directoryKey]: {
         directoryKey: params.directoryKey,
-        directoryThreadsCollapsed: true,
+        directoryThreadsCollapsed: params.collapsed ?? true,
       },
     },
     overlayByThreadKey: {
@@ -7576,6 +7577,195 @@ describe("DesktopBackendRegistry", () => {
     expect(running?.[0].subAgent.preferredModel).toBe("local-model");
     expect(running?.[0].subAgent.preferredReasoningEffort).toBeUndefined();
     await registry.close();
+  });
+
+  it("recovers account and quotas after startup thread refresh fails", async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), "pwragent-account-recovery-"));
+    const configStore = new DesktopConfigStore({ configPath: path.join(tempRoot, "config.toml") });
+    const command = path.join(tempRoot, "codex");
+    configStore.recordProviderDiscovery("codex", {
+      candidates: [{ command, source: "path", version: "0.160.0" }],
+      selectedCommand: command,
+      selectedVersion: "0.160.0",
+    });
+    const codexClient = new MockBackendClient({
+      listThreadsError: new Error("codex app server client closed"),
+      account: { type: "chatgpt", email: "user@example.com", planType: "pro" },
+      rateLimits: [{ name: "Weekly limit", usedPercent: 22 }],
+    });
+    const registry = new DesktopBackendRegistry({ codexClient, configStore, overlayStore: createOverlayStoreMock() });
+    onTestFinished(async () => {
+      await registry.close();
+      configStore.dispose();
+      await rm(tempRoot, { recursive: true, force: true });
+    });
+    await registry.refreshProvidersAtStartup(issueProviderDiscoveryPermit("startup"));
+    expect((await registry.listBackends()).backends[0].account).toBeUndefined();
+    const response = await registry.listBackends({ refreshRateLimits: true });
+    expect(response.backends[0]).toMatchObject({
+      account: { type: "chatgpt", email: "user@example.com", planType: "pro" },
+      rateLimits: [{ name: "Weekly limit", usedPercent: 22 }],
+    });
+    expect(codexClient.listModelsCallCount).toBe(0);
+  });
+
+  it("recovers a failed account read and retains it when a later read fails", async () => {
+    const codexClient = new MockBackendClient({ rateLimits: [{ name: "Weekly limit", usedPercent: 22 }] });
+    const accountRead = vi.spyOn(codexClient, "readAccount").mockRejectedValueOnce(new Error("temporary failure"));
+    const registry = new DesktopBackendRegistry({ codexClient, overlayStore: createOverlayStoreMock() });
+    onTestFinished(async () => { await registry.close(); });
+    await registry.refreshProvidersAtStartup(issueProviderDiscoveryPermit("startup"));
+    accountRead.mockResolvedValue({ type: "chatgpt", email: "user@example.com", planType: "pro" });
+    const recovered = await registry.listBackends({ refreshRateLimits: true });
+    expect(recovered.backends[0].account?.planType).toBe("pro");
+    await registry.listBackends({ refreshRateLimits: true });
+    expect(accountRead).toHaveBeenCalledTimes(2);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 6_000);
+    onTestFinished(() => { clock.mockRestore(); });
+    accountRead.mockRejectedValueOnce(new Error("temporary failure"));
+    const retained = await registry.listBackends({ refreshRateLimits: true });
+    expect(retained.backends[0].account).toEqual(recovered.backends[0].account);
+  });
+
+  it("clears old quotas when the account becomes signed out", async () => {
+    const codexClient = new MockBackendClient({
+      account: { type: "chatgpt", email: "user@example.com", planType: "pro", requiresOpenaiAuth: true },
+      rateLimits: [{ name: "Weekly limit", usedPercent: 54 }],
+    });
+    const registry = new DesktopBackendRegistry({ codexClient, overlayStore: createOverlayStoreMock() });
+    onTestFinished(async () => { await registry.close(); });
+    await registry.refreshProvidersAtStartup(issueProviderDiscoveryPermit("startup"));
+    vi.spyOn(codexClient, "readAccount").mockResolvedValue({ requiresOpenaiAuth: true });
+    const quotaRead = vi.spyOn(codexClient, "readRateLimits");
+    const response = await registry.listBackends({ refreshRateLimits: true });
+    expect(response.backends[0].account).toEqual({ requiresOpenaiAuth: true });
+    expect(response.backends[0].rateLimits).toEqual([]);
+    expect(quotaRead).not.toHaveBeenCalled();
+  });
+
+  it("does not relabel old quotas when a new account's quota read fails", async () => {
+    const codexClient = new MockBackendClient({
+      account: { type: "chatgpt", email: "previous@example.com", planType: "pro" },
+      rateLimits: [{ name: "Weekly limit", usedPercent: 54 }],
+    });
+    const registry = new DesktopBackendRegistry({ codexClient, overlayStore: createOverlayStoreMock() });
+    onTestFinished(async () => { await registry.close(); });
+    await registry.refreshProvidersAtStartup(issueProviderDiscoveryPermit("startup"));
+    vi.spyOn(codexClient, "readAccount").mockResolvedValue({ type: "chatgpt", email: "current@example.com", planType: "free" });
+    vi.spyOn(codexClient, "readRateLimits").mockRejectedValueOnce(new Error("temporary failure"));
+    const response = await registry.listBackends({ refreshRateLimits: true });
+    expect(response.backends[0].account?.planType).toBe("free");
+    expect(response.backends[0].rateLimits).toEqual([]);
+  });
+
+  it.each([
+    {
+      transition: "account switch",
+      account: { type: "chatgpt", email: "current@example.com", planType: "pro" } as BackendAccountSummary,
+      limits: [{ name: "Weekly limit", usedPercent: 22 }],
+    },
+    {
+      transition: "sign-out",
+      account: { requiresOpenaiAuth: true } as BackendAccountSummary,
+      limits: [],
+    },
+    {
+      transition: "plan change",
+      account: { type: "chatgpt", email: "previous@example.com", planType: "free" } as BackendAccountSummary,
+      limits: [],
+    },
+  ])("discards a pending quota notification refetch after $transition", async ({ account, limits }) => {
+    const codexClient = new MockBackendClient({
+      account: { type: "chatgpt", email: "previous@example.com", planType: "pro" },
+      rateLimits: [{ name: "Weekly limit", usedPercent: 54 }],
+    });
+    const registry = new DesktopBackendRegistry({ codexClient, overlayStore: createOverlayStoreMock() });
+    const pending = createDeferred<BackendRateLimitSummary[]>();
+    onTestFinished(async () => { pending.resolve([]); await registry.close(); });
+    await registry.refreshProvidersAtStartup(issueProviderDiscoveryPermit("startup"));
+    const read = vi.spyOn(codexClient, "readRateLimits")
+      .mockReturnValueOnce(pending.promise)
+      .mockResolvedValue(limits);
+    const notification = codexClient.emit({
+      method: "account/rateLimits/updated",
+      params: {
+        rateLimits: {
+          limitId: null,
+          limitName: "Codex",
+          primary: { usedPercent: 55, windowDurationMins: null, resetsAt: null },
+          secondary: null,
+          individualLimit: null,
+          credits: null,
+          planType: null,
+          rateLimitReachedType: null,
+        },
+      },
+    });
+    await vi.waitFor(() => expect(read).toHaveBeenCalledOnce());
+    vi.spyOn(codexClient, "readAccount").mockResolvedValue(account);
+    await registry.listBackends({ refreshRateLimits: true });
+    pending.resolve([{ name: "Weekly limit", usedPercent: 55 }]);
+    await notification;
+    const response = await registry.listBackends();
+    expect(response.backends[0].account).toEqual(account);
+    expect(response.backends[0].rateLimits).toEqual(limits);
+  });
+
+  it.each(["failed", "empty"])("clears old plan quotas when the new quota read is %s", async (result) => {
+    const codexClient = new MockBackendClient({
+      account: { type: "chatgpt", email: "user@example.com", planType: "pro" },
+      rateLimits: [{ name: "Weekly limit", usedPercent: 54 }],
+    });
+    const registry = new DesktopBackendRegistry({ codexClient, overlayStore: createOverlayStoreMock() });
+    onTestFinished(async () => { await registry.close(); });
+    await registry.refreshProvidersAtStartup(issueProviderDiscoveryPermit("startup"));
+    vi.spyOn(codexClient, "readAccount").mockResolvedValue({ type: "chatgpt", email: "user@example.com", planType: "free" });
+    const read = vi.spyOn(codexClient, "readRateLimits");
+    if (result === "failed") read.mockRejectedValueOnce(new Error("temporary failure"));
+    else read.mockResolvedValueOnce([]);
+    const response = await registry.listBackends({ refreshRateLimits: true });
+    expect(response.backends[0].account?.planType).toBe("free");
+    expect(response.backends[0].rateLimits).toEqual([]);
+  });
+
+  it("discards quota discovery started before a plan change", async () => {
+    const codexClient = new MockBackendClient({
+      initializeResult: { methods: ["thread/list"] },
+      account: { type: "chatgpt", email: "user@example.com", planType: "pro" },
+      rateLimits: [{ name: "Weekly limit", usedPercent: 54 }],
+    });
+    const registry = new DesktopBackendRegistry({ codexClient, overlayStore: createOverlayStoreMock() });
+    const pending = createDeferred<BackendRateLimitSummary[]>();
+    onTestFinished(async () => { pending.resolve([]); await registry.close(); });
+    await registry.refreshProvidersAtStartup(issueProviderDiscoveryPermit("startup"));
+    const read = vi.spyOn(codexClient, "readRateLimits").mockReturnValueOnce(pending.promise).mockResolvedValue([]);
+    vi.spyOn(codexClient, "getInitializeResult").mockResolvedValue({ methods: ["thread/start"] });
+    const discovery = discoverCodexBackendForTest(registry);
+    await vi.waitFor(() => expect(read).toHaveBeenCalledOnce());
+    vi.spyOn(codexClient, "readAccount").mockResolvedValue({ type: "chatgpt", email: "user@example.com", planType: "free" });
+    await registry.listBackends({ refreshRateLimits: true });
+    pending.resolve([{ name: "Weekly limit", usedPercent: 55 }]);
+    await discovery;
+    const response = await registry.listBackends();
+    expect(response.backends[0].account?.planType).toBe("free");
+    expect(response.backends[0].rateLimits).toEqual([]);
+    expect(response.backends[0].capabilities.createThread).toBe(true);
+  });
+
+  it("discards an account refresh from an invalidated runtime", async () => {
+    const codexClient = new MockBackendClient({ account: { type: "chatgpt", planType: "pro" } });
+    const registry = new DesktopBackendRegistry({ codexClient, overlayStore: createOverlayStoreMock() });
+    onTestFinished(async () => { await registry.close(); });
+    await registry.refreshProvidersAtStartup(issueProviderDiscoveryPermit("startup"));
+    const pending = createDeferred<BackendAccountSummary>();
+    const read = vi.spyOn(codexClient, "readAccount").mockReturnValueOnce(pending.promise);
+    const refresh = registry.listBackends({ includeUnavailable: true, refreshRateLimits: true });
+    await vi.waitFor(() => expect(read).toHaveBeenCalledOnce());
+    await registry.invalidateProviderRuntimeSelections({ codex: true, acp: false });
+    pending.resolve({ type: "chatgpt", email: "obsolete@example.com", planType: "free" });
+    const response = await refresh;
+    expect(response.backends[0].account).toBeUndefined();
+    expect(response.backends[0].rateLimits).toBeUndefined();
   });
 
   it("refreshes idle Codex quotas without rediscovery and coalesces repeated reads", async () => {
@@ -12468,6 +12658,45 @@ describe("DesktopBackendRegistry", () => {
       { id: expect.stringMatching(/^scheduled-action:/) },
     );
 
+    await registry.close();
+  });
+
+  it.each([true, false])("uses a directory disclosure changed after its navigation snapshot (collapsed: %s)", async (collapsed) => {
+    const directoryPath = expectedDir(
+      path.join(os.tmpdir(), "pwragent-auto-pin-disclosure-project"),
+    );
+    const directoryKey = `directory:${directoryPath}`;
+    const overlayStore = createOverlayStoreMock();
+    const registry = new DesktopBackendRegistry({
+      codexClient: new MockBackendClient({ threads: [] }),
+      overlayStore,
+    });
+    rememberCollapsedDirectoryWithPinnedThread({
+      directoryKey,
+      directoryPath,
+      registry,
+      collapsed: !collapsed,
+    });
+    // The disclosure mutation reaches the owner immediately, even if provider
+    // metadata cannot produce another complete navigation snapshot.
+    await registry.publishLocalEvent({
+      backend: "codex",
+      notification: {
+        method: "directory/threadsCollapsed/updated",
+        params: { directoryKey, collapsed },
+      },
+    });
+
+    const response = await registry.startThread({
+      backend: "codex",
+      cwd: directoryPath,
+    });
+
+    if (collapsed) {
+      expect(response).toMatchObject({ pinnedRank: "0" });
+    } else {
+      expect(response).not.toHaveProperty("pinnedRank");
+    }
     await registry.close();
   });
 

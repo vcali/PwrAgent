@@ -403,6 +403,39 @@ afterEach(() => {
 });
 
 describe("Sidebar", () => {
+  it("asks for composer focus on a pointer click but not on keyboard activation", () => {
+    const onSelectThread = vi.fn();
+    render(
+      <Sidebar
+        backends={backends}
+        browseMode="recents"
+        directories={directories}
+        inboxThreads={[sharedThread]}
+        loaded
+        loading={false}
+        threads={[sharedThread]}
+        onBrowseModeChange={() => undefined}
+        onCreateThread={async () => undefined}
+        onOpenLaunchpad={async () => undefined}
+        onSelectThread={onSelectThread}
+      />,
+    );
+    const row = screen.getByRole("button", { name: /^Cross-project cleanup/ });
+
+    // Enter or Space on a focused button dispatches a click whose detail is 0.
+    fireEvent.click(row, { detail: 0 });
+    expect(onSelectThread).toHaveBeenLastCalledWith(
+      sharedThread,
+      { focusComposer: false },
+    );
+
+    fireEvent.click(row, { detail: 1 });
+    expect(onSelectThread).toHaveBeenLastCalledWith(
+      sharedThread,
+      { focusComposer: true },
+    );
+  });
+
   it("keeps a loaded thread snapshot visible when its refresh fails", () => {
     const staleThread: NavigationThreadSummary = {
       ...sharedThread,
@@ -3001,6 +3034,7 @@ describe("Sidebar", () => {
             active: true,
             default: false,
             profileDir: "/home/example/.pwragent/profiles/work",
+            showInMenu: true,
             canDelete: false,
             codexProfile: {
               name: "work3",
@@ -3059,6 +3093,7 @@ describe("Sidebar", () => {
             active: true,
             default: false,
             profileDir: "/home/example/.pwragent/profiles/work",
+            showInMenu: true,
             canDelete: false,
             codexProfile: {
               name: "work3",
@@ -3097,6 +3132,7 @@ describe("Sidebar", () => {
             active: true,
             default: false,
             profileDir: "/home/example/.pwragent/profiles/work",
+            showInMenu: true,
             canDelete: false,
             codexProfile: {
               name: "personal",
@@ -4884,7 +4920,7 @@ describe("Sidebar", () => {
     expect(secondButton).toHaveAttribute("aria-pressed", "true");
     expect(thirdButton).toHaveAttribute("aria-pressed", "true");
     expect(onSelectThread).toHaveBeenCalledTimes(1);
-    expect(onSelectThread).toHaveBeenCalledWith(firstThread);
+    expect(onSelectThread).toHaveBeenCalledWith(firstThread, { focusComposer: false });
 
     fireEvent.contextMenu(secondButton, { clientX: 48, clientY: 64 });
     const menu = screen.getByRole("menu", {
@@ -5594,8 +5630,8 @@ describe("Sidebar", () => {
     const ordinaryRow = screen
       .getByRole("button", { name: /Fresh pin/i })
       .closest(".thread-row-shell") as HTMLElement;
-    expect(keptRow.querySelector(".thread-row__heading-pin--kept")).not.toBeNull();
-    expect(ordinaryRow.querySelector(".thread-row__heading-pin--kept")).toBeNull();
+    expect(keptRow.querySelector(".thread-row__pin--kept")).not.toBeNull();
+    expect(ordinaryRow.querySelector(".thread-row__pin--kept")).toBeNull();
 
     // The kept row is last in its own tier, so Move Down cannot push it
     // below the seam even though an ordinary pin follows it.
@@ -5708,19 +5744,19 @@ describe("Sidebar", () => {
       name: /Cross-project cleanup|Updated thread/i,
     });
     expect(threadCard(rows[0]!)).toHaveTextContent("Updated thread");
-    // Pinned state rides the title line as `.thread-row__heading-pin`
-    // since the 2026-08 density pass (the old role="img" pin chip left
-    // the chip flow). This render omits `onSetThreadPin`, so it gets the
+    // Pinned state rides the title line as `.thread-row__pin` since the
+    // 2026-08 density pass (the old role="img" pin chip left the chip
+    // flow). This render omits `onSetThreadPin`, so it gets the
     // handler-less aria-hidden static variant; with a handler wired (as
     // the live app always does) the same slot is a real "Unpin thread"
     // button — see the transcript-gaps pin tests in
     // thread-row-chips.test.tsx for that form.
     expect(
-      threadCard(rows[0]!).querySelector(".thread-row__heading-pin"),
+      threadCard(rows[0]!).querySelector(".thread-row__pin"),
     ).not.toBeNull();
     expect(threadCard(rows[1]!)).toHaveTextContent("Cross-project cleanup");
     expect(
-      threadCard(rows[1]!).querySelector(".thread-row__heading-pin"),
+      threadCard(rows[1]!).querySelector(".thread-row__pin"),
     ).toBeNull();
   });
 
@@ -9232,10 +9268,15 @@ describe("Sidebar menus from the keyboard", () => {
   });
 
   it("closes the thread actions on Tab and moves on from ⋮", () => {
+    // No metadata chips: ⋮ ends the title line, and the chip flow below it
+    // comes next in the tab order. Without chips the stop after the first
+    // row's ⋮ is the next row, and the copy chips' focus tooltips stay out
+    // of a test about the menu.
+    const chipless = { ...sharedThread, gitBranch: undefined, linkedDirectories: [] };
     renderThreadSidebar({
       threads: [
-        sharedThread,
-        { ...sharedThread, id: "thread-2", title: "Second cleanup" },
+        chipless,
+        { ...chipless, id: "thread-2", title: "Second cleanup" },
       ],
     });
     // The first row's ⋮, so the stop after it is the next row. The menu
@@ -9313,6 +9354,7 @@ describe("Sidebar menus from the keyboard", () => {
     active,
     default: false,
     profileDir: `/home/example/.pwragent/profiles/${name}`,
+    showInMenu: true,
     canDelete: false,
     codexProfile: {
       name,

@@ -3,6 +3,7 @@ import type { MessagingToolUpdateMode } from "./messaging";
 import type { AppServerBackendKind } from "./normalized-app-server";
 import type { FederationTarget } from "./federation";
 import type { DesktopHelperModelSettings } from "../helper-models";
+import type { DesktopDecisionModelSettings } from "../decision-models";
 import type { ThreadTodoMergeMethod } from "./thread-todos";
 import {
   TOOL_OUTPUT_WARNING_INVOCATIONS,
@@ -68,6 +69,14 @@ export const DESKTOP_UPDATE_CHANNEL_DEFAULT: DesktopUpdateChannel = "latest";
  * something an operator opts into, never something they inherit.
  */
 export const MANAGED_GROK_BUILD_CHANNEL_DEFAULT: DesktopUpdateChannel =
+  "latest";
+
+/**
+ * PwrAgent's managed Codex build follows the same two tracks, for the same
+ * reason: pwrdrvr/codex publishes a build for testing as a GitHub pre-release,
+ * and an operator has to opt in to run one.
+ */
+export const MANAGED_CODEX_BUILD_CHANNEL_DEFAULT: DesktopUpdateChannel =
   "latest";
 
 export const DESKTOP_UPDATE_TRAINS = ["stable", "beta"] as const;
@@ -623,7 +632,9 @@ export type DesktopSettingsSecretName =
   | "federationCloudflareAccessClientSecret"
   | "mcpConnectionCredentials"
   | "pwrsnapMcpCredential"
-  | "pwrgitMcpCredential";
+  | "pwrgitMcpCredential"
+  | "decisionLocalApiKey"
+  | "typesafeJevApiKey";
 
 /**
  * Predicate: does writing or clearing this secret affect the
@@ -666,6 +677,8 @@ export function isMessagingRuntimeSecret(
     case "mcpConnectionCredentials":
     case "pwrsnapMcpCredential":
     case "pwrgitMcpCredential":
+    case "decisionLocalApiKey":
+    case "typesafeJevApiKey":
       return false;
   }
 }
@@ -721,6 +734,10 @@ export type DesktopAppearanceSnapshot = {
   /** macOS: a running instance's Dock icon follows its dark theme, so two
    *  profiles in two themes are told apart in the Dock. On by default. */
   themedDockIcon: DesktopSettingsValue<boolean>;
+  /** The integrated terminal lifts text that falls below 4.5:1 on its
+   *  background (xterm's `minimumContrastRatio`). Off by default, so each
+   *  theme's own ANSI colors render as published. */
+  terminalMinimumContrast: DesktopSettingsValue<boolean>;
   density: DesktopSettingsValue<DesktopAppearanceDensity>;
   sidebarTextSize: DesktopSettingsValue<DesktopTextSize>;
   transcriptTextSize: DesktopSettingsValue<DesktopTextSize>;
@@ -1117,6 +1134,10 @@ export type DesktopSettingsSnapshot = {
         reason?: string;
         version?: string;
         checkedAt?: number;
+        /** Newest promoted tag the last release check saw. */
+        latestTag?: string;
+        /** Newest tag overall the last release check saw, promoted or not. */
+        prereleaseTag?: string;
       };
       /**
        * Whether the Codex-side gate is actually installed. The feature fails
@@ -1223,6 +1244,8 @@ export type DesktopSettingsSnapshot = {
     codexDefaultModeRequestUserInput: DesktopSettingsValue<boolean>;
     /** Hide only Codex's default-mode request_user_input development warning toast. */
     codexSkillQuestionsWarningDismissed: DesktopSettingsValue<boolean>;
+    /** Exact Codex config warning identities hidden in this PwrAgent profile. */
+    codexConfigWarningsDismissed?: DesktopSettingsValue<string[]>;
     /** Legacy round-trip field; per-review runMode now selects the engine. */
     managedReview?: DesktopSettingsValue<boolean>;
     /**
@@ -1363,6 +1386,13 @@ export type DesktopSettingsSnapshot = {
     >;
     /** Models for work PwrAgent starts on its own. Absent on older builds. */
     helperModels?: DesktopHelperModelSettings;
+    /** The decision model and its providers. Absent on older builds. */
+    decisionModels?: DesktopDecisionModelSettings;
+    decisionSecrets?: {
+      /** Optional; sent as a bearer token to the local decision server. */
+      localApiKey: DesktopSettingsSecretState;
+      jevApiKey: DesktopSettingsSecretState;
+    };
     codex: {
       path: DesktopSettingsValue<string>;
       profile: DesktopSettingsValue<string>;
@@ -1373,6 +1403,8 @@ export type DesktopSettingsSnapshot = {
        * on whatever this says.
        */
       managedBuilds?: DesktopSettingsValue<boolean>;
+      /** Which pwrdrvr/codex track the managed runtime follows. */
+      managedBuildChannel?: DesktopSettingsValue<DesktopUpdateChannel>;
       managedBuildsRequiredBy?: "token-miser";
       versionAdvisory?: DesktopCodexVersionAdvisory;
       configOverrides?: DesktopSettingsValue<string[]>;
@@ -1498,6 +1530,7 @@ export type DesktopSettingsConfigPatch = {
       darkTheme?: DesktopDarkTheme;
       lightTheme?: DesktopLightTheme;
       themedDockIcon?: boolean;
+      terminalMinimumContrast?: boolean;
       density?: DesktopAppearanceDensity;
       sidebarTextSize?: DesktopTextSize;
       transcriptTextSize?: DesktopTextSize;
@@ -1526,6 +1559,7 @@ export type DesktopSettingsConfigPatch = {
     threadToolAccounting?: boolean;
     codexDefaultModeRequestUserInput?: boolean;
     codexSkillQuestionsWarningDismissed?: boolean;
+    codexConfigWarningsDismissed?: string[];
     /** Legacy round-trip field; per-review runMode now selects the engine. */
     managedReview?: boolean;
     diffCondensation?: {
@@ -1670,11 +1704,15 @@ export type DesktopSettingsConfigPatch = {
     >;
     /** Replaces every helper model choice; omit a helper to use Helper default. */
     helperModels?: DesktopHelperModelSettings;
+    /** Replaces the whole decision model section. */
+    decisionModels?: DesktopDecisionModelSettings;
     codex?: {
       path?: string;
       profile?: string;
       allowFast?: boolean;
       managedBuilds?: boolean;
+      /** Which pwrdrvr/codex track the managed runtime follows. */
+      managedBuildChannel?: DesktopUpdateChannel;
       /** Ordered process-local Codex key=value overrides; never written to CODEX_HOME. */
       configOverrides?: string[];
       /** Exact model IDs explicitly declared to have zero local API cost. */
@@ -1986,12 +2024,41 @@ export type DesktopPwrAgentProfileSummary = {
   profileDir: string;
   canDelete: boolean;
   codexProfile: DesktopCodexAuthProfileCandidate;
+  /**
+   * Whether the Profiles menu lists this profile. A hidden profile keeps its
+   * data and its place in the order, and still opens from Settings →
+   * Profiles and the CLI; it only gives up its menu row and shortcut.
+   */
+  showInMenu: boolean;
 };
 
 export type ListDesktopPwrAgentProfilesResponse = {
   activeProfile: string;
   defaultProfile: string;
+  /** In the operator's order: creation order until they reorder it. */
   profiles: DesktopPwrAgentProfileSummary[];
+};
+
+export type ReorderDesktopPwrAgentProfilesRequest = {
+  /**
+   * Every listed profile name, in the new order. A list that does not name
+   * exactly the current set of profiles is refused as stale.
+   */
+  order: string[];
+};
+
+export type ReorderDesktopPwrAgentProfilesResponse = {
+  order: string[];
+};
+
+export type SetDesktopPwrAgentProfileMenuVisibilityRequest = {
+  profile: string;
+  showInMenu: boolean;
+};
+
+export type SetDesktopPwrAgentProfileMenuVisibilityResponse = {
+  profile: string;
+  showInMenu: boolean;
 };
 
 export type OpenDesktopPwrAgentProfileRequest = {
@@ -2407,6 +2474,8 @@ export const SETTINGS_CREDENTIAL_TEST_KINDS = [
   "slack",
   "feishu",
   "line",
+  "decision-local",
+  "decision-jev",
 ] as const;
 
 export type SettingsCredentialTestKind =

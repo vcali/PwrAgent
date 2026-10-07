@@ -109,7 +109,7 @@ import {
   formatRateLimitLine,
   selectVisibleRateLimits,
 } from "../../lib/backend-status-format";
-import { DirectoriesList } from "./DirectoriesList";
+import { DirectoriesList, type ProjectRevealRequest } from "./DirectoriesList";
 import type { ThreadRowRef } from "./ThreadRow";
 import { RecentsList } from "./RecentsList";
 import { createHoverStableSidebarHydrator } from "./hover-stable-sidebar-snapshot";
@@ -254,6 +254,11 @@ type SidebarProps = {
   /** Incremented when the thread title asks the active lens to reveal its row. */
   revealSelectedThreadRequest?: number;
   onRevealSelectedThreadComplete?: (request: number) => void;
+  /**
+   * Set (to a fresh object) when the thread header's project name asks the
+   * Directories lens to show that project. The caller switches the lens.
+   */
+  projectRevealRequest?: ProjectRevealRequest;
   selectedItemKey?: string;
   pendingLaunchpadCreations?: PendingLaunchpadCreation[];
   /** Sub-thread launchpads being written in this window. */
@@ -336,7 +341,16 @@ type SidebarProps = {
   onOpenProfile?: (profile: string) => Promise<void>;
   /** Opens the Usage Activity window: account limits and spend across instances. */
   onOpenUsageActivity?: () => void;
-  onSelectThread: (thread: NavigationThreadSummary) => void;
+  /**
+   * `focusComposer` is true for a pointer click on a row: the operator's next
+   * move is usually to type a reply. A keyboard activation (Enter/Space,
+   * where the click's `detail` is 0) leaves focus on the row so Tab and
+   * Shift+Tab keep walking the list.
+   */
+  onSelectThread: (
+    thread: NavigationThreadSummary,
+    options?: { focusComposer?: boolean },
+  ) => void;
   onMarkThreadsSeen?: (threads: NavigationThreadSummary[]) => Promise<void>;
   onMarkDirectoriesSeen?: (directoryKeys: string[]) => Promise<void>;
   onArchiveDirectories?: (directoryKeys: string[]) => Promise<void>;
@@ -543,7 +557,7 @@ export function Sidebar(props: SidebarProps) {
   const previousSelectedItemKeyRef = useRef<string | undefined>(
     props.selectedItemKey,
   );
-  const [projectReveal, setProjectReveal] = useState<{ key: string }>();
+  const [projectReveal, setProjectReveal] = useState<ProjectRevealRequest>();
   const [directoryRevealRequest, setDirectoryRevealRequest] = useState(0);
   const [selectedThreadKeys, setSelectedThreadKeys] = useState<Set<string>>(
     () =>
@@ -928,7 +942,7 @@ export function Sidebar(props: SidebarProps) {
       selectionAnchorKeyRef.current = threadKey;
       selectionAnchorDirectoryKeyRef.current = row?.directoryKey;
       setSelectedThreadKeys(new Set([threadKey]));
-      props.onSelectThread(thread);
+      props.onSelectThread(thread, { focusComposer: event.detail > 0 });
       return;
     }
 
@@ -1090,6 +1104,21 @@ export function Sidebar(props: SidebarProps) {
       setDirectoryRevealRequest(0);
     }
   }, [browseMode, directoryRevealRequest]);
+
+  // The request outlives the lens switch that comes with it: it is held here,
+  // and DirectoriesList picks it up when it mounts. Each request is taken
+  // once, so a completed reveal cannot replay into a later remount of the lens.
+  const projectRevealRequest = props.projectRevealRequest;
+  const takenProjectRevealRequestRef = useRef<ProjectRevealRequest>(undefined);
+  useEffect(() => {
+    if (
+      !projectRevealRequest
+      || takenProjectRevealRequestRef.current === projectRevealRequest
+    ) return;
+    takenProjectRevealRequestRef.current = projectRevealRequest;
+    releaseHoverStableSnapshot();
+    setProjectReveal(projectRevealRequest);
+  }, [projectRevealRequest, releaseHoverStableSnapshot]);
 
   useEffect(() => {
     if (!copiedRuntimeValue) {
@@ -2434,7 +2463,9 @@ export function Sidebar(props: SidebarProps) {
           <MastheadActionButton
             ariaLabel="Open automations"
             ariaPressed={props.automationsActive}
-            className={`sidebar__icon-button${props.automationsActive ? " is-active" : ""}`}
+            // `sidebar__masthead-automations` drops out after the gear on a
+            // narrow rail; View → Automations is its other home.
+            className={`sidebar__icon-button sidebar__masthead-automations${props.automationsActive ? " is-active" : ""}`}
             onClick={props.onOpenAutomations}
           >
             <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M8 2v4"/><path d="M16 2v4"/><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M3 10h18"/><path d="M8 14h.01"/><path d="M12 14h.01"/><path d="M16 14h.01"/><path d="M8 18h.01"/><path d="M12 18h.01"/></svg>
@@ -2445,7 +2476,7 @@ export function Sidebar(props: SidebarProps) {
             ariaLabel="Open settings"
             ariaPressed={props.settingsActive}
             // `sidebar__masthead-settings` lets the gear drop out first when the
-            // rail is too narrow for the wordmark + all four actions — Settings
+            // rail is too narrow for the wordmark + all five controls — Settings
             // is still reachable from the app menu (⌘,), so it's the safe one to
             // shed before the (less reachable) brand wordmark.
             className={`sidebar__icon-button sidebar__masthead-settings${props.settingsActive ? " is-active" : ""}`}
@@ -2534,32 +2565,39 @@ export function Sidebar(props: SidebarProps) {
               tabIndex={-1}
               onClick={(event) => event.stopPropagation()}
             >
-              {props.profiles.map((profile) => (
-                <button
-                  key={profile.name}
-                  className="sidebar__menu-item"
-                  disabled={profile.active || !props.onOpenProfile}
-                  role="menuitem"
-                  type="button"
-                  onClick={() => {
-                    setProfileMenuOpen(false);
-                    void props.onOpenProfile?.(profile.name);
-                  }}
-                >
-                  <span className="sidebar__menu-item-title">
-                    {profile.displayName || profile.name}
-                  </span>
-                  <span className="sidebar__menu-item-detail">
-                    {profile.active
-                      ? profile.default
-                        ? "Current profile - startup default"
-                        : "Current profile"
-                      : profile.default
-                        ? "Startup default - open in new app instance"
-                        : "Open in new app instance"}
-                  </span>
-                </button>
-              ))}
+              {/*
+                The operator's Settings → Profiles order, minus the profiles
+                switched out of the Profiles menu. The current profile stays,
+                because this row is also where it says it is current.
+              */}
+              {props.profiles
+                .filter((profile) => profile.showInMenu || profile.active)
+                .map((profile) => (
+                  <button
+                    key={profile.name}
+                    className="sidebar__menu-item"
+                    disabled={profile.active || !props.onOpenProfile}
+                    role="menuitem"
+                    type="button"
+                    onClick={() => {
+                      setProfileMenuOpen(false);
+                      void props.onOpenProfile?.(profile.name);
+                    }}
+                  >
+                    <span className="sidebar__menu-item-title">
+                      {profile.displayName || profile.name}
+                    </span>
+                    <span className="sidebar__menu-item-detail">
+                      {profile.active
+                        ? profile.default
+                          ? "Current profile - startup default"
+                          : "Current profile"
+                        : profile.default
+                          ? "Startup default - open in new app instance"
+                          : "Open in new app instance"}
+                    </span>
+                  </button>
+                ))}
               {props.onOpenUsageActivity ? (
                 <>
                   <div className="thread-context-menu__separator" role="separator" />

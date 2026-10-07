@@ -12,6 +12,7 @@ import type {
   DesktopChatReplyComposer,
   DesktopAuthorizedContact,
   DesktopCodexProfileModel,
+  DesktopDecisionModelSettings,
   DesktopFederationMode,
   DesktopHelperModelChoice,
   DesktopHelperModelSettings,
@@ -57,6 +58,7 @@ import {
   isDesktopCodexProfileModel,
   isDesktopFederationMode,
   isFederationGatewayEndpointUrl,
+  normalizeDecisionModelSettings,
   isDesktopHotCpuProfileStartDelayMs,
   isDesktopHotCpuProfileTriggerMode,
   isDesktopIntegratedTerminalWindowsShell,
@@ -126,6 +128,7 @@ export type DesktopSettingsConfig = {
       darkTheme?: DesktopDarkTheme;
       lightTheme?: DesktopLightTheme;
       themedDockIcon?: boolean;
+      terminalMinimumContrast?: boolean;
       density?: DesktopAppearanceDensity;
       sidebarTextSize?: DesktopTextSize;
       transcriptTextSize?: DesktopTextSize;
@@ -154,6 +157,7 @@ export type DesktopSettingsConfig = {
     threadToolAccounting?: boolean;
     codexDefaultModeRequestUserInput?: boolean;
     codexSkillQuestionsWarningDismissed?: boolean;
+    codexConfigWarningsDismissed?: string[];
     managedReview?: boolean;
     diffCondensation?: {
       enabled?: boolean;
@@ -294,12 +298,15 @@ export type DesktopSettingsConfig = {
       DesktopProviderThreadModelMigration
     >;
     helperModels?: DesktopHelperModelSettings;
+    decisionModels?: DesktopDecisionModelSettings;
     codex?: {
       path?: string;
       profile?: string;
       allowFast?: boolean;
       /** Download and use PwrAgent's own Codex build. Token Miser implies it. */
       managedBuilds?: boolean;
+      /** Which pwrdrvr/codex track the managed runtime follows. */
+      managedBuildChannel?: DesktopUpdateChannel;
       configOverrides?: string[];
       localModelIds?: string[];
     };
@@ -853,6 +860,12 @@ export function desktopSettingsPatchToEdits(
       patch.experimental.codexSkillQuestionsWarningDismissed,
     );
   }
+  if (patch.experimental?.codexConfigWarningsDismissed !== undefined) {
+    set(
+      ["experimental", "codex_config_warnings_dismissed"],
+      [...new Set(patch.experimental.codexConfigWarningsDismissed)],
+    );
+  }
   if (patch.experimental?.managedReview !== undefined) {
     set(
       ["experimental", "managed_review"],
@@ -904,6 +917,17 @@ export function desktopSettingsPatchToEdits(
       });
     } else {
       set(["general", "appearance", "themed_dock_icon"], false);
+    }
+  }
+  if (patch.general?.appearance?.terminalMinimumContrast !== undefined) {
+    // Off by default, so only the opt-in is written.
+    if (patch.general.appearance.terminalMinimumContrast) {
+      set(["general", "appearance", "terminal_minimum_contrast"], true);
+    } else {
+      edits.push({
+        op: "delete",
+        path: ["general", "appearance", "terminal_minimum_contrast"],
+      });
     }
   }
   if (patch.onboarding?.completed !== undefined) {
@@ -1642,6 +1666,12 @@ export function desktopSettingsPatchToEdits(
   if (patch.models?.codex?.managedBuilds !== undefined) {
     set(["models", "codex", "managed_builds"], patch.models.codex.managedBuilds);
   }
+  if (patch.models?.codex?.managedBuildChannel !== undefined) {
+    set(
+      ["models", "codex", "managed_build_channel"],
+      patch.models.codex.managedBuildChannel,
+    );
+  }
   if (patch.models?.providerDefaults !== undefined) {
     const providerDefaults = normalizeProviderModelDefaults(
       patch.models.providerDefaults,
@@ -1705,6 +1735,29 @@ export function desktopSettingsPatchToEdits(
         op: "deleteTableArray",
         path: ["models", "helper_models"],
       });
+    }
+  }
+  if (patch.models?.decisionModels !== undefined) {
+    // `[models.decision]`: new keys with no legacy shape. A key left at its
+    // default is removed rather than written.
+    const decision = patch.models.decisionModels;
+    const normalized = normalizeDecisionModelSettings({
+      model: decision.model,
+      cameraCues: decision.cameraCues,
+      localEndpoint: decision.local?.endpoint,
+      localModel: decision.local?.model,
+      jevModel: decision.jev?.model,
+    });
+    const keys: [string, string | boolean | undefined][] = [
+      ["model", normalized?.model],
+      ["camera_cues", normalized?.cameraCues],
+      ["local_endpoint", normalized?.local?.endpoint],
+      ["local_model", normalized?.local?.model],
+      ["jev_model", normalized?.jev?.model],
+    ];
+    for (const [key, value] of keys) {
+      if (value === undefined) edits.push({ op: "delete", path: ["models", "decision", key] });
+      else set(["models", "decision", key], value);
     }
   }
   if (patch.models?.providerThreadMigrations !== undefined) {
@@ -1912,6 +1965,7 @@ function normalizeDesktopConfig(
   const line = tables["messaging.line"];
   const models = tables["models"];
   const codex = tables["models.codex"];
+  const decision = tables["models.decision"];
   const acpAgentsGemini = tables["acp_agents.gemini"];
   const acpAgentsGrok = tables["acp_agents.grok"];
   const acpAgentsKimi = tables["acp_agents.kimi"];
@@ -1996,6 +2050,9 @@ function normalizeDesktopConfig(
         darkTheme: readDarkTheme(generalAppearance?.dark_theme),
         lightTheme: readLightTheme(generalAppearance?.light_theme),
         themedDockIcon: readBoolean(generalAppearance?.themed_dock_icon),
+        terminalMinimumContrast: readBoolean(
+          generalAppearance?.terminal_minimum_contrast,
+        ),
         density: readAppearanceDensity(generalAppearance?.density),
         sidebarTextSize: readTextSize(
           generalAppearance?.sidebar_text_size,
@@ -2051,6 +2108,9 @@ function normalizeDesktopConfig(
       ),
       codexSkillQuestionsWarningDismissed: readBoolean(
         experimental?.codex_skill_questions_warning_dismissed,
+      ),
+      codexConfigWarningsDismissed: readStringArray(
+        experimental?.codex_config_warnings_dismissed,
       ),
       managedReview: readBoolean(experimental?.managed_review),
       diffCondensation: {
@@ -2277,11 +2337,19 @@ function normalizeDesktopConfig(
         models?.helper_default_reasoning_effort,
         models?.helper_models,
       ),
+      decisionModels: normalizeDecisionModelSettings({
+        model: decision?.model,
+        cameraCues: decision?.camera_cues,
+        localEndpoint: decision?.local_endpoint,
+        localModel: decision?.local_model,
+        jevModel: decision?.jev_model,
+      }),
       codex: {
         path: readString(codex?.path),
         profile: readString(codex?.profile),
         allowFast: readBoolean(codex?.allow_fast),
         managedBuilds: readBoolean(codex?.managed_builds),
+        managedBuildChannel: readUpdateChannel(codex?.managed_build_channel),
         localModelIds: codex?.local_model_ids === undefined ? undefined : validateLocalModelIds(codex.local_model_ids),
         configOverrides: codex?.config_overrides === undefined
           ? undefined
@@ -2604,6 +2672,7 @@ function pruneEmptyConfig(config: DesktopSettingsConfig): DesktopSettingsConfig 
   const providerDefaults = config.models?.providerDefaults;
   const providerThreadMigrations = config.models?.providerThreadMigrations;
   const helperModels = config.models?.helperModels;
+  const decisionModels = config.models?.decisionModels;
   const hasHelperModels = Boolean(
     helperModels
     && (
@@ -2620,9 +2689,11 @@ function pruneEmptyConfig(config: DesktopSettingsConfig): DesktopSettingsConfig 
       && Object.keys(providerThreadMigrations).length > 0
     )
     || hasHelperModels
+    || decisionModels
   ) {
     pruned.models = {
       ...(hasHelperModels ? { helperModels } : {}),
+      ...(decisionModels ? { decisionModels } : {}),
       ...(providerDefaults && Object.keys(providerDefaults).length > 0
         ? { providerDefaults }
         : {}),

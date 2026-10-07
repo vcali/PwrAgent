@@ -265,6 +265,11 @@
   --shadow-tint-medium: color-mix(in srgb, var(--shadow-base) 40%, transparent);
   --shadow-tint-strong: color-mix(in srgb, var(--shadow-base) 58%, transparent);
 
+  /* Labels drawn over live video, on a scrim that is dark in every theme,
+     so the light theme deliberately does not override either. */
+  --media-overlay-scrim: color-mix(in srgb, var(--shadow-base) 62%, transparent);
+  --media-overlay-text: #f7f3eb;
+
   /* Surface-border overlays for inset box-shadows that read as
      hairline borders. */
   --surface-border-faint: color-mix(in srgb, var(--text-primary) 8%, transparent);
@@ -1011,6 +1016,22 @@
   --terminal-fg: #d4d4d8;
   --terminal-cursor: #ffb35c;
   --terminal-cursor-accent: #2b2b2e;
+  --terminal-ansi-black: #18181b;
+  --terminal-ansi-red: #f47a72;
+  --terminal-ansi-green: #6fd08c;
+  --terminal-ansi-yellow: #e6c36a;
+  --terminal-ansi-blue: #6eaaf5;
+  --terminal-ansi-magenta: #d58fe0;
+  --terminal-ansi-cyan: #5fcbd6;
+  --terminal-ansi-white: #d4d4d8;
+  --terminal-ansi-bright-black: #9696a0;
+  --terminal-ansi-bright-red: #ff9b94;
+  --terminal-ansi-bright-green: #93e2a9;
+  --terminal-ansi-bright-yellow: #f3d78e;
+  --terminal-ansi-bright-blue: #96c3ff;
+  --terminal-ansi-bright-magenta: #e5b0ee;
+  --terminal-ansi-bright-cyan: #8ddfe7;
+  --terminal-ansi-bright-white: #f4f4f5;
 
   /* Semantic */
   --danger-base: #ff9b8a;
@@ -1076,6 +1097,22 @@
   --terminal-fg: #2e2e33;
   --terminal-cursor: #d96d00;
   --terminal-cursor-accent: #ebebed;
+  --terminal-ansi-black: #18181b;
+  --terminal-ansi-red: #b42318;
+  --terminal-ansi-green: #1a7032;
+  --terminal-ansi-yellow: #7f5c00;
+  --terminal-ansi-blue: #1f5bb5;
+  --terminal-ansi-magenta: #8a3aa8;
+  --terminal-ansi-cyan: #0b6b72;
+  --terminal-ansi-white: #4a4a52;
+  --terminal-ansi-bright-black: #5c5c66;
+  --terminal-ansi-bright-red: #c4321f;
+  --terminal-ansi-bright-green: #1b7536;
+  --terminal-ansi-bright-yellow: #856000;
+  --terminal-ansi-bright-blue: #2a68c6;
+  --terminal-ansi-bright-magenta: #9846b8;
+  --terminal-ansi-bright-cyan: #0c7078;
+  --terminal-ansi-bright-white: #7c7c86;
 
   /* Semantic */
   --danger-base: #8a1f12;
@@ -1141,6 +1178,22 @@
   --terminal-fg: #c9d6ea;
   --terminal-cursor: #7fbcff;
   --terminal-cursor-accent: #0f1724;
+  --terminal-ansi-black: #22314a;
+  --terminal-ansi-red: #f2777a;
+  --terminal-ansi-green: #5fcf8f;
+  --terminal-ansi-yellow: #e5c06a;
+  --terminal-ansi-blue: #5baaff;
+  --terminal-ansi-magenta: #c79af2;
+  --terminal-ansi-cyan: #4fd0d6;
+  --terminal-ansi-white: #c9d6ea;
+  --terminal-ansi-bright-black: #7c8ca6;
+  --terminal-ansi-bright-red: #ff9a9c;
+  --terminal-ansi-bright-green: #86e3ab;
+  --terminal-ansi-bright-yellow: #f2d58c;
+  --terminal-ansi-bright-blue: #8cc4ff;
+  --terminal-ansi-bright-magenta: #dbb8ff;
+  --terminal-ansi-bright-cyan: #82e3e8;
+  --terminal-ansi-bright-white: #eef3fa;
 
   /* Semantic */
   --danger-base: #ffa99a;
@@ -1206,6 +1259,22 @@
   --terminal-fg: #1f2f47;
   --terminal-cursor: #1f5fbf;
   --terminal-cursor-accent: #f3f7fc;
+  --terminal-ansi-black: #0f223b;
+  --terminal-ansi-red: #b3261e;
+  --terminal-ansi-green: #1d7a3a;
+  --terminal-ansi-yellow: #8a6100;
+  --terminal-ansi-blue: #1c56ac;
+  --terminal-ansi-magenta: #8e3fb0;
+  --terminal-ansi-cyan: #0e7178;
+  --terminal-ansi-white: #4d5d75;
+  --terminal-ansi-bright-black: #5a6b85;
+  --terminal-ansi-bright-red: #c4362c;
+  --terminal-ansi-bright-green: #1f7e43;
+  --terminal-ansi-bright-yellow: #8e6400;
+  --terminal-ansi-bright-blue: #2a66c2;
+  --terminal-ansi-bright-magenta: #9d4fc0;
+  --terminal-ansi-bright-cyan: #107880;
+  --terminal-ansi-bright-white: #8a99b0;
 
   /* Semantic */
   --danger-base: #9a2516;
@@ -1329,10 +1398,10 @@
    one pending state nothing but the operator will ever resolve, so hiding it
    in the denser view is exactly where it would be lost.
    (The pin is absent from this list because it is no longer a chip in ANY
-   density: pinned state and the unpin control are the in-title
-   `.thread-row__heading-pin` button, and the hover actions cluster's
-   `.thread-row__pin-button` renders only on UNPINNED rows to pin them —
-   a lone pin pill used to keep a whole second chip row alive.)
+   density: pinned state and the unpin control are the title line's
+   `.thread-row__pin` button, and `.thread-row__pin-button` renders in
+   the same slot only on UNPINNED rows to pin them — a lone pin pill used
+   to keep a whole second chip row alive.)
 
    Surviving chips carry the `thread-row__chip--persistent` marker class
    in TSX — ONE source of truth shared with the gap-zeroing rule below,
@@ -1355,8 +1424,9 @@
 /* Tighten thread-row vertical real estate. The row keeps its column
    layout (title row → chips row when chips remain), but the title→chips
    gap shrinks. Block padding matches the 4px Mission Control base, so
-   `.thread-row__actions` / `.thread-row__subthread-toggle` need no
-   compact offset overrides and only padding-left differs here. The
+   `.thread-row__subthread-toggle` needs no compact offset override (the
+   title line's actions ride the line itself) and only padding-left
+   differs here. The
    hidden-chips selector zeroes the column gap for rows where every chip
    is suppressed — the `--persistent` marker (same source of truth as
    the suppression rule above) plus `.pr-chip` are the only things that
@@ -2592,47 +2662,57 @@ textarea,
   gap: 8px;
 }
 
-/* When the rail gets too narrow for the wordmark + all four actions, the
-   Settings gear drops out — it's the one masthead action reachable elsewhere
-   (app menu → Settings…, ⌘,), so it's the safe one to shed. That alone frees
-   enough room for the wordmark + the remaining three buttons to coexist all the
-   way down to the minimum rail width, so the wordmark itself never has to hide.
+/* A local window's masthead holds five 28px controls: Director voice, Search,
+   Automations, Settings and New Thread. As the rail narrows they shed in a
+   fixed order — the brand mark, then Settings, then Automations — and the
+   wordmark, the mic, Search and New Thread stay down to the 280px minimum.
+   Settings and Automations go because they are the two with another home:
+   app menu / File → Settings… (⌘,) and View → Automations. A remote
+   federation window shows only Search and New Thread, which fit at every
+   width, so the mark rule is scoped to the five-control row.
+
    `.sidebar` is the named width-query container (`sidebar`) — the same
-   mechanism the lens switch uses to swap "Directories" → "Dirs". */
-@container sidebar (max-width: 282px) {
-  /* Compound selector (.0,2,0) so this beats `.sidebar__icon-button`'s own
-     `display: inline-flex` (.0,1,0), which is declared later in the file and
-     would otherwise win the cascade and keep the gear visible. */
+   mechanism the lens switch uses to swap "Directories" → "Dirs". Its content
+   box is the rail minus 33px (16px padding each side and the 1px border).
+   Measured in Chromium with the wordmark in the bundled Geist Sans Bold on
+   macOS: the lockup ends at x=206.41 with the mark and 178.41 without it,
+   each control takes 30px (28px + 2px gap), and the action group may reach
+   8px into the rail's padding. So n controls need a rail of at least
+   lockup end + 15 + 30n: 371.41px for the mark and five, 343.41px for five,
+   313.41px for four, 283.41px for three. Each query below leaves ~3.6px of
+   slack over that. Adding a sixth control means re-measuring every step;
+   the mic shipped without that, and the row ran up to 29px past the rail. */
+@container sidebar (max-width: 341px) {
+  /* The mark is the first to go: it is decorative (the wordmark names the
+     app) and the lockup is 28px wider than the wordmark alone. Only the
+     stoplight gutter costs this room, so every other platform and macOS
+     fullscreen keep it. */
+  :root[data-platform="darwin"]:not([data-fullscreen="true"])
+    .sidebar__masthead:has(.sidebar__masthead-automations)
+    .brand-lockup__mark {
+    display: none;
+  }
+}
+
+/* Compound selectors (.0,2,0) so these beat `.sidebar__icon-button`'s own
+   `display: inline-flex` (.0,1,0), which is declared later in the file and
+   would otherwise win the cascade and keep the button visible. */
+@container sidebar (max-width: 313px) {
   .sidebar__icon-button.sidebar__masthead-settings {
     display: none;
   }
 }
 
-/* The brand lockup's mark is the first thing the macOS masthead sheds, before
-   any button: it is decorative (the wordmark names the app) and the lockup
-   is 28px wider than the wordmark alone. Measured with the wordmark drawn in
-   the bundled Geist Sans Bold: the lockup ends at x=206.41, and four buttons
-   plus the 8px gap need the rail's content box to be at least 308.41px (a
-   341.41px sidebar). The query leaves ~3.6px of slack. It stood at 307px
-   while the wordmark drew in `.SF NS` Bold, 3.91px narrower, and at a 341px
-   rail that left the buttons 0.41px past their inset.
-   The default 408px rail keeps the mark; the 280px minimum drops it and, at
-   282px, the Settings gear above as well. Only the stoplight gutter costs
-   this room, so every other platform and macOS fullscreen keep the mark. */
-@container sidebar (max-width: 312px) {
-  :root[data-platform="darwin"]:not([data-fullscreen="true"])
-    .sidebar__masthead .brand-lockup__mark {
+@container sidebar (max-width: 283px) {
+  .sidebar__icon-button.sidebar__masthead-automations {
     display: none;
   }
 }
 
-/* At the minimum rail the mark and the gear are both shed (above), leaving
-   the wordmark and three buttons. The wordmark in Geist Sans Bold measures
-   82.41px, 3.91px wider than it drew in `.SF NS` Bold, so with the 8px gap
-   those buttons need a 283.41px rail, and at the 280px minimum they sat
-   3.41px past their inset. At a 284px rail or narrower (251px of content
-   inside the 16px padding and 1px border) the gap tightens to 4px, which fits
-   them at the minimum with 0.59px to spare. */
+/* Three controls beside the bare wordmark need a 283.41px rail with the 8px
+   gap, 3.41px more than the 280px minimum. At a 284px rail or narrower
+   (251px of content) the gap tightens to 4px, which fits them at the minimum
+   with 0.59px to spare. */
 @container sidebar (max-width: 251px) {
   .sidebar__masthead {
     gap: 4px;
@@ -2719,9 +2799,16 @@ textarea,
   padding-right: 16px;
 }
 
+/* Controls and EVERYTHING inside them. `.thread-header *` above marks each
+   descendant a drag region, so an icon or span inside a button stayed one:
+   the pointer over the glyph belonged to the OS, which took the click and
+   ate the hover, and the control answered only at its edges. The `*` forms
+   outrank `.thread-header *` by specificity, wherever either rule sits. */
 .thread-header button,
+.thread-header button *,
 .thread-header input,
 .thread-header a,
+.thread-header a *,
 .thread-header select {
   -webkit-app-region: no-drag;
 }
@@ -3219,7 +3306,7 @@ textarea,
 }
 
 .messaging-status-popover__state--degraded {
-  color: var(--status-warning);
+  color: var(--status-warning-text);
 }
 
 .messaging-status-popover__state--errored {
@@ -3816,7 +3903,7 @@ textarea,
 
 .log-window__status-note {
   flex: 0 0 auto;
-  color: var(--status-warning);
+  color: var(--status-warning-text);
   font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
@@ -3961,7 +4048,7 @@ textarea,
 }
 
 .log-window__part--level-warn {
-  color: var(--status-warning);
+  color: var(--status-warning-text);
   font-weight: 700;
 }
 
@@ -5411,13 +5498,15 @@ a.button {
 .thread-row__subthread-toggle {
   position: absolute;
   /* Center the toggle on the title's FIRST line, not the row's geometric
-     center — same anchoring (and the same token-derived math) as
-     .thread-row__actions: title-line midpoint = 1px card border + 4px
-     padding + (size × 1.25 line + 2px descender pad) / 2, minus half the
-     toggle's 18px height, rounded to a whole pixel (same golden-stability
-     rationale as the actions rule; the border term is explained there,
-     since this toggle is positioned against the shell too). Resolves to
-     5px at the md notch and tracks every user-selected notch of
+     center: title-line midpoint = 1px card border + 4px padding +
+     (size × 1.25 line + 2px descender pad) / 2, minus half the toggle's
+     18px height, rounded to a whole pixel so the toggle never sits on a
+     fractional boundary (which would antialias-shift the visual
+     goldens). The border term matters because this toggle is positioned
+     against the SHELL, whose edge is the card's outer border edge;
+     `.thread-row__open` measures from the card's padding box, where 4px
+     alone is right. Resolves to 5px at the md notch and tracks every
+     user-selected notch of
      `--sidebar-title-size`. */
   top: round(calc(5px + (var(--sidebar-title-size) * 1.25 + 2px) / 2 - 9px), 1px);
   left: 8px;
@@ -5537,8 +5626,8 @@ a.button {
      text-to-text between rows — the inter-card air was the loosest
      measurement left on the surface once the type and chips shrank.
      Both densities share this padding; they differ in what they SHOW,
-     not how the card breathes. (`.thread-row__actions` top is kept in
-     step with the block padding — see that rule.) */
+     not how the card breathes. (`.thread-row__subthread-toggle` top is
+     kept in step with the block padding — see that rule.) */
   padding: 4px 10px;
   border: 1px solid transparent;
   border-radius: 8px;
@@ -5703,38 +5792,53 @@ a.button {
   display: none !important;
 }
 
+/* The row's controls ride the END of the title line, in one fixed order:
+   add reaction · pin · timestamp-or-kebab (see ThreadRow). The pin must
+   not move when the row is hovered. It used to follow the title, and a
+   hover reserve re-truncated the title to clear the revealed cluster, so
+   the pin slid up to 46px left at the moment the pointer arrived and a
+   click aimed at the title unpinned the thread. Now nothing right of the
+   pin changes width: the timestamp and the kebab share
+   `.thread-row__time-lane`, and the hover-only controls open toward the
+   title, which re-truncates instead.
+
+   The controls are 24px targets (WCAG 2.5.8) in a title line of
+   size × 1.25 + 2px descender pad (18.25px at md, 15.75px at xs). The
+   negative block margin gives back the overhang at every notch, so the
+   line, and the card, keep their height at rest and on hover in both
+   densities. The overhang is largest at xs (4.1px), which leaves the
+   controls 0.9px inside the card's outer edge — where the absolutely
+   positioned cluster used to sit — and the inset focus ring clear of
+   the card's border at every notch. */
 .thread-row__actions {
-  position: absolute;
-  /* Align the pin/overflow buttons + add-reaction chip with the title
-     line, not the row's geometric center. The cluster sits so its
-     vertical midpoint matches the title's line midpoint. When the
-     row is multi-line (chips present) the title is still the FIRST
-     line, so the same offset keeps the cluster anchored to it. Derived
-     from the user-adjustable title token so every notch stays aligned:
-     title-line midpoint = 1px card border + 4px padding + (size × 1.25
-     line + 2px descender pad) / 2; subtract half the 24px cluster
-     height, rounded to a whole pixel so the cluster never sits on a
-     fractional boundary (which would antialias-shift the visual
-     goldens). At the md notch (13px) this resolves to 2. The border
-     term matters because this cluster is positioned against the SHELL,
-     whose edge is the card's outer border edge. `.thread-row__open`
-     measures from the card's padding box, where 4px alone is right.
-     Without the border the cluster sat 0.5-2px above the title
-     midpoint and touched the card's top border at the xs notch. */
-  top: round(calc(5px + (var(--sidebar-title-size) * 1.25 + 2px) / 2 - 12px), 1px);
-  /* 11px (from 9): the card's own right inset is 10px padding + 1px
-     border, so 9 put the kebab's edge 2px inside the border while its
-     6px corner radius sat against the card's 8px one — the two curves
-     read as touching. 11 lines the cluster's right edge up with the
-     content edge every chip and the timestamp already respect, giving
-     the same visible air the row's left side keeps. The pinned-row
-     heading reserve below derives from this offset — move both. */
-  right: 11px;
-  z-index: 3;
   display: flex;
+  flex: 0 0 auto;
+  align-self: center;
   align-items: center;
-  gap: 4px;
-  pointer-events: none;
+  margin-block: calc((var(--sidebar-title-size) * 1.25 + 2px - 24px) / 2);
+}
+
+/* The timestamp and the kebab share one grid cell; hover fades one out
+   and the other in. 26px is the kebab's width, so the lane is as wide at
+   rest as on hover and the pin to its left never moves. A timestamp wider
+   than the kebab ("Sep 30") widens the lane in both states alike. */
+.thread-row__time-lane {
+  display: grid;
+  min-width: 26px;
+  align-items: center;
+  justify-items: end;
+}
+
+.thread-row__time-lane > .thread-row__time,
+.thread-row__time-lane > .thread-row__overflow-button {
+  grid-area: 1 / 1;
+}
+
+/* The lane centres on the title's line box, which carries a 2px descender
+   pad, so the time's glyphs sat 1px below the title's. Same nudge as the
+   status indicator, for the same reason. */
+.thread-row__time-lane > .thread-row__time {
+  translate: 0 -1px;
 }
 
 /* One base chrome + reveal mechanic for both hover-revealed row action
@@ -5768,39 +5872,47 @@ a.button {
 }
 
 .thread-row__overflow-button {
-  /* 26px is the pinned cluster-side literal the pinned-row heading
-     reserve derives from, and the 24px-tall button reads as a
-     slightly wider pill next to the square 24px add-reaction chip on
-     purpose. */
+  /* 26px, a touch wider than the 24px pin beside it on purpose. It is
+     also the time lane's floor (`.thread-row__time-lane`): change both
+     together, or the lane grows on hover and pushes the pin left. */
   width: 26px;
 }
 
-/* The hover-only add-reaction chip rides in the same cluster; match the
-   24px cluster height so the three controls read as one unit (and stay
-   on the WCAG 2.5.8 target floor together). */
+/* The hover-only add-reaction chip rides in the same cluster at its 24px
+   height, so the controls read as one unit (and stay on the WCAG 2.5.8
+   target floor together). At rest it takes no width, so the title keeps
+   the space; revealed (see the reveal rule below the chip's own block),
+   it opens to a 30px pill, the 14px smiley plus the chip's usual 8px
+   inline padding, to the LEFT of the pin. */
 .thread-row__actions .thread-row__chip--add-reaction {
+  width: 0;
   height: 24px;
-  min-width: 24px;
+  justify-content: center;
+  margin-right: 0;
+  padding: 0;
+  transition:
+    width 120ms ease,
+    margin-right 120ms ease,
+    background 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease;
 }
 
-/* Timestamp fade — the union of every state that reveals a cluster
-   control over the time's lane. Adding a reveal state here? The pinned
-   rows' heading-reserve rule below keeps the in-title unpin pin clear
-   of the revealed cluster and mirrors this state set (minus the
-   cluster pin, which pinned rows never render) — extend it in the same
-   commit or the new state re-covers the pin. */
-.thread-row-shell:has(.thread-row__pin-button:focus-visible) .thread-row__time,
-.thread-row-shell:hover .thread-row__time,
-.thread-row-shell:has(.thread-row__overflow-button:focus-visible) .thread-row__time,
-.thread-row-shell:has(.thread-row__chip--add-reaction:focus-visible) .thread-row__time,
-.thread-row-shell:has(.thread-row__chip--add-reaction.is-open) .thread-row__time,
-.thread-row-shell:has(.thread-row__overflow-button[aria-expanded="true"]) .thread-row__time {
+/* The timestamp fades exactly when the kebab that shares its lane is
+   shown: on row hover, while the kebab has keyboard focus, and while its
+   menu is open (focus has moved into the menu, so without that arm the
+   time faded back in under the trigger of the menu it opened). Scoped to
+   the lane, so a row without a kebab (Starting, Draft) keeps its label on
+   hover, and focusing the reaction chip or the pin leaves the time alone:
+   neither covers it any more. */
+.thread-row-shell:hover .thread-row__time-lane > .thread-row__time,
+.thread-row__time-lane:has(> .thread-row__overflow-button:focus-visible) > .thread-row__time,
+.thread-row__time-lane:has(> .thread-row__overflow-button[aria-expanded="true"]) > .thread-row__time {
   opacity: 0;
 }
 
-/* Cluster reveal. New reveal states must also join the fade list above
-   and the pinned-row heading-reserve rule below — see the fade list's
-   comment. */
+/* Cluster reveal. A new kebab reveal state must also join the timestamp
+   fade list above, or the time paints under the kebab. */
 .thread-row-shell:hover .thread-row__pin-button,
 .thread-row__pin-button:focus-visible,
 .thread-row-shell:hover .thread-row__overflow-button,
@@ -5808,53 +5920,6 @@ a.button {
 .thread-row__overflow-button[aria-expanded="true"] {
   opacity: 1;
   pointer-events: auto;
-}
-
-/* Keep the in-title unpin pin clickable while the hover cluster is
-   shown. The pin sits after the title, so a long (truncated) title
-   parks it at the heading's right edge — exactly where the revealed
-   add-reaction + kebab cluster paints, covering the unpin control at
-   the moment the pointer arrives to use it. Reserving heading padding
-   during the reveal re-truncates the title and docks the pin left of
-   the cluster. Short titles never reach the boundary, so nothing moves
-   for them; the transition on `.thread-row__heading` glides the dock
-   in step with the cluster's 120ms fade.
-
-   46px derivation, all border-box worst case. The cluster zone spans
-   71px from the card's right border: 11px offset + 26px kebab + 4px
-   gap + the add-reaction chip's RENDERED width of 30px (its
-   `min-width: 24px` is a floor — the 14px smiley plus the base chip's
-   0 8px padding is what actually paints). The pin's border box must
-   clear that zone: card padding 10px + header gap 12px + timestamp +
-   reserve − the pin's 3px `margin-right: -3px` overhang ≥ 71px + 4px
-   air. The narrowest timestamp ("1h"/"2d") measures ~13px at its fixed
-   12px font, giving reserve ≥ 43px; 46px leaves 3px of real slack at
-   every title-size notch. The cluster-side literals in this arithmetic
-   are pinned by theme-contract next to this rule's own pin, so a
-   cluster resize fails a test instead of silently re-covering the pin.
-
-   Scoped by the row's `--pinned` or `--retained` modifier (set by
-   ThreadRow when it renders an in-title pin — a plain class match instead
-   of a per-hover `:has()` subtree scan, same optimization as the
-   directory-row header modifiers). The selector list mirrors the
-   cluster's reveal states in the fade/reveal rules above (the cluster
-   pin's states are absent because pinned rows never render it).
-   Deliberate over-reserve: on a surface without a reaction handler the
-   revealed cluster is kebab-only (37px zone) and the rest-state gap
-   already clears it, so the reserve protects nothing there — accepted,
-   since every production surface wires reactions and a narrower
-   conditional would re-add the `:has()` scan this class avoids. */
-.thread-row-shell:hover .thread-row--retained .thread-row__heading,
-.thread-row-shell:has(.thread-row__overflow-button:focus-visible) .thread-row--retained .thread-row__heading,
-.thread-row-shell:has(.thread-row__chip--add-reaction:focus-visible) .thread-row--retained .thread-row__heading,
-.thread-row-shell:has(.thread-row__chip--add-reaction.is-open) .thread-row--retained .thread-row__heading,
-.thread-row-shell:has(.thread-row__overflow-button[aria-expanded="true"]) .thread-row--retained .thread-row__heading,
-.thread-row-shell:hover .thread-row--pinned .thread-row__heading,
-.thread-row-shell:has(.thread-row__overflow-button:focus-visible) .thread-row--pinned .thread-row__heading,
-.thread-row-shell:has(.thread-row__chip--add-reaction:focus-visible) .thread-row--pinned .thread-row__heading,
-.thread-row-shell:has(.thread-row__chip--add-reaction.is-open) .thread-row--pinned .thread-row__heading,
-.thread-row-shell:has(.thread-row__overflow-button[aria-expanded="true"]) .thread-row--pinned .thread-row__heading {
-  padding-right: 46px;
 }
 
 .thread-row__pin-button:hover,
@@ -5871,15 +5936,16 @@ a.button {
    hovered and drew Chromium's `outline: auto` ring.
 
    Every control in the card's title band rings INSET. The band has no
-   room for an outset ring: the cluster and the subthread toggle sit 1-6px
-   below the card's outer edge, and the in-title pin's 24px box overhangs
-   its 18px line slot by 3px. Measured before this rule, the rings (1px
+   room for an outset ring: the subthread toggle and the title line's
+   24px controls sit 1-6px below the card's outer edge (the controls
+   overhang their 18px line by 3px at md, 4px at xs). Measured before
+   this rule, the rings (1px
    and 2px offsets) crossed that edge by up to 4px at every title-size
    notch, drawing the kebab's ring over the selected card's border. At
    -2px the ring's reach is 0, so it clears the card's 1px border wherever
    the control itself does. */
 .thread-row__subthread-toggle:focus-visible,
-.thread-row__heading-pin:focus-visible,
+.thread-row__pin:focus-visible,
 .thread-row__pin-button:focus-visible,
 .thread-row__chip--add-reaction:focus-visible,
 .thread-row__overflow-button:focus-visible {
@@ -5945,6 +6011,8 @@ a.button {
 .thread-row-shell:hover .thread-row__chip--add-reaction,
 .thread-row__chip--add-reaction:focus-visible,
 .thread-row__chip--add-reaction.is-open {
+  width: 30px;
+  margin-right: 4px;
   opacity: 1;
   pointer-events: auto;
 }
@@ -6077,8 +6145,8 @@ a.button {
 /* Title line — a sibling of the open-thread overlay since the
    transcript-gaps pass, exactly like `.thread-row__chips`: the container
    is transparent to the pointer (clicks fall through to the overlay
-   button) and only the in-title pin button and the status indicator opt
-   back in. The indicator's opt-in exists solely so its native `title`
+   button) and only the row's actions (pin, add reaction, kebab) and the
+   status indicator opt back in. The indicator's opt-in exists solely so its native `title`
    tooltip ("Thinking" / "Unread update") keeps working — the sidebar's
    only sighted-hover explanation of the marks; its clicks bubble to the
    header's onClick in ThreadRow, which forwards to the same select
@@ -6094,8 +6162,8 @@ a.button {
 }
 
 /* The row's open-thread action: an EMPTY button stretched over the whole
-   card. The visible title line, the chip flow, and the actions cluster
-   are all siblings, because they carry their own buttons (unpin, copy
+   card. The visible title line (which holds the row's actions) and the
+   chip flow are its siblings, because they carry their own buttons (unpin, copy
    path, copy branch, unbind, reactions, PR links) and nesting a control
    inside this one made the row invalid and unoperable (axe
    `nested-interactive`). `.star-map-card-shell` solves the same problem
@@ -6171,61 +6239,67 @@ a.button {
      brings the two surfaces to parity. */
   gap: 2px;
   flex: 1 1 auto;
-  /* Glides the pinned-row hover reserve (see the `--pinned` rule near
-     the reveal lists) in step with the cluster's 120ms opacity fade,
-     instead of the title/pin snapping while the buttons are still
-     fading in. Inert on unpinned rows — nothing changes their
-     padding. */
-  transition: padding-right 120ms ease;
 }
 
-/* Always-visible in-title pin on pinned rows — and since the
-   transcript-gaps pass, the actual UNPIN control (the title line is a
-   sibling of the open-thread overlay now, so a real button here is
-   valid). The hover cluster's pin button only renders on UNPINNED rows,
-   so each row shows exactly one pin affordance.
+/* A pinned row's pin, and the dashed pin on a selection-retained row: the
+   actual unpin (or pin) control, visible at rest in `.thread-row__actions`
+   between the add-reaction chip and the timestamp lane. The title line is
+   a sibling of the open-thread overlay, so a real button here is valid.
+   The hover cluster's `.thread-row__pin-button` renders only on the other
+   unpinned rows, in this same slot, so each row shows exactly one pin
+   affordance and it is always in the same place.
 
-   The box is a real 24×24 WCAG 2.5.8 target — axe's target-size rule
-   does not extend the inline exception to a flex-item button, so an
-   18px box would fail the a11y gate the first time an audited fixture
-   pins a thread. The negative margins collapse the layout footprint
-   back to the 18px line slot the title line was tuned around
-   (footprint: -1 + 24 - 3 = 20px wide, 24 - 3 - 3 = 18px tall, icon
-   center unchanged), so the heading's height and spacing don't move. */
-.thread-row__heading-pin {
-  display: inline-flex;
+   A real 24×24 WCAG 2.5.8 target: axe's target-size rule does not extend
+   the inline exception to a flex-item button, so an 18px box would fail
+   the a11y gate the first time an audited fixture pins a thread. The
+   cluster's negative block margin absorbs the overhang. On row hover it
+   takes the cluster's button chrome so it reads as one of the row's
+   controls; only the paint changes, never the box. */
+.thread-row__pin {
+  display: grid;
   width: 24px;
   height: 24px;
   flex: 0 0 auto;
-  align-items: center;
-  justify-content: center;
-  /* The heading gap is tuned for the status-indicator lane's slack;
-     this control has none, so give it back a little air after the
-     title (2px slot air = 2px margin-left on the old 18px box). */
-  margin: -3px -3px -3px -1px;
+  place-items: center;
+  margin-right: 4px;
   padding: 0;
-  border: 0;
-  border-radius: 4px;
+  border: 1px solid transparent;
+  border-radius: 6px;
   background: transparent;
   color: var(--accent-bright);
   pointer-events: auto;
   cursor: pointer;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease;
 }
 
-.thread-row__heading-pin:hover,
-.thread-row__heading-pin:focus-visible {
-  background: var(--accent-soft);
+.thread-row-shell:hover .thread-row__pin {
+  border-color: var(--border-subtle);
+  background: var(--bg-panel-elevated);
+}
+
+/* Scoped through the shell to outrank the row-hover chrome above: the
+   row is always hovered while the pin is, so a bare `:hover` here never
+   painted. */
+.thread-row-shell .thread-row__pin:hover,
+.thread-row-shell .thread-row__pin:focus-visible {
+  border-color: var(--accent-border);
+  background: var(--bg-row-active);
 }
 
 /* Read-only variant for surfaces without a pin handler — same mark,
-   no interaction. */
-.thread-row__heading-pin--static {
+   no interaction, and no control chrome on hover. */
+.thread-row__pin--static,
+.thread-row-shell:hover .thread-row__pin--static {
+  border-color: transparent;
+  background: transparent;
   pointer-events: none;
   cursor: default;
 }
 
 /* A pin kept at top: the same glyph, filled. */
-.thread-row__heading-pin--kept path {
+.thread-row__pin--kept path {
   fill: currentColor;
 }
 
@@ -6479,6 +6553,21 @@ a.button {
   background: var(--bg-row-active);
 }
 
+/* In the title line the chip is zero-width at rest, but the 1px border
+   above would still paint a 2px sliver, and axe's target-size rule
+   measures an invisible control: the sub-agents strip audit failed on a
+   2px add-reaction beside the (also invisible) kebab. Like the pin
+   button, the border exists only while the chip is revealed. */
+.thread-row__actions .thread-row__chip.thread-row__chip--add-reaction {
+  border-width: 0;
+}
+
+.thread-row-shell:hover .thread-row__actions .thread-row__chip.thread-row__chip--add-reaction,
+.thread-row__actions .thread-row__chip.thread-row__chip--add-reaction:focus-visible,
+.thread-row__actions .thread-row__chip.thread-row__chip--add-reaction.is-open {
+  border-width: 1px;
+}
+
 /* `.chip--backend` is the non-list alias of `.thread-row__chip--backend`,
    pairing with the `.chip` primitive. Used by the open-thread header and
    the transcript so they keep their elevated-panel backend pill without
@@ -6512,12 +6601,43 @@ a.button {
   font-weight: 600;
 }
 
-/* Pin affordance — hover-revealed on UNPINNED rows only (a pinned row's
-   in-title pin is the unpin control). Base chrome, reveal, and
-   hover-accent rules are SHARED with `.thread-row__overflow-button`
-   (see that block) — only the width lives here. */
+/* Pin affordance — hover-revealed on UNPINNED rows only, in the slot a
+   pinned row's `.thread-row__pin` holds at rest, so pin and unpin sit in
+   one place. Base chrome, reveal, and hover-accent rules are SHARED with
+   `.thread-row__overflow-button` (see that block). At rest it takes no
+   width, so the title keeps the space; revealed, it opens toward the
+   title like the add-reaction chip. */
 .thread-row__pin-button {
+  width: 0;
+  margin-right: 0;
+  border-width: 0;
+  overflow: hidden;
+  transition:
+    width 120ms ease,
+    margin-right 120ms ease,
+    background 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease,
+    opacity 120ms ease;
+}
+
+.thread-row-shell:hover .thread-row__pin-button,
+.thread-row__pin-button:focus-visible {
   width: 24px;
+  margin-right: 4px;
+  border-width: 1px;
+}
+
+/* Under reduced motion the hover controls open at full size instead of
+   growing from zero: the growth also pushes the title, so it is motion,
+   and a target caught mid-growth measures under the 24px WCAG 2.5.8 floor
+   (the a11y gate, which emulates reduced motion, measured a 22.5px pin
+   button 80ms into the hover). The paint fades stay. */
+@media (prefers-reduced-motion: reduce) {
+  .thread-row__actions .thread-row__chip--add-reaction,
+  .thread-row__pin-button {
+    transition-property: background, border-color, color, opacity;
+  }
 }
 
 .thread-row__chip--approval,
@@ -6734,7 +6854,9 @@ a.button {
 /* A PR chip inside rendered markdown is part of the message's copyable prose.
    Select it atomically so Chromium includes the full chip in the range;
    ThreadMarkdown serializes it as a full PR URL for cross-project hydration.
-   Chips in sidebar rows and context chrome remain non-selectable controls. */
+   `all` also selects the chip on a mousedown inside it, so ThreadMarkdown
+   refuses that mousedown's default; only a drag that crosses the chip selects
+   it. Chips in sidebar rows and context chrome remain non-selectable controls. */
 .thread-markdown .pr-chip {
   -webkit-user-select: all;
   user-select: all;
@@ -7214,7 +7336,7 @@ a.button {
 .thread-row__chip--unpublished {
   border: 1px solid color-mix(in srgb, var(--status-warning) 48%, var(--border-subtle));
   background: color-mix(in srgb, var(--status-warning) 14%, transparent);
-  color: var(--status-warning);
+  color: var(--status-warning-text);
   font-weight: 650;
   font-variant-numeric: tabular-nums;
 }
@@ -7406,6 +7528,34 @@ a.button {
 
 .directory-row__summary--unconfigured .directory-row__icon {
   opacity: 0.72;
+}
+
+/* Revealed from the thread header's project name: an outline that fades,
+   because the click can switch the lens and the eye needs somewhere to land.
+   The 1200ms matches PROJECT_REVEAL_FLASH_MS, which removes the class. Under
+   reduced motion the outline holds for that time and goes without a fade. */
+.directory-row__summary.is-revealed {
+  outline: 1px solid transparent;
+  outline-offset: -1px;
+  animation: directory-row-revealed 1200ms ease-out;
+}
+
+@keyframes directory-row-revealed {
+  0%,
+  40% {
+    outline-color: var(--accent);
+  }
+
+  100% {
+    outline-color: transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .directory-row__summary.is-revealed {
+    animation: none;
+    outline-color: var(--accent);
+  }
 }
 
 .directory-row__summary-main,
@@ -8113,9 +8263,11 @@ a.button {
 .transcript-error {
   margin: 12px 0 0;
   padding: 12px;
-  border: 1px solid var(--danger-border);
+  /* Neutral card; the error text carries the tone. A --danger-soft fill
+     read as a salmon box in blue and the other cool themes. */
+  border: 1px solid var(--border-subtle);
   border-radius: 8px;
-  background: var(--danger-soft);
+  background: var(--bg-panel-elevated);
   color: var(--danger-text);
   font-size: 14px;
   line-height: 1.45;
@@ -8670,11 +8822,11 @@ a.button {
 
 .thread-search__error {
   margin: 0;
-  border: 1px solid color-mix(in srgb, var(--status-error) 50%, var(--border-subtle));
+  border: 1px solid var(--border-subtle);
   border-radius: 8px;
   padding: 10px 12px;
-  background: color-mix(in srgb, var(--status-error) 10%, transparent);
-  color: var(--text-primary);
+  background: var(--bg-panel-elevated);
+  color: var(--danger-text);
   font-size: 13px;
 }
 
@@ -8911,9 +9063,12 @@ a.button {
   grid-template-columns: minmax(0, 1fr);
   gap: 12px;
   padding: 14px;
-  border: 1px solid color-mix(in srgb, var(--status-warning) 52%, var(--border-subtle));
+  /* Neutral card, like the notice toasts: the amber eyebrow carries the
+     warning. A tinted card and border read as a beige panel in blue and
+     the other cool themes. */
+  border: 1px solid var(--border-subtle);
   border-radius: 8px;
-  background: color-mix(in srgb, var(--bg-panel-elevated) 92%, var(--status-warning) 8%);
+  background: var(--bg-panel-elevated);
   box-shadow: var(--shadow-popover);
   animation: app-update-banner-enter 160ms ease-out;
   -webkit-app-region: no-drag;
@@ -8925,7 +9080,7 @@ a.button {
 
 .codex-config-warning-banner__eyebrow {
   margin: 0 0 4px;
-  color: var(--status-warning);
+  color: var(--status-warning-text);
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0;
@@ -8959,9 +9114,14 @@ a.button {
 
 .codex-config-warning-banner__actions {
   display: flex;
+  align-items: center;
   flex-wrap: wrap;
   justify-content: flex-end;
   gap: 8px;
+}
+
+.codex-config-warning-banner__suppress {
+  margin-right: auto;
 }
 
 .codex-config-warning-banner__actions .button {
@@ -10084,7 +10244,7 @@ a.button {
 .automation-runtime__access--elevated {
   border-color: color-mix(in srgb, var(--status-warning) 48%, var(--border-subtle));
   background: var(--warning-surface);
-  color: var(--status-warning);
+  color: var(--status-warning-text);
 }
 
 .automations-table__cwd {
@@ -10215,11 +10375,15 @@ a.button {
   -webkit-app-region: drag;
 }
 
+/* Descendants too, for the reason given at `.thread-header button *`. */
 .settings-titlebar button,
+.settings-titlebar button *,
 .settings-titlebar input,
 .settings-titlebar a,
+.settings-titlebar a *,
 .settings-titlebar select,
-.settings-titlebar [role="button"] {
+.settings-titlebar [role="button"],
+.settings-titlebar [role="button"] * {
   -webkit-app-region: no-drag;
 }
 
@@ -11015,9 +11179,10 @@ a.button {
   overflow: visible;
 }
 
-.settings-panel--error {
-  border-color: var(--danger-border);
-  background: var(--danger-soft);
+/* The error panel keeps the base panel's neutral frame; its eyebrow
+   carries the tone, and `.settings-error-block p` the message. */
+.settings-panel--error .settings-panel__header .eyebrow {
+  color: var(--danger-text);
 }
 
 .settings-panel--warning {
@@ -11436,7 +11601,7 @@ a.button {
 /* Contradiction state: the setting says on, the runtime says it never loaded.
    Semantic warning, not the accent — this reports health, not emphasis. */
 .settings-field__value--warn {
-  color: var(--status-warning);
+  color: var(--status-warning-text);
 }
 
 .settings-field:first-child {
@@ -11750,14 +11915,24 @@ a.button {
 }
 
 .settings-inline-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
   margin: 0 18px 8px;
   padding: 8px 10px;
-  border: 1px solid var(--border-strong);
+  /* Neutral card; the leading status dot carries the warning. */
+  border: 1px solid var(--border-subtle);
   border-radius: 6px;
-  background: var(--warning-surface, var(--bg-panel-elevated));
+  background: var(--bg-panel-elevated);
   color: var(--text-secondary);
   font-size: 12px;
   line-height: 1.45;
+}
+
+/* Centred on the first line box: half the 1.45 line height, less half
+   the 8px dot. */
+.settings-inline-notice__dot {
+  margin-top: calc(0.725em - 4px);
 }
 
 .slack-connect {
@@ -13236,9 +13411,10 @@ a.button {
   justify-content: space-between;
   gap: 10px;
   padding: 7px 8px;
-  border: 1px solid var(--danger-border);
+  /* Neutral row; the message text carries the error tone. */
+  border: 1px solid var(--border-subtle);
   border-radius: 6px;
-  background: var(--danger-soft);
+  background: var(--bg-panel-elevated);
 }
 
 .settings-list-validation__message {
@@ -13927,19 +14103,15 @@ a.button {
   background: color-mix(in srgb, var(--bg-panel-elevated) 94%, var(--accent) 6%);
 }
 
-.managed-progress--ok {
-  border-color: var(--success-border);
-  background: var(--bg-panel-elevated);
-}
-
-.managed-progress--error {
-  border-color: var(--danger-border);
-  background: color-mix(in srgb, var(--bg-panel-elevated) 92%, var(--status-error) 8%);
-}
-
+/* A settled strip is a neutral card: the eyebrow carries ok, error, and
+   notice. A tinted fill read as a salmon or beige box in the cool themes.
+   The busy strip keeps the accent wash of the bar it shares with the
+   update banner. */
+.managed-progress--ok,
+.managed-progress--error,
 .managed-progress--notice {
-  border-color: var(--info-border);
-  background: color-mix(in srgb, var(--bg-panel-elevated) 94%, var(--info-text) 6%);
+  border-color: var(--border-subtle);
+  background: var(--bg-panel-elevated);
 }
 
 .managed-progress__head {
@@ -14557,6 +14729,8 @@ a.button {
    ------------------------------------------------------------------ */
 
 .settings-profile-card {
+  /* Anchors the reorder drop line. */
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -14693,6 +14867,101 @@ a.button {
   text-transform: uppercase;
 }
 
+/* The operator's order is the Profiles menu's order. A card is a drop target
+   while a grip drags; the line sits in the middle of the 6px gap between
+   cards (`.settings-paths`), above or below the card it lands beside. The
+   offset is from the padding edge, inside the card's 1px border. */
+.settings-profile-card.is-dragging {
+  border-style: dashed;
+  border-color: var(--accent-border);
+  opacity: 0.6;
+}
+
+.settings-profile-card.is-drop-before::before,
+.settings-profile-card.is-drop-after::after {
+  content: "";
+  position: absolute;
+  right: 8px;
+  left: 8px;
+  height: 2px;
+  border-radius: 999px;
+  background: var(--accent);
+  pointer-events: none;
+}
+
+.settings-profile-card.is-drop-before::before {
+  top: -3px;
+}
+
+.settings-profile-card.is-drop-after::after {
+  bottom: -3px;
+}
+
+/* `--text-muted`, not `--text-subtle`: the dots are the control's only
+   visible form, so they owe a non-text 3:1 against the card. The negative
+   margins give the target 18px of width without pushing the name right. */
+.settings-profile-card__grip {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 26px;
+  margin: 0 -2px 0 -6px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: grab;
+}
+
+.settings-profile-card__grip svg {
+  fill: currentColor;
+}
+
+.settings-profile-card__grip:hover {
+  color: var(--text-secondary);
+}
+
+.settings-profile-card__grip:active {
+  cursor: grabbing;
+}
+
+/* Same chip as a context-menu item's shortcut hint, so the digit reads as
+   the binding it is. */
+.settings-profile-card__shortcut {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+}
+
+.settings-profile-card__menu-toggle {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 1.2;
+}
+
+.settings-profile-list__announcement {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
 /* Shared by the profile Delete button and the confirm dialogs that
    follow it (and by the Plugins pane's remove action). */
 .settings-danger-button {
@@ -14808,9 +15077,10 @@ a.button {
   gap: 10px;
   margin: 0 0 12px;
   padding: 8px 10px;
-  border: 1px solid var(--accent-border);
+  /* Neutral card in every kind; the line's own color carries the tone. */
+  border: 1px solid var(--border-subtle);
   border-radius: 6px;
-  background: var(--accent-soft);
+  background: var(--bg-panel-elevated);
   color: var(--accent-bright);
   font-size: 12px;
   line-height: 1.35;
@@ -14823,14 +15093,10 @@ a.button {
 }
 
 .settings-plugin-notice--success {
-  border-color: var(--success-border);
-  background: var(--success-soft);
   color: var(--success-text);
 }
 
 .settings-plugin-notice--error {
-  border-color: var(--danger-border);
-  background: var(--danger-soft);
   color: var(--danger-text);
 }
 
@@ -15004,15 +15270,13 @@ a.button {
   line-height: 1.5;
 }
 
+/* The probe keeps the base's neutral frame; the result line carries the
+   tone. */
 .settings-mcp-probe--ok {
-  border-color: var(--success-border);
-  background: var(--success-soft);
   color: var(--success-text);
 }
 
 .settings-mcp-probe--err {
-  border-color: var(--danger-border);
-  background: var(--danger-soft);
   color: var(--danger-text);
 }
 
@@ -15360,9 +15624,10 @@ a.button {
   align-items: center;
   gap: 10px;
   padding: 10px 12px 10px 14px;
-  border: 1px solid var(--danger-border);
+  /* Neutral card; the bold headline carries the error tone. */
+  border: 1px solid var(--border-subtle);
   border-radius: 8px;
-  background: var(--danger-soft);
+  background: var(--bg-panel-elevated);
 }
 
 .settings-archive-banner__text {
@@ -15371,12 +15636,13 @@ a.button {
   gap: 2px;
   min-width: 0;
   margin: 0;
-  color: var(--danger-text);
+  color: var(--text-secondary);
   font-size: 12px;
   line-height: 1.45;
 }
 
 .settings-archive-banner__text b {
+  color: var(--danger-text);
   font-size: 13px;
   font-weight: 600;
 }
@@ -16032,14 +16298,6 @@ a.button {
   border-radius: 8px;
   background: var(--bg-panel-elevated);
   box-shadow: var(--shadow-popover);
-}
-
-.settings-confirm-dialog--danger::before {
-  position: absolute;
-  inset: 0 auto 0 0;
-  width: 3px;
-  background: var(--danger-text);
-  content: "";
 }
 
 .settings-confirm-dialog h2 {
@@ -20208,6 +20466,22 @@ a.button {
   user-select: text;
 }
 
+.settings-gh-setup__commands > summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+}
+
+.settings-gh-setup__commands .settings-copyvalue {
+  margin-top: 8px;
+  max-width: 100%;
+}
+
+.settings-gh-setup__commands .settings-copyvalue__value {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
 .settings-pill {
   align-self: flex-start;
   padding: 2px 8px;
@@ -20837,6 +21111,9 @@ a.button {
   white-space: nowrap;
 }
 
+/* The breadcrumb's two links, the project name and the thread title, share
+   one reset: each is a button inside a trimmed text span that ellipsizes. */
+.thread-header__project-button,
 .thread-header__title-button {
   display: inline-block;
   max-width: 100%;
@@ -20858,10 +21135,70 @@ a.button {
   color: var(--accent-bright);
 }
 
+.thread-header__project-button:focus-visible,
 .thread-header__title-button:focus-visible {
   border-radius: 4px;
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
+}
+
+/* The breadcrumb's project name, when it links to the project's section in
+   Directories. Built like the title: the eyebrow span keeps its trim and
+   baseline, and the shared reset button above carries the ellipsis. The span
+   clips with the same 4px margin as the title, so the ring survives.
+   `min-width: 0` because `clip`, unlike the plain eyebrow's `hidden`, does
+   not make a scroll container: the flex item's automatic minimum became the
+   button's whole unwrapped label, the name stopped shrinking, and a narrow
+   header squeezed the thread title to 0px instead. */
+.thread-header__eyebrow--link {
+  min-width: 0;
+  overflow: clip;
+  overflow-clip-margin: 4px;
+}
+
+/* Underlined where the title is not: the eyebrow is already accent-coloured,
+   and brightening it alone is too slight a change to read as a link. */
+.thread-header__project-button:hover {
+  color: var(--accent-bright);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+/* Opens the project's new-thread menu, like the chevron on the project's
+   sidebar row. Muted at rest so the breadcrumb still reads as one line.
+   24px square, the WCAG 2.2 minimum target (SC 2.5.8) and the history
+   buttons' height: at 18px it passed only on the spacing exception, by a
+   pixel. The block margins take the extra 6px back out of layout: at full
+   height the box grew the breadcrumb and lifted the name and title 3px. The
+   left margin narrows the breadcrumb's 6px gap, since the caret belongs to
+   the name before it, not to the chevron after it. Its focus ring is inset,
+   so at that gap the ring clears the name's last letter. */
+.thread-header__project-menu-button {
+  display: inline-grid;
+  flex: 0 0 auto;
+  align-self: center;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  margin: -3px 0 -3px -2px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.thread-header__project-menu-button:hover,
+.thread-header__project-menu-button.is-open {
+  background: var(--bg-panel-hover);
+  color: var(--accent-bright);
+}
+
+.thread-header__project-menu-button:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -1px;
 }
 
 .thread-header__eyebrow-row > .thread-row__chip {
@@ -20872,7 +21209,9 @@ a.button {
 /* Window-level notice for a remote federation window whose peer is
    unreachable: the composer disables and remote polling suspends, so
    the banner is the one place that says why. Warning tones (not danger)
-   — the runtime is auto-reconnecting and the state is expected to heal. */
+   — the runtime is auto-reconnecting and the state is expected to heal.
+   The card is neutral and the dot carries the warning: an amber fill
+   read as a beige box in the cool themes. */
 .federation-disconnected-banner {
   display: flex;
   flex: 0 0 auto;
@@ -20880,9 +21219,9 @@ a.button {
   gap: 8px;
   margin: 10px 16px 0;
   padding: 8px 12px;
-  border: 1px solid var(--accent-border);
+  border: 1px solid var(--border-subtle);
   border-radius: 8px;
-  background: var(--warning-surface);
+  background: var(--bg-panel-elevated);
   color: var(--text-primary);
   font-size: 13px;
   line-height: 1.45;
@@ -23412,13 +23751,15 @@ a.transcript-message__messaging-origin:focus-visible {
   overflow-wrap: anywhere;
 }
 
-.markdown-document-modal__path-row {
+.markdown-document-modal__path-row,
+.markdown-files-window__path-row {
   display: flex;
   align-items: flex-start;
   gap: 4px;
 }
 
-.markdown-document-modal__path-copy {
+.markdown-document-modal__path-copy,
+.markdown-files-window__path-copy {
   display: inline-flex;
   width: 24px;
   height: 24px;
@@ -23435,12 +23776,15 @@ a.transcript-message__messaging-origin:focus-visible {
 }
 
 .markdown-document-modal__path-copy:hover,
-.markdown-document-modal__path-copy:focus-visible {
+.markdown-document-modal__path-copy:focus-visible,
+.markdown-files-window__path-copy:hover,
+.markdown-files-window__path-copy:focus-visible {
   background: var(--bg-row-active);
   color: var(--text-primary);
 }
 
-.markdown-document-modal__path-copy:focus-visible {
+.markdown-document-modal__path-copy:focus-visible,
+.markdown-files-window__path-copy:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: -2px;
 }
@@ -23486,6 +23830,15 @@ a.transcript-message__messaging-origin:focus-visible {
   padding: 18px 20px 22px;
 }
 
+.markdown-document-modal__body--file {
+  padding: 14px 0 18px;
+}
+
+/* The code view runs its gutter to the edge, so status lines keep the inset. */
+.markdown-document-modal__body--file > .markdown-document-modal__status {
+  padding: 0 20px;
+}
+
 .markdown-document-modal__markdown {
   max-width: 78ch;
 }
@@ -23503,6 +23856,172 @@ a.transcript-message__messaging-origin:focus-visible {
 
 .markdown-document-modal__status--error {
   color: var(--danger-text);
+}
+
+/* In-app file preview: every kind but Markdown. Shown as written with a line
+   gutter so line numbers match the editor. The gutter number comes from
+   data-line through ::before, which selection and copy skip. */
+.file-preview {
+  --file-preview-inset: 20px;
+}
+
+.markdown-files-window__markdown-scroll--file .file-preview {
+  --file-preview-inset: 26px;
+}
+
+.file-preview__notice {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0 var(--file-preview-inset) 10px;
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.file-preview__notice strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.file-preview__notice[data-tone="neutral"] strong {
+  color: inherit;
+  font-weight: inherit;
+}
+
+/* Tone on the dot, not the panel: warm danger tints read orange in the
+   Blue and Gray themes. */
+.file-preview__notice-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  transform: translateY(-1px);
+}
+
+.file-preview__notice[data-tone="danger"] .file-preview__notice-dot {
+  background: var(--danger-text);
+}
+
+.file-preview__code,
+.file-preview__plain {
+  margin: 0;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: calc(var(--transcript-text-size) - 1px);
+  font-weight: 400;
+  line-height: 1.5;
+  tab-size: 2;
+}
+
+.file-preview__plain {
+  padding: 0 var(--file-preview-inset);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.file-preview__code:focus-visible,
+.file-preview__plain:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+.file-preview__line {
+  display: grid;
+  grid-template-columns:
+    calc(var(--file-preview-inset) + var(--file-preview-digits, 2) * 1ch + 12px)
+    minmax(0, 1fr);
+}
+
+.file-preview__line::before {
+  content: attr(data-line);
+  /* Empty alt text keeps the numbers out of the accessibility tree. */
+  content: attr(data-line) / "";
+  padding-right: 12px;
+  border-right: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  text-align: right;
+  user-select: none;
+}
+
+.file-preview__text {
+  min-width: 0;
+  padding: 0 var(--file-preview-inset) 0 14px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.file-preview__line[data-state="target"] {
+  background: var(--accent-soft);
+}
+
+.file-preview__line[data-state="target"]::before {
+  color: var(--accent-bright);
+  font-weight: 600;
+}
+
+.file-preview__line[data-state="error"]::before {
+  color: var(--danger-text);
+  font-weight: 700;
+  box-shadow: inset 2px 0 var(--danger-text);
+}
+
+.file-preview__token--key,
+.file-preview__token--section {
+  color: var(--info-text);
+}
+
+.file-preview__token--section {
+  font-weight: 600;
+}
+
+.file-preview__token--string {
+  color: var(--success-text);
+}
+
+.file-preview__token--number,
+.file-preview__token--literal {
+  color: var(--accent-bright);
+}
+
+.file-preview__token--punctuation {
+  color: var(--text-secondary);
+}
+
+.file-preview__token--comment {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.file-preview__table {
+  margin: 0 var(--file-preview-inset);
+}
+
+.file-preview__table .thread-markdown__th[data-numeric="true"],
+.file-preview__table .thread-markdown__td[data-numeric="true"] {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Copy sits beside the outline icon buttons in both preview headers, so it
+   drops the transcript chip's fill and takes their size and glyph. */
+.transcript-copy-button.file-preview__copy {
+  width: 32px;
+  height: 32px;
+  background: transparent;
+  opacity: 1;
+}
+
+.transcript-copy-button.file-preview__copy::before {
+  width: 16px;
+  height: 16px;
+}
+
+.transcript-copy-button.file-preview__copy:hover,
+.transcript-copy-button.file-preview__copy:focus-visible,
+.transcript-copy-button.file-preview__copy[data-copied="true"] {
+  background: transparent;
 }
 
 .markdown-files-window {
@@ -23655,6 +24174,14 @@ a.transcript-message__messaging-origin:focus-visible {
   min-height: 0;
   overflow: auto;
   padding: 22px 26px 32px;
+}
+
+.markdown-files-window__markdown-scroll--file {
+  padding: 16px 0 28px;
+}
+
+.markdown-files-window__markdown-scroll--file > .markdown-files-window__status {
+  padding: 0 26px;
 }
 
 .markdown-files-window__markdown {
@@ -24254,7 +24781,7 @@ a.transcript-message__messaging-origin:focus-visible {
 }
 
 .incident-explorer__confidence[data-kind="reconstructed"] {
-  color: var(--status-warning);
+  color: var(--status-warning-text);
 }
 
 .incident-explorer__confidence span {
@@ -25236,7 +25763,7 @@ a.transcript-message__messaging-origin:focus-visible {
 }
 
 .incident-explorer__turn-label .incident-explorer__turn-compaction {
-  color: var(--status-warning);
+  color: var(--status-warning-text);
 }
 
 .incident-explorer__turn-bar,
@@ -25288,7 +25815,7 @@ a.transcript-message__messaging-origin:focus-visible {
   margin: 0;
   padding: 8px 18px;
   border-bottom: 1px solid var(--border-subtle);
-  color: var(--status-warning);
+  color: var(--status-warning-text);
   font-size: 12px;
 }
 
@@ -25406,7 +25933,7 @@ a.transcript-message__messaging-origin:focus-visible {
    competing with it, so it stays smaller and takes the warning tone. */
 .incident-explorer__repeat {
   margin-right: 6px;
-  color: var(--status-warning);
+  color: var(--status-warning-text);
   font-size: 10px;
   font-weight: 650;
 }
@@ -25509,7 +26036,7 @@ a.transcript-message__messaging-origin:focus-visible {
 }
 
 .incident-explorer__fact[data-tone="warning"] b {
-  color: var(--status-warning);
+  color: var(--status-warning-text);
 }
 
 .incident-explorer__fact[data-tone="error"] b {
@@ -26346,7 +26873,7 @@ a.transcript-message__messaging-origin:focus-visible {
   border: 1px solid color-mix(in srgb, var(--status-warning) 38%, transparent);
   border-radius: 999px;
   background: color-mix(in srgb, var(--status-warning) 12%, transparent);
-  color: var(--status-warning);
+  color: var(--status-warning-text);
   font-size: 9px;
   font-weight: 600;
   letter-spacing: 0.04em;
@@ -26659,7 +27186,7 @@ a.transcript-message__messaging-origin:focus-visible {
 .edit-commit-badge__status--uncommitted {
   border-color: color-mix(in srgb, var(--status-warning) 42%, transparent);
   background: color-mix(in srgb, var(--status-warning) 14%, transparent);
-  color: var(--status-warning);
+  color: var(--status-warning-text);
 }
 
 .edit-commit-badge__status--committed {
@@ -27064,7 +27591,14 @@ a.transcript-message__messaging-origin:focus-visible {
   padding-top: 8px;
 }
 
+/* The row names the command by its preview (`agentCommandPreview`): the
+   first line only, and at most two lines of that, so a 400-character
+   one-liner cannot make the collapsed row tall either. */
 .agent-command-run__command {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
   color: var(--text-primary);
   font-family: var(--font-mono);
   font-size: 12px;
@@ -27096,6 +27630,37 @@ a.transcript-message__messaging-origin:focus-visible {
   display: grid;
   gap: 10px;
   padding: 2px 10px 10px 40px;
+}
+
+/* An unbroken Output line must scroll its own box, not widen the grid. */
+.agent-command-run__body > * {
+  min-width: 0;
+}
+
+.agent-command-run__full-command {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* The whole command when the summary preview cut it: a heredoc keeps its
+   line breaks, and a long script scrolls instead of growing the panel. */
+.agent-command-run__command-text {
+  max-height: 220px;
+  margin: 0;
+  padding: 6px 8px;
+  overflow: auto;
+  border: 1px solid var(--border-subtle);
+  border-radius: 4px;
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 .agent-command-run__facts {
@@ -27806,7 +28371,7 @@ div.composer-error-row__toggle {
 .transcript-review__priority--p2 {
   border-color: color-mix(in srgb, var(--status-warning) 48%, transparent);
   background: color-mix(in srgb, var(--status-warning) 18%, transparent);
-  color: var(--status-warning);
+  color: var(--status-warning-text);
 }
 
 .transcript-review__priority--p3 {
@@ -27928,14 +28493,32 @@ div.composer-error-row__toggle {
   line-height: 1;
 }
 
+/* One row whatever the command: the preview ellipsizes, and the words after
+   it and the Actions link never wrap away from it. */
+.transcript-list__agent-commands-text {
+  display: flex;
+  align-items: baseline;
+  gap: 0.35em;
+  min-width: 0;
+}
+
 .transcript-list__agent-commands-command {
+  min-width: 0;
+  overflow: hidden;
   color: var(--text-primary);
   font-family: var(--font-mono);
   font-size: 12px;
-  overflow-wrap: anywhere;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.transcript-list__agent-commands-tail {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .transcript-list__agent-commands-link {
+  flex: 0 0 auto;
   padding: 0;
   border: 0;
   background: none;
@@ -31819,7 +32402,7 @@ div.composer-error-row__toggle {
 }
 
 .context-empty--warning {
-  color: var(--status-warning);
+  color: var(--status-warning-text);
 }
 
 .provider-status__heading {
@@ -34369,7 +34952,7 @@ button.pricing-token-miser__folded:focus-visible {
 }
 
 .composer__queued--permissions .composer__queued-label {
-  color: var(--status-warning);
+  color: var(--status-warning-text);
 }
 
 .composer__queued--scheduled {
@@ -37552,9 +38135,9 @@ button.composer__subthread-source-parent:hover {
   margin: 4px 8px 6px;
   padding: 6px 8px;
   border-radius: 6px;
-  /* Canonical danger pair — same tokens used by .settings-panel--error
-     and .messaging-status-chip--errored. Don't introduce a new error
-     token name (UI-THEME.md). */
+  /* Canonical danger pair — same tokens used by
+     .messaging-status-chip--errored. Don't introduce a new error token
+     name (UI-THEME.md). */
   background: var(--danger-soft);
   color: var(--danger-text);
   font-size: 12px;
@@ -39189,7 +39772,7 @@ button.composer__subthread-source-parent:hover {
 }
 
 .composer__meta--warning {
-  color: var(--status-warning);
+  color: var(--status-warning-text);
 }
 
 .transcript-copy-button--composer-error {
@@ -40853,8 +41436,8 @@ button.composer__subthread-source-parent:hover {
 }
 
 /* Real-app-mimic chips used in the preview cards. The visual contract
-   mirrors the live ThreadRow primitive — the pin is the in-title accent
-   marker (`.thread-row__heading-pin` in the live sidebar), PR chip uses
+   mirrors the live ThreadRow primitive — the pin is the title line's
+   accent marker (`.thread-row__pin` in the live sidebar), PR chip uses
    a small status dot + #number, Meta chips are gray-on-near-black for
    OpenAI / directory / branch slots. */
 .onboarding-wizard__mini-pin {
@@ -41691,7 +42274,7 @@ button.composer__subthread-source-parent:hover {
   border-color: var(--success-border);
 }
 .onboarding-wizard__field-pill.is-warn {
-  color: var(--status-warning);
+  color: var(--status-warning-text);
   background: var(--warning-surface);
   border-color: var(--border-strong);
 }
@@ -41884,7 +42467,7 @@ button.composer__subthread-source-parent:hover {
   color: var(--text-primary);
 }
 .onboarding-wizard__pairing-warning em {
-  color: var(--status-warning);
+  color: var(--status-warning-text);
   font-style: normal;
   font-weight: 600;
 }
@@ -42197,19 +42780,16 @@ button.composer__subthread-source-parent:hover {
 /* Ported from docs/design/pwragent-v2/project/rbac.css; raw    */
 /* accent/danger literals mapped to :root tokens via color-mix. */
 /* ============================================================ */
+/* Neutral card; the icon chip carries the tone. */
 .rbac-callout {
   display: flex;
   align-items: flex-start;
   gap: 12px;
   padding: 12px 14px;
-  border: 1px solid var(--accent-border);
-  background: var(--accent-soft);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-panel-elevated);
   border-radius: 8px;
   margin-bottom: 12px;
-}
-.rbac-callout.is-danger {
-  border-color: var(--danger-border);
-  background: var(--danger-soft);
 }
 .rbac-callout__icon {
   width: 28px; height: 28px;
@@ -43452,7 +44032,7 @@ details.launchpad-pending__output > summary .launchpad-pending__command-label {
 .usage-pace.is-short > span { background: var(--warning-surface-faint); color: var(--status-warning-text); }
 .usage-limit__sub { display: flex; flex-wrap: wrap; gap: 4px 14px; color: var(--text-muted); font-size: 10px; }
 .usage-limit__sub strong { color: var(--text-secondary); font-weight: 600; }
-.usage-limit__reset { color: var(--status-warning); }
+.usage-limit__reset { color: var(--status-warning-text); }
 .usage-band__cost { display: flex; flex-direction: column; gap: 6px; min-width: 0; padding-left: 20px; border-left: 1px solid var(--border-subtle); }
 .usage-band__note { grid-column: 1 / -1; margin: 0; color: var(--text-muted); font-size: 10px; }
 
@@ -43467,15 +44047,22 @@ details.launchpad-pending__output > summary .launchpad-pending__command-label {
 .usage-timeline__frame { display: grid; grid-template-columns: 44px minmax(0, 1fr) 36px; gap: 8px; margin-top: 10px; }
 .usage-timeline__axis-y { display: flex; flex-direction: column; justify-content: space-between; height: 110px; color: var(--text-muted); font: 9px var(--font-mono); text-align: right; }
 .usage-timeline__axis-y--right { text-align: left; }
-.usage-timeline__plot { position: relative; height: 110px; border-bottom: 1px solid var(--border-subtle); }
-.usage-timeline__bars { display: flex; align-items: flex-end; gap: 3px; height: 100%; }
+/* The slice card reads the gap to line up with the bar flex drew. */
+.usage-timeline__plot { --usage-bar-gap: 3px; position: relative; height: 110px; border-bottom: 1px solid var(--border-subtle); }
+.usage-timeline__bars { display: flex; align-items: flex-end; gap: var(--usage-bar-gap); height: 100%; }
 /* Each bar's flex-grow is its span, so a partial first or last bar is narrower. */
 .usage-timeline__bar { display: flex; align-items: flex-end; flex: 1 1 0; height: 100%; min-width: 0; padding: 0; border: 0; border-bottom: 2px solid transparent; background: transparent; }
 .usage-timeline__bar:hover { background: var(--bg-panel-hover); }
-.usage-timeline__bar.is-selected { border-bottom-color: var(--text-primary); background: var(--bg-row-active); }
+/* A pinned slice is selected like a row: the accent edge, on the baseline,
+   and an outline drawn over the segments, which would cover an inset shadow. */
+.usage-timeline__bar.is-selected { position: relative; border-bottom-color: var(--accent); background: var(--bg-row-active); }
+.usage-timeline__bar.is-selected::after { content: ""; position: absolute; inset: 0; border: 1px solid var(--accent-border); border-bottom: 0; border-radius: 2px 2px 0 0; pointer-events: none; }
 .usage-timeline__stack { display: flex; flex-direction: column-reverse; width: 100%; min-height: 0; opacity: 0.85; }
 .usage-timeline__stack i { display: block; flex-basis: 0; min-height: 1px; }
 .usage-timeline__bar:hover .usage-timeline__stack, .usage-timeline__bar:focus-visible .usage-timeline__stack, .usage-timeline__bar.is-selected .usage-timeline__stack { opacity: 1; }
+/* While a slice is read on hover, the rest of the chart steps back. */
+.usage-timeline__bars.is-dimmed .usage-timeline__bar:not(.is-shown) .usage-timeline__stack { opacity: 0.4; }
+.usage-timeline__stack i.is-hot { box-shadow: inset 0 0 0 1.5px var(--text-primary); }
 .usage-timeline__line { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
 .usage-timeline__line polyline { fill: none; stroke: var(--text-primary); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
 .usage-timeline__line polyline.is-forecast { stroke: var(--text-secondary); stroke-dasharray: 5 4; stroke-linecap: butt; }
@@ -43484,12 +44071,12 @@ details.launchpad-pending__output > summary .launchpad-pending__command-label {
 .usage-timeline__future { position: absolute; top: 0; right: 0; bottom: 0; border-left: 1px dashed var(--text-muted); background: color-mix(in srgb, var(--text-muted) 6%, transparent); pointer-events: none; }
 .usage-timeline__full { position: absolute; top: 0; bottom: 0; border-left: 1px solid var(--status-warning); pointer-events: none; }
 .usage-timeline__outcome { position: absolute; top: -2px; right: 4px; color: var(--text-secondary); font: 9px var(--font-mono); white-space: nowrap; pointer-events: none; }
-.usage-timeline__outcome.is-short { color: var(--status-warning); }
-.usage-timeline__full span { position: absolute; top: 12px; right: 5px; color: var(--status-warning); font: 9px var(--font-mono); white-space: nowrap; }
+.usage-timeline__outcome.is-short { color: var(--status-warning-text); }
+.usage-timeline__full span { position: absolute; top: 12px; right: 5px; color: var(--status-warning-text); font: 9px var(--font-mono); white-space: nowrap; }
 .usage-timeline__reset { position: absolute; top: 0; bottom: 0; border-left: 1px dashed var(--text-muted); pointer-events: none; }
 .usage-timeline__reset.is-unscheduled { border-left-color: var(--status-warning); }
 .usage-timeline__reset span { position: absolute; top: -2px; left: 3px; color: var(--text-muted); font: 9px var(--font-mono); white-space: nowrap; }
-.usage-timeline__reset.is-unscheduled span { color: var(--status-warning); }
+.usage-timeline__reset.is-unscheduled span { color: var(--status-warning-text); }
 .usage-timeline__axis { padding: 5px 44px 0 52px; color: var(--text-muted); font: 9px var(--font-mono); }
 .usage-timeline__ticks { position: relative; height: 12px; }
 .usage-timeline__ticks span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
@@ -43503,6 +44090,40 @@ button.usage-timeline__legend-item:hover > span { text-decoration: underline; }
 button.usage-timeline__legend-item[aria-pressed="true"] { background: var(--bg-row-active); color: var(--text-primary); }
 .usage-timeline__dimension button { padding: 2px 8px; font-size: 10px; }
 .usage-timeline__readout { min-height: 16px; margin: 6px 0 0; color: var(--text-secondary); font: 10px var(--font-mono); }
+/* The legend entry for the segment under the pointer. */
+.usage-timeline__legend[data-hot="0"] .usage-timeline__legend-item:has(> .usage-series--0),
+.usage-timeline__legend[data-hot="1"] .usage-timeline__legend-item:has(> .usage-series--1),
+.usage-timeline__legend[data-hot="2"] .usage-timeline__legend-item:has(> .usage-series--2),
+.usage-timeline__legend[data-hot="3"] .usage-timeline__legend-item:has(> .usage-series--3),
+.usage-timeline__legend[data-hot="4"] .usage-timeline__legend-item:has(> .usage-series--4),
+.usage-timeline__legend[data-hot="other"] .usage-timeline__legend-item:has(> .usage-series--other) { background: var(--bg-row-active); color: var(--text-primary); }
+.usage-chip { display: inline-flex; align-items: center; gap: 6px; height: 22px; padding: 0 8px; border: 1px solid var(--accent-border); border-radius: 4px; background: var(--bg-row-active); color: var(--text-primary); font: 10px var(--font-mono); white-space: nowrap; }
+.usage-chip span { color: var(--text-muted); }
+.usage-chip:hover span { color: var(--text-primary); }
+
+/* What is in a slice. It sits beside its bar on the side with room, measured
+   like .context-usage-card; a click pins it, and only then does it take the pointer. */
+.usage-slice-card { position: absolute; top: -4px; z-index: 3; display: flex; flex-direction: column; gap: 6px; width: 264px; max-width: calc(100% - 16px); padding: 10px 10px 8px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--popover-bg); box-shadow: 0 12px 28px var(--shadow-tint-soft); color: var(--text-primary); font-size: 11px; pointer-events: none; text-align: left; }
+.usage-slice-card.is-pinned { pointer-events: auto; }
+.usage-slice-card__head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding: 0 4px; }
+.usage-slice-card__head span { color: var(--text-secondary); font: 10px var(--font-mono); }
+.usage-slice-card__head strong { font: 600 13px var(--font-mono); }
+.usage-workspace .usage-slice-card__sub { margin: 0; padding: 0 4px; color: var(--text-muted); font-size: 10px; line-height: 1.3; }
+.usage-slice-card__rows { display: flex; flex-direction: column; max-height: 240px; margin: 0; padding: 4px 0 0; overflow-y: auto; border-top: 1px solid var(--border-subtle); list-style: none; }
+.usage-slice-card__row { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto; align-items: center; column-gap: 8px; padding: 3px 4px; border-radius: 4px; }
+.usage-slice-card__row > i { width: 8px; height: 8px; border-radius: 2px; }
+.usage-slice-card__row.is-hot { background: var(--bg-row-active); }
+.usage-slice-card__row > b { font: 600 10.5px var(--font-mono); }
+.usage-slice-card__name { display: flex; flex-direction: column; align-items: flex-start; min-width: 0; }
+.usage-slice-card__title, .usage-slice-card__action, .usage-slice-card__name small { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.usage-slice-card__name small { color: var(--text-muted); font-size: 10px; }
+.usage-slice-card__row.is-other .usage-slice-card__title { color: var(--text-muted); }
+.usage-slice-card__action { padding: 0; border: 0; background: transparent; color: var(--text-primary); font-size: 11px; text-align: left; }
+.usage-slice-card__action:hover { text-decoration: underline; }
+.usage-slice-card__action[aria-pressed="true"] { color: var(--accent-bright); }
+.usage-slice-card__foot { display: flex; align-items: center; gap: 5px; padding: 6px 4px 0; border-top: 1px solid var(--border-subtle); color: var(--text-muted); font-size: 10px; }
+.usage-slice-card__foot kbd { padding: 0 4px; border: 1px solid var(--border-subtle); border-radius: 3px; font: 9.5px var(--font-mono); }
+.usage-slice-card__spacer { flex: 1; }
 
 /* Thread list */
 .usage-results { display: grid; grid-template-columns: minmax(0, 1fr); flex: 1 0 280px; min-height: 280px; margin: 8px 18px 0; }
@@ -43637,13 +44258,14 @@ button.usage-timeline__legend-item[aria-pressed="true"] { background: var(--bg-r
   display: grid;
   gap: 4px;
   padding: 10px;
-  border: 1px solid color-mix(in srgb, var(--status-warning) 40%, transparent);
+  /* Neutral card; the title carries the warning. */
+  border: 1px solid var(--border-subtle);
   border-radius: 8px;
-  background: var(--warning-surface);
+  background: var(--bg-panel-elevated);
 }
 
 .pr-activity__notice-title {
-  color: var(--text-primary);
+  color: var(--status-warning-text);
   font-size: 12.5px;
   font-weight: 650;
 }
@@ -43758,7 +44380,7 @@ button.usage-timeline__legend-item[aria-pressed="true"] { background: var(--bg-r
 }
 
 .pr-activity__count.is-empty {
-  color: var(--status-warning);
+  color: var(--status-warning-text);
 }
 
 .pr-activity__budget-note,

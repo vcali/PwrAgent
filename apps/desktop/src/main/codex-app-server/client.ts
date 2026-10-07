@@ -1,5 +1,5 @@
 import type { NativeVoiceNotification } from "./native-voice-protocol";
-import type { ThreadRealtimeStartParams } from "@pwrdrvr/codex-app-server-protocol/v2";
+import type { ThreadRealtimeStartParams, ThreadRealtimeAppendTextParams } from "@pwrdrvr/codex-app-server-protocol/v2";
 import type {
   ListBackgroundTerminalsResponse,
   CodexBackgroundTerminal,
@@ -7641,7 +7641,8 @@ export class CodexAppServerClient {
   >();
   private readonly threadListTextCache = new ThreadListTextCache();
   private readonly pendingThreadListings = new Map<string, Promise<AppServerThreadSummary[]>>();
-  private threadListingGeneration = 0;
+  private activeThreadListingGeneration = 0;
+  private archivedThreadListingGeneration = 0;
   private readonly threadListingInvalidations = new WeakSet<AppServerNotification>();
   private readonly recordedThreadNames = new Map<string, string>();
   private readonly requestListeners = new Set<
@@ -7662,6 +7663,7 @@ export class CodexAppServerClient {
   private readonly pendingFirstTurnThreadResults = new Map<string, unknown>();
   private readonly pendingFirstTurnShellEnvironments = new Map<string, string | undefined>();
   private readonly helperThreadIds = new Set<string>();
+  private readonly pendingHelperThreadStarts = new Set<Promise<string | undefined>>();
   private readonly helperTurnWaiters = new Map<
     string,
     {
@@ -7813,6 +7815,16 @@ export class CodexAppServerClient {
       );
       if (navigationQueryEventRequiresRefresh(method)) this.invalidateThreadListings(normalized);
       const helperThreadId = extractThreadIdFromNotification(normalized, params);
+      // Codex can send startup warnings before thread/start returns its ID.
+      // Wait only for startup notices, then suppress those belonging to the
+      // helper. Interactive turn traffic continues while the RPC is pending.
+      if (helperThreadId
+        && !this.helperThreadIds.has(helperThreadId)
+        && (normalized.method === "warning" || method === "thread/started")
+        && this.pendingHelperThreadStarts.size > 0) {
+        const startedHelperIds = await Promise.all([...this.pendingHelperThreadStarts]);
+        if (startedHelperIds.includes(helperThreadId)) return;
+      }
       if (helperThreadId && (normalized.method === "turn/started" || method === "thread/closed")) {
         this.threadsAwaitingFirstTurn.delete(helperThreadId);
         this.freshNativeVoiceThreads.delete(helperThreadId);
@@ -8419,9 +8431,9 @@ export class CodexAppServerClient {
     this.ownedRealtimeThreads.delete(threadId);
   }
 
-  async appendRealtimeText(threadId: string, text: string): Promise<void> {
+  async appendRealtimeText(threadId: string, text: string, role: ThreadRealtimeAppendTextParams["role"] = "user"): Promise<void> {
     if (!this.initialized || this.pendingCloses > 0) throw new Error("Voice backend disconnected.");
-    await this.connection.request("thread/realtime/appendText", { threadId, text, role: "user" }, 10_000);
+    await this.connection.request("thread/realtime/appendText", { threadId, text, role } satisfies ThreadRealtimeAppendTextParams, 10_000);
   }
 
   onNotification(
@@ -8894,15 +8906,21 @@ export class CodexAppServerClient {
 
   /** Mutation fences also arrive locally through the registry, without a
    * notification on this connection. Existing readers keep their ownership;
-   * callers after the fence cannot join their pre-mutation physical read.
+   * callers after the fence cannot join the affected inventory's pre-mutation read.
    */
   invalidateThreadListings(notification?: AppServerNotification): void {
     if (notification) {
       if (this.threadListingInvalidations.has(notification)) return;
       this.threadListingInvalidations.add(notification);
     }
-    this.threadListingGeneration += 1;
-    this.pendingThreadListings.clear();
+    this.activeThreadListingGeneration += 1;
+    // Turn/status and viewer overlay events do not change archived inventory.
+    // Keep its in-flight owner joinable while active navigation advances.
+    if (!notification || !["turn/started", "turn/completed", "turn/failed", "turn/cancelled",
+      "thread/status/changed", "navigation/thread/seen", "thread/pin/added", "thread/pin/removed",
+      "thread/pin/reordered"].includes(notification.method)) {
+      this.archivedThreadListingGeneration += 1;
+    }
   }
 
   async listThreads(params?: {
@@ -8921,7 +8939,7 @@ export class CodexAppServerClient {
     // through different cache keys. Share the complete listing, including
     // directory observations, until it settles. Never retain a completed scan.
     const key = JSON.stringify([
-      this.threadListingGeneration,
+      params?.archived ? this.archivedThreadListingGeneration : this.activeThreadListingGeneration,
       params?.archived === true, params?.enrichDirectories ?? true,
       params?.filter?.trim() || "", params?.limit, params?.maxPages,
       params?.skipArchivedMetadataRefresh === true, params?.deadlineAt,
@@ -10409,7 +10427,7 @@ export class CodexAppServerClient {
         mcpServerNames,
         params.disableExecution,
       );
-      const threadStartResult = await requestWithFallbacks({
+      const threadStartResult = await this.startHelperThread({
         client: this.connection,
         methods: ["thread/start"],
         payloads: [
@@ -10482,7 +10500,6 @@ export class CodexAppServerClient {
           threadId: helperThreadId,
         });
       }
-      this.helperThreadIds.add(helperThreadId);
       this.helperThreadPredicates.set(helperThreadId, helperPredicate);
       if (params.onToolCall) {
         // Registered only after the attestation above proves this thread has
@@ -10604,6 +10621,26 @@ export class CodexAppServerClient {
         this.helperToolTurnThreadIds.delete(helperThreadId);
         this.noteLiveTurnActivity();
       }
+    }
+  }
+
+  private async startHelperThread(
+    params: Parameters<typeof requestWithFallbacks>[0],
+  ): Promise<unknown> {
+    let resolveStarted!: (threadId: string | undefined) => void;
+    const started = new Promise<string | undefined>((resolve) => { resolveStarted = resolve; });
+    this.pendingHelperThreadStarts.add(started);
+    let threadId: string | undefined;
+    try {
+      const result = await requestWithFallbacks(params);
+      threadId = extractThreadIdFromValue(result);
+      // Own notifications before instruction validation and MCP attestation
+      // await further RPCs. Tool handlers still require successful attestation.
+      if (threadId) this.helperThreadIds.add(threadId);
+      return result;
+    } finally {
+      resolveStarted(threadId);
+      this.pendingHelperThreadStarts.delete(started);
     }
   }
 

@@ -150,6 +150,7 @@ class MockTransport implements JsonRpcTransport {
     }
   };
   static turnStartPreResponseNotification: unknown | null = null;
+  static preResponseNotificationsByMethod = new Map<string, unknown[]>();
   static turnInterruptResult: TurnInterruptResponse = {};
   static reviewStartResult: unknown = {
     reviewThreadId: "thread-2",
@@ -272,6 +273,10 @@ class MockTransport implements JsonRpcTransport {
       method?: string;
       params?: Record<string, unknown>;
     };
+
+    for (const notification of MockTransport.preResponseNotificationsByMethod.get(payload.method ?? "") ?? []) {
+      this.messageHandler(JSON.stringify(notification));
+    }
 
     if (payload.method?.startsWith("thread/realtime/")) {
       this.messageHandler(JSON.stringify({ id: payload.id, result: {} }));
@@ -1886,6 +1891,7 @@ describe("CodexAppServerClient", () => {
       }
     };
     MockTransport.turnStartPreResponseNotification = null;
+    MockTransport.preResponseNotificationsByMethod.clear();
     MockTransport.reviewStartResult = {
       reviewThreadId: "thread-2",
       turn: {
@@ -2846,6 +2852,57 @@ describe("CodexAppServerClient", () => {
       await client.close();
     }
   });
+
+  it.each([
+    ["turn/started", 1], ["thread/status/changed", 1], ["thread/pin/added", 1], ["navigation/thread/seen", 1],
+    ["thread/archived", 2], ["thread/unarchived", 2], ["thread/name/updated", 2],
+  ] as const)(
+    "budgets archived scans across %s at %i generations", async (method, generations) => {
+      const { CodexAppServerClient } = await import("../codex-app-server/client");
+      MockTransport.threadListResultBySearchTerm.set("archive-generation-budget", []);
+
+      const client = new CodexAppServerClient({ command: "codex" });
+      await client.listThreads({ enrichDirectories: false, skipArchivedMetadataRefresh: true, maxPages: 1 });
+      const transport = MockTransport.instances.at(-1)!;
+      const originalSend = transport.send.bind(transport);
+      const send = (message: string) => {
+        const request = JSON.parse(message);
+        const previousCursor = MockTransport.threadListNextCursor;
+        if (request.method === "thread/list") MockTransport.threadListNextCursor = request.params.cursor ? undefined : "last-page";
+        try { originalSend(message); } finally { MockTransport.threadListNextCursor = previousCursor; }
+      };
+      let release!: () => void;
+      let held = false;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const rpc = vi.spyOn(transport, "send").mockImplementation((message) => {
+        const request = JSON.parse(message);
+        if (request.method === "thread/list" && request.params.archived && !held) {
+          held = true;
+          void gate.then(() => send(message));
+        } else send(message);
+      });
+      const params = { archived: true, filter: "archive-generation-budget", enrichDirectories: false,
+        skipArchivedMetadataRefresh: true };
+      try {
+        const first = client.listThreads(params);
+        await vi.waitFor(() => expect(held).toBe(true));
+        transport.notify(method, { threadId: "active", threadName: "Renamed", status: { type: "active" }, turn: { id: "turn" } });
+        const second = client.listThreads(params);
+        await new Promise((resolve) => setImmediate(resolve));
+        release();
+        await Promise.all([first, second]);
+        const requests = () => rpc.mock.calls.filter(([message]) => JSON.parse(message).method === "thread/list");
+        expect(requests()).toHaveLength(generations * 2); // two cursor pages per affected generation
+        // A later explicit read still reaches the provider; no completed cache.
+        await client.listThreads(params);
+        expect(requests()).toHaveLength((generations + 1) * 2);
+      } finally {
+        release();
+        rpc.mockRestore();
+        await client.close();
+      }
+    },
+  );
 
   it("schedules one archived metadata page sequence for concurrent active listings", async () => {
     const { CodexAppServerClient } = await import("../codex-app-server/client");
@@ -12927,6 +12984,91 @@ describe("CodexAppServerClient", () => {
     await client.close();
   });
 
+  it.each(["thread/start", "mcpServerStatus/list"])(
+    "isolates helper startup warnings before the %s response without hiding interactive warnings",
+    async (method) => {
+      const { CodexAppServerClient } = await import("../codex-app-server/client");
+      MockTransport.threadStartResult = {
+        thread: { id: "thread-title-helper" },
+        instructionSources: [],
+      };
+      MockTransport.turnStartResult = {
+        turn: {
+          id: "turn-title-helper",
+          output: [{ type: "text", text: '{"title":"Fixture title"}' }],
+        },
+      };
+      const helperWarning = {
+        method: "warning",
+        params: {
+          threadId: "thread-title-helper",
+          message: "Ignoring unknown 'features' requirement 'ultrafast_mode'",
+        },
+      };
+      const interactiveWarning = {
+        method: "warning",
+        params: { threadId: "interactive-thread", message: "Interactive warning" },
+      };
+      const helperStarted = {
+        method: "thread/started",
+        params: { thread: { id: "thread-title-helper" } },
+      };
+      MockTransport.preResponseNotificationsByMethod.set(method, [helperWarning, helperStarted, interactiveWarning]);
+      const client = new CodexAppServerClient({ command: "codex", directoryResolver: async () => [] });
+      const notifications: AppServerNotification[] = [];
+      client.onNotification((notification) => { notifications.push(notification); });
+      try {
+        await expect(client.generateTitle({
+          prompt: "Name this fixture thread",
+          promptVersion: "thread-title-v1",
+          schema: { type: "object", properties: { title: { type: "string" } } },
+          schemaName: "thread_title",
+          timeoutMs: 5_000,
+        })).resolves.toMatchObject({ status: "ok", object: { title: "Fixture title" } });
+        expect(notifications).toContainEqual(interactiveWarning);
+        expect(notifications).not.toContainEqual(helperWarning);
+        expect(notifications.some((notification) => notification.method === "thread/started")).toBe(false);
+        const tracking = client as unknown as {
+          pendingHelperThreadStarts: Set<Promise<string | undefined>>;
+          helperThreadIds: Set<string>;
+        };
+        expect(tracking.pendingHelperThreadStarts.size).toBe(0);
+        expect(tracking.helperThreadIds.size).toBe(0);
+      } finally {
+        await client.close();
+      }
+    },
+  );
+
+  it("releases startup warning delivery when a helper start returns no thread ID", async () => {
+    const { CodexAppServerClient } = await import("../codex-app-server/client");
+    MockTransport.threadStartResult = {};
+    const interactiveWarning = {
+      method: "warning",
+      params: { threadId: "interactive-thread", message: "Interactive warning" },
+    };
+    MockTransport.preResponseNotificationsByMethod.set("thread/start", [interactiveWarning]);
+    const client = new CodexAppServerClient({ command: "codex", directoryResolver: async () => [] });
+    const notifications: AppServerNotification[] = [];
+    client.onNotification((notification) => { notifications.push(notification); });
+    try {
+      await expect(client.generateTitle({
+        prompt: "Name this fixture thread",
+        promptVersion: "thread-title-v1",
+        schema: { type: "object", properties: { title: { type: "string" } } },
+        schemaName: "thread_title",
+        timeoutMs: 5_000,
+      })).resolves.toMatchObject({ status: "failed", reason: "codex_title_thread_start_missing_thread_id" });
+      await vi.waitFor(() => expect(notifications).toContainEqual(interactiveWarning));
+      const tracking = client as unknown as {
+        pendingHelperThreadStarts: Set<Promise<string | undefined>>;
+      };
+      expect(tracking.pendingHelperThreadStarts.size).toBe(0);
+    } finally {
+      await client.close();
+    }
+  });
+
   it("runs the bounded helper turn when Codex retains global instructions", async () => {
     const { CodexAppServerClient } = await import("../codex-app-server/client");
     MockTransport.threadStartResult = {
@@ -15412,9 +15554,11 @@ describe("CodexAppServerClient", () => {
       expect(JSON.stringify(log.mock.calls)).not.toContain("Hello");
     }
     await client.appendRealtimeText("voice-fixture", "Check progress.");
+    await client.appendRealtimeText("voice-fixture", "[Camera observation] Neutral visible cue.", "developer");
     await client.stopRealtime("voice-fixture");
     const requests = transport.sentMessages.map((message) => JSON.parse(message));
     expect(requests).toContainEqual(expect.objectContaining({ method: "thread/realtime/appendText", params: { threadId: "voice-fixture", text: "Check progress.", role: "user" } }));
+    expect(requests).toContainEqual(expect.objectContaining({ method: "thread/realtime/appendText", params: { threadId: "voice-fixture", text: "[Camera observation] Neutral visible cue.", role: "developer" } }));
     expect(requests.some((request) => request.method === "turn/interrupt")).toBe(false);
     off();
     transport.emitInbound({ method: "thread/realtime/sdp", params: { threadId: "voice-fixture", sdp: "ignored" } });

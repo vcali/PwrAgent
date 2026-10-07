@@ -323,6 +323,12 @@ export type ComposerProps = {
   };
   /** A review this composer submitted was accepted by the backend. */
   onReviewStarted?: () => void;
+  /**
+   * Each new id puts the caret at the end of the draft, once the composer is
+   * enabled. The sidebar sends one for a pointer click on a thread row, never
+   * for keyboard activation, so keyboard users stay in the thread list.
+   */
+  focusRequestId?: number;
   launchpad?: NavigationLaunchpadDraft;
   /** Which machine the launchpad starts its thread on, and how to move it. */
   launchpadMachine?: LaunchpadMachineControl;
@@ -4011,6 +4017,24 @@ export const Composer = memo(function Composer(props: ComposerProps) {
     // The helpers are recreated each render; the id guard opens once.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.reviewRequest, props.disabled, props.thread?.id, props.thread?.source]);
+  const appliedFocusRequestId = useRef<number | undefined>(undefined);
+  useEffect(() => {
+    const requestId = props.focusRequestId;
+    if (requestId === undefined || appliedFocusRequestId.current === requestId) {
+      return;
+    }
+    // A thread that is still loading renders a disabled composer. Hold the
+    // request until it opens rather than spending it on an inert editor.
+    if (props.disabled) return;
+    appliedFocusRequestId.current = requestId;
+    const frame = requestAnimationFrame(() => {
+      const input = inputRef.current;
+      if (!input) return;
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [props.focusRequestId, props.disabled]);
   const clearComposerDraftSnapshot = (scopeKey: string): void => {
     if (isDraftStoreScope(scopeKey)) {
       draftStore.delete(scopeKey);

@@ -25,6 +25,8 @@ import type {
   DesktopCodexAuthProfileDiscoverySnapshot,
   DesktopCodexCandidateSource,
   DesktopHelperModelSettings,
+  DesktopDecisionModelSettings,
+  DecisionProviderId,
   DesktopCodexDiscoverySnapshot,
   DesktopCodexVersionAdvisory,
   DesktopCodexProfileModel,
@@ -86,6 +88,7 @@ import {
   DESKTOP_INTEGRATED_TERMINAL_WINDOWS_SHELL_DEFAULT,
   resolveDesktopUpdateSelection,
   DESKTOP_WORKTREE_STORAGE_DEFAULT,
+  MANAGED_CODEX_BUILD_CHANNEL_DEFAULT,
   MANAGED_GROK_BUILD_CHANNEL_DEFAULT,
   MAX_PR_AUTO_DISPATCH_BUDGET_CAPACITY,
   MAX_PR_AUTO_DISPATCH_BUDGET_REFILL_PER_MINUTE,
@@ -303,6 +306,7 @@ type DesktopSettingsServiceOptions = {
   defaultManagedGrokBuilds?: boolean;
   retainCachedCodexCommand?: (command: string) => Promise<void>;
   ensureManagedCodexRuntime?: (options: {
+    channel: DesktopUpdateChannel;
     checkMode: ManagedCodexCheckMode;
     signal?: AbortSignal;
     waitForUpdate?: boolean;
@@ -387,6 +391,21 @@ function isManagedCodexWanted(
   managedBuilds: boolean,
 ): boolean {
   return tokenMiserEnabled || managedBuilds;
+}
+
+/** What each track resolved to at the last release check, for the track control. */
+function managedCodexTrackTags(runtime: ManagedCodexRuntime): {
+  latestTag?: string;
+  prereleaseTag?: string;
+} {
+  return {
+    ...(runtime.metadata.latestTag
+      ? { latestTag: runtime.metadata.latestTag }
+      : {}),
+    ...(runtime.metadata.prereleaseTag
+      ? { prereleaseTag: runtime.metadata.prereleaseTag }
+      : {}),
+  };
 }
 
 function codexDiscoveryFromProvider(
@@ -784,6 +803,16 @@ export class DesktopSettingsService {
       undefined,
       secretStorage.available,
     );
+    const decisionLocalApiKey = await this.readSecretState(
+      "decisionLocalApiKey",
+      undefined,
+      secretStorage.available,
+    );
+    const typesafeJevApiKey = await this.readSecretState(
+      "typesafeJevApiKey",
+      undefined,
+      secretStorage.available,
+    );
     const managedCodexRuntime = this.managedCodexRuntime;
     const managedCodexError = this.managedCodexError;
     const codexDiscoveryCommand = this.resolveActiveCodexCommand(config);
@@ -869,48 +898,28 @@ export class DesktopSettingsService {
       configPath: this.configPath,
       configError: error,
       runtime: {
-        tokenMiser: tokenMiserActivation
-          ? {
-              activation: tokenMiserActivation,
-              ...(managedCodexRuntime
-                ? {
-                    managedCodex: {
-                      state: this.managedCodexRuntimeSwitchPending
-                        ? "pending-switch" as const
-                        : "ready" as const,
-                      version: managedCodexRuntime.metadata.version,
-                      checkedAt: managedCodexRuntime.metadata.checkedAt,
-                    },
-                  }
-                : managedCodexError
-                  ? {
-                      managedCodex: {
-                        state: "unavailable" as const,
-                        reason: managedCodexError,
-                      },
-                    }
-                  : {}),
-            }
-          : {
-              ...(managedCodexRuntime
-                ? {
-                    managedCodex: {
-                      state: this.managedCodexRuntimeSwitchPending
-                        ? "pending-switch" as const
-                        : "ready" as const,
-                      version: managedCodexRuntime.metadata.version,
-                      checkedAt: managedCodexRuntime.metadata.checkedAt,
-                    },
-                  }
-                : managedCodexError
-                  ? {
-                      managedCodex: {
-                        state: "unavailable" as const,
-                        reason: managedCodexError,
-                      },
-                    }
-                  : {}),
-            },
+        tokenMiser: {
+          ...(tokenMiserActivation ? { activation: tokenMiserActivation } : {}),
+          ...(managedCodexRuntime
+            ? {
+                managedCodex: {
+                  state: this.managedCodexRuntimeSwitchPending
+                    ? "pending-switch" as const
+                    : "ready" as const,
+                  version: managedCodexRuntime.metadata.version,
+                  checkedAt: managedCodexRuntime.metadata.checkedAt,
+                  ...managedCodexTrackTags(managedCodexRuntime),
+                },
+              }
+            : managedCodexError
+              ? {
+                  managedCodex: {
+                    state: "unavailable" as const,
+                    reason: managedCodexError,
+                  },
+                }
+              : {}),
+        },
         tokenMiserDiagnosticsDirectory: path.join(
           this.tokenMiserStateDir(),
           TOKEN_MISER_DIAGNOSTICS_DIRNAME,
@@ -1056,6 +1065,10 @@ export class DesktopSettingsService {
             config.general?.appearance?.themedDockIcon,
             true,
           ),
+          terminalMinimumContrast: this.resolveConfigBoolean(
+            config.general?.appearance?.terminalMinimumContrast,
+            false,
+          ),
           density: this.resolveAppearanceDensity(
             config.general?.appearance?.density,
           ),
@@ -1142,6 +1155,12 @@ export class DesktopSettingsService {
           config.experimental?.codexSkillQuestionsWarningDismissed,
           false,
         ),
+        codexConfigWarningsDismissed: {
+          value: config.experimental?.codexConfigWarningsDismissed ?? [],
+          source: config.experimental?.codexConfigWarningsDismissed === undefined
+            ? "default"
+            : "config",
+        },
         managedReview: this.resolveConfigBoolean(
           config.experimental?.managedReview,
           false,
@@ -1538,6 +1557,8 @@ export class DesktopSettingsService {
         providerThreadMigrations:
           config.models?.providerThreadMigrations ?? {},
         helperModels: config.models?.helperModels ?? { helpers: {} },
+        decisionModels: config.models?.decisionModels ?? {},
+        decisionSecrets: { localApiKey: decisionLocalApiKey, jevApiKey: typesafeJevApiKey },
         codex: {
           path: this.resolveString(config.models?.codex?.path, CODEX_COMMAND_ENV),
           profile: this.resolveConfigString(config.models?.codex?.profile),
@@ -1557,6 +1578,13 @@ export class DesktopSettingsService {
             config.models?.codex?.managedBuilds,
             false,
           ),
+          managedBuildChannel: {
+            value: config.models?.codex?.managedBuildChannel
+              ?? MANAGED_CODEX_BUILD_CHANNEL_DEFAULT,
+            source: config.models?.codex?.managedBuildChannel === undefined
+              ? "default"
+              : "config",
+          },
           ...(this.options.ensureManagedCodexRuntime
             && this.resolveTokenMiserEnabled()
             ? { managedBuildsRequiredBy: "token-miser" as const }
@@ -2055,6 +2083,12 @@ export class DesktopSettingsService {
     );
   }
 
+  /** Which pwrdrvr/codex track the managed runtime follows. */
+  resolveManagedCodexBuildChannel(): DesktopUpdateChannel {
+    return this.configStore.read("models").codex?.managedBuildChannel
+      ?? MANAGED_CODEX_BUILD_CHANNEL_DEFAULT;
+  }
+
   resolveTokenMiserFocusedSummariesEnabled(): boolean {
     return this.configStore.read("experimental").tokenMiserFocusedSummariesEnabled
       ?? false;
@@ -2174,6 +2208,14 @@ export class DesktopSettingsService {
     const managedCodexPatched =
       patch.experimental?.tokenMiserEnabled !== undefined
       || patch.models?.codex?.managedBuilds !== undefined;
+    // A new track while the build stays on: install that track's build now,
+    // even when it is a step back from what is running. Moving from
+    // Prerelease to Latest is a downgrade on purpose. Enabling installs the
+    // saved track before the write lands, so it does not need a second check.
+    const switchingManagedCodexTrack =
+      patch.models?.codex?.managedBuildChannel !== undefined
+      && managedCodexAfter
+      && !enablingManagedCodex;
     // The switch is a transaction from the operator's perspective: acquire a
     // usable managed Codex first, then persist availability. A failed first
     // install leaves the feature off instead of selecting an arbitrary Codex.
@@ -2182,7 +2224,11 @@ export class DesktopSettingsService {
         "settings-user-action",
         "setup-user-action",
       ]);
-      await this.ensureManagedCodexRuntime("force");
+      // Install the track this write saves, not the one it replaces.
+      await this.ensureManagedCodexRuntime("force", {
+        channel: patch.models?.codex?.managedBuildChannel
+          ?? this.resolveManagedCodexBuildChannel(),
+      });
     }
     if (disablingManagedCodex) {
       this.abortManagedCodexUpdate();
@@ -2237,7 +2283,11 @@ export class DesktopSettingsService {
     }
     if (
       discoveryPermit
-      && (patch.models?.codex?.path !== undefined || disablingManagedCodex)
+      && (
+        patch.models?.codex?.path !== undefined
+        || disablingManagedCodex
+        || switchingManagedCodexTrack
+      )
     ) {
       // Saving a path (including auto discovery) changes the executable.
       // Validate and publish its selection before returning the write snapshot,
@@ -2994,6 +3044,16 @@ export class DesktopSettingsService {
     return this.readModelsConfig().helperModels ?? { helpers: {} };
   }
 
+  resolveDecisionModelSettings(): DesktopDecisionModelSettings {
+    return this.readModelsConfig().decisionModels ?? {};
+  }
+
+  async resolveDecisionApiKey(provider: DecisionProviderId): Promise<string | undefined> {
+    return await this.options.secretStore.getSecret(
+      provider === "local" ? "decisionLocalApiKey" : "typesafeJevApiKey",
+    );
+  }
+
   resolveCodexConfigOverrides(): string[] {
     const status = this.configStore.fileStatus();
     if (status.kind === "invalid" && status.serving === "defaults") {
@@ -3198,6 +3258,8 @@ export class DesktopSettingsService {
       return undefined;
     }
     return await this.ensureManagedCodexRuntime(checkMode, {
+      channel: config.models?.codex?.managedBuildChannel
+        ?? MANAGED_CODEX_BUILD_CHANNEL_DEFAULT,
       signal: options.signal ?? this.resolveManagedCodexUpdateSignal(),
       ...(options.waitForUpdate !== undefined
         ? { waitForUpdate: options.waitForUpdate }
@@ -3208,14 +3270,16 @@ export class DesktopSettingsService {
   private async ensureManagedCodexRuntime(
     checkMode: ManagedCodexCheckMode,
     options: {
+      channel: DesktopUpdateChannel;
       signal?: AbortSignal;
       waitForUpdate?: boolean;
-    } = {},
+    },
   ): Promise<ManagedCodexRuntime> {
     if (!this.options.ensureManagedCodexRuntime) {
       throw new Error("Managed Codex installation is unavailable.");
     }
     const runtime = await this.options.ensureManagedCodexRuntime({
+      channel: options.channel,
       checkMode,
       ...(options.signal ? { signal: options.signal } : {}),
       ...(options.waitForUpdate !== undefined
@@ -4247,6 +4311,8 @@ function secretEnvironmentKey(
     case "federationCloudflareAccessClientSecret":
     case "pwrsnapMcpCredential":
     case "pwrgitMcpCredential":
+    case "decisionLocalApiKey":
+    case "typesafeJevApiKey":
       return undefined;
   }
 }

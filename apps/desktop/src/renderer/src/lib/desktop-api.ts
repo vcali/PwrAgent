@@ -491,6 +491,10 @@ import type {
   ReadMarkdownFileViewerSnapshotResponse,
   OpenDesktopPwrAgentProfileRequest,
   OpenDesktopPwrAgentProfileResponse,
+  ReorderDesktopPwrAgentProfilesRequest,
+  ReorderDesktopPwrAgentProfilesResponse,
+  SetDesktopPwrAgentProfileMenuVisibilityRequest,
+  SetDesktopPwrAgentProfileMenuVisibilityResponse,
   ReadDesktopSettingsRequest,
   ReadDesktopSettingsResponse,
   DesktopTokenMiserUsage,
@@ -549,7 +553,7 @@ import type { RuntimeIdentity } from "../../../shared/runtime-identity";
 import type { WindowPointerSnapshot } from "../../../shared/window-pointer";
 import type { WindowShowThreadRequest } from "../../../shared/window-show-thread";
 import type { AppMenuTopLevel, AppMenuPopupRequest } from "../../../shared/app-menu";
-import type { WindowControlAction } from "../../../shared/ipc";
+import type { WindowControlAction, WindowOpenMainViewRequest } from "../../../shared/ipc";
 import type {
   AppChangelogDocument,
   AppLogEntry,
@@ -719,6 +723,13 @@ export type DesktopApi = Partial<NativeVoiceApi> & {
   setPwrAgentProfileCodexProfile?: (
     request: SetDesktopPwrAgentProfileCodexProfileRequest,
   ) => Promise<SetDesktopPwrAgentProfileCodexProfileResponse>;
+  /** Rejects a stale order: one that does not name exactly the current set. */
+  reorderPwrAgentProfiles?: (
+    request: ReorderDesktopPwrAgentProfilesRequest,
+  ) => Promise<ReorderDesktopPwrAgentProfilesResponse>;
+  setPwrAgentProfileMenuVisibility?: (
+    request: SetDesktopPwrAgentProfileMenuVisibilityRequest,
+  ) => Promise<SetDesktopPwrAgentProfileMenuVisibilityResponse>;
   /** Graduate ONLY the bootstrap profile's `config.toml` to the
    *  target real profile (theme, density, messaging acknowledgment,
    *  etc). Does NOT graduate secrets — call `writeSecretsToProfile`
@@ -1678,7 +1689,14 @@ export type DesktopApi = Partial<NativeVoiceApi> & {
    * unsubscribe function.
    */
   onOpenSettingsRequested?: (
-    callback: (section?: string) => void,
+    callback: (section?: string, subsection?: string) => void,
+  ) => () => void;
+  /**
+   * Main → renderer push: fires from View → Search Threads and View →
+   * Automations, naming the screen to show.
+   */
+  onOpenMainViewRequested?: (
+    callback: (view: WindowOpenMainViewRequest) => void,
   ) => () => void;
   /**
    * Main → renderer push: fires when the user invokes File → New Thread
@@ -1701,7 +1719,7 @@ export type DesktopApi = Partial<NativeVoiceApi> & {
    * without flipping the persisted `onboarding.completed` flag.
    */
   onReplayOnboardingRequested?: (callback: () => void) => () => void;
-  /** Main → renderer push from Help → Copy Local Diagnostics Info. */
+  /** Main → renderer push from Help → Copy Diagnostics Info. */
   onCopyLocalDiagnosticsInfoRequested?: (callback: () => void) => () => void;
   getWindowPointerSnapshot?: () => Promise<WindowPointerSnapshot>;
   /**

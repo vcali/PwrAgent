@@ -1,3 +1,7 @@
+import {
+  NATIVE_VOICE_CAMERA_CHANNEL, NATIVE_VOICE_CAMERA_FRAME_CHANNEL, NATIVE_VOICE_CAMERA_CUE_CHANNEL, NATIVE_VOICE_CAMERA_REPEAT_CHANNEL,
+  type VoiceCameraRequest, type VoiceCameraFrame, type VoiceCameraCue, type VoiceCameraRepeatCheck,
+} from "../shared/native-voice-camera";
 import type {
   ListBackgroundTerminalsRequest,
   ListBackgroundTerminalsResponse,
@@ -444,6 +448,10 @@ import type {
   ReadMarkdownFileViewerSnapshotResponse,
   OpenDesktopPwrAgentProfileRequest,
   OpenDesktopPwrAgentProfileResponse,
+  ReorderDesktopPwrAgentProfilesRequest,
+  ReorderDesktopPwrAgentProfilesResponse,
+  SetDesktopPwrAgentProfileMenuVisibilityRequest,
+  SetDesktopPwrAgentProfileMenuVisibilityResponse,
   ReadFederationActivityRequest,
   ReadFederationActivityResponse,
   ReadFederationHealthRequest,
@@ -531,7 +539,7 @@ import type {
   UpdateThreadExpectedBranchResponse,
   WriteDesktopSettingsConfigRequest,
 } from "@pwragent/shared";
-import type { WindowControlAction } from "../shared/ipc";
+import type { WindowControlAction, WindowOpenMainViewRequest } from "../shared/ipc";
 import type { StarMapIntakeDispatchRequest } from "../shared/star-map-intake";
 import type { RendererErrorReport } from "../shared/renderer-error";
 import type { RendererDiagnosticLogRequest } from "../shared/renderer-diagnostic";
@@ -918,8 +926,10 @@ import {
   PROFILES_GRADUATE_BOOTSTRAP_CONFIG_CHANNEL,
   PROFILES_LIST_CHANNEL,
   PROFILES_OPEN_CHANNEL,
+  PROFILES_REORDER_CHANNEL,
   PROFILES_SET_CODEX_PROFILE_CHANNEL,
   PROFILES_SET_DEFAULT_CHANNEL,
+  PROFILES_SET_MENU_VISIBILITY_CHANNEL,
   PROFILES_WRITE_SECRETS_CHANNEL,
   RENDERER_ERROR_REPORT_CHANNEL,
   RUNTIME_IDENTITY_CHANNEL,
@@ -959,6 +969,7 @@ import {
   WINDOW_FULLSCREEN_SYNC_CHANNEL,
   WINDOW_CONTROL_CHANNEL,
   WINDOW_FRAME_SYNC_CHANNEL,
+  WINDOW_OPEN_MAIN_VIEW_CHANNEL,
   WINDOW_OPEN_NEW_THREAD_CHANNEL,
   WINDOW_OPEN_SETTINGS_CHANNEL,
   WINDOW_POINTER_SNAPSHOT_CHANNEL,
@@ -1091,6 +1102,10 @@ const desktopApi = Object.freeze({
   nativeVoiceCapability: () => ipcRenderer.invoke(NATIVE_VOICE_CAPABILITY_CHANNEL),
   startNativeVoice: (request: NativeVoiceStart) => ipcRenderer.invoke(NATIVE_VOICE_START_CHANNEL, request),
   stopNativeVoice: (request: NativeVoiceTarget) => ipcRenderer.invoke(NATIVE_VOICE_STOP_CHANNEL, request),
+  sendNativeVoiceCameraCue: (request: VoiceCameraCue) => ipcRenderer.invoke(NATIVE_VOICE_CAMERA_CUE_CHANNEL, request),
+  setNativeVoiceCamera: (request: VoiceCameraRequest) => ipcRenderer.invoke(NATIVE_VOICE_CAMERA_CHANNEL, request),
+  analyzeNativeVoiceCamera: (request: VoiceCameraFrame) => ipcRenderer.invoke(NATIVE_VOICE_CAMERA_FRAME_CHANNEL, request),
+  checkNativeVoiceCameraRepeat: (request: VoiceCameraRepeatCheck) => ipcRenderer.invoke(NATIVE_VOICE_CAMERA_REPEAT_CHANNEL, request),
   sendNativeVoiceText: (request: NativeVoiceText) => ipcRenderer.invoke(NATIVE_VOICE_TEXT_CHANNEL, request),
   openVoiceManager: (): Promise<OpenVoiceManagerResponse> => ipcRenderer.invoke(NATIVE_VOICE_OPEN_MANAGER_CHANNEL),
   publishOperatorFocus: (focus: OperatorFocusSnapshot): Promise<void> => ipcRenderer.invoke(OPERATOR_FOCUS_PUBLISH_CHANNEL, focus),
@@ -1377,6 +1392,14 @@ const desktopApi = Object.freeze({
     request: SetDesktopPwrAgentProfileCodexProfileRequest,
   ): Promise<SetDesktopPwrAgentProfileCodexProfileResponse> =>
     await ipcRenderer.invoke(PROFILES_SET_CODEX_PROFILE_CHANNEL, request),
+  reorderPwrAgentProfiles: async (
+    request: ReorderDesktopPwrAgentProfilesRequest,
+  ): Promise<ReorderDesktopPwrAgentProfilesResponse> =>
+    await ipcRenderer.invoke(PROFILES_REORDER_CHANNEL, request),
+  setPwrAgentProfileMenuVisibility: async (
+    request: SetDesktopPwrAgentProfileMenuVisibilityRequest,
+  ): Promise<SetDesktopPwrAgentProfileMenuVisibilityResponse> =>
+    await ipcRenderer.invoke(PROFILES_SET_MENU_VISIBILITY_CHANNEL, request),
   graduateBootstrapConfigToProfile: async (
     request: GraduateDesktopBootstrapConfigToProfileRequest,
   ): Promise<GraduateDesktopBootstrapConfigToProfileResponse> =>
@@ -2723,15 +2746,36 @@ const desktopApi = Object.freeze({
     };
   },
   onOpenSettingsRequested: (
-    callback: (section?: string) => void,
+    callback: (section?: string, subsection?: string) => void,
   ): (() => void) => {
     // Main → renderer push from the PwrAgent → Settings… menu item.
     // App.tsx subscribes and switches `mainView` to "settings".
-    const listener = (_event: Electron.IpcRendererEvent, section?: unknown) =>
-      callback(typeof section === "string" ? section : undefined);
+    const listener = (
+      _event: Electron.IpcRendererEvent,
+      section?: unknown,
+      subsection?: unknown,
+    ) =>
+      callback(
+        typeof section === "string" ? section : undefined,
+        typeof subsection === "string" ? subsection : undefined,
+      );
     ipcRenderer.on(WINDOW_OPEN_SETTINGS_CHANNEL, listener);
     return () => {
       ipcRenderer.off(WINDOW_OPEN_SETTINGS_CHANNEL, listener);
+    };
+  },
+  onOpenMainViewRequested: (
+    callback: (view: WindowOpenMainViewRequest) => void,
+  ): (() => void) => {
+    // Main → renderer push from View → Search Threads / View → Automations.
+    const listener = (_event: Electron.IpcRendererEvent, view: unknown) => {
+      if (view === "automations" || view === "search") {
+        callback(view);
+      }
+    };
+    ipcRenderer.on(WINDOW_OPEN_MAIN_VIEW_CHANNEL, listener);
+    return () => {
+      ipcRenderer.off(WINDOW_OPEN_MAIN_VIEW_CHANNEL, listener);
     };
   },
   onOpenNewThreadRequested: (callback: () => void): (() => void) => {

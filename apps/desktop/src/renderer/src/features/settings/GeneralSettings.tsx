@@ -277,6 +277,7 @@ export function GeneralSettings(props: {
   onPastedImageMaxPatchesChange: (value: number) => Promise<void>;
   onNotificationsEnabledChange: (value: boolean) => Promise<void>;
   onThemedDockIconChange: (value: boolean) => Promise<void>;
+  onTerminalMinimumContrastChange: (value: boolean) => Promise<void>;
   onClearMessagingAcknowledgment: () => Promise<void>;
 }) {
   const pastedImageMaxPatches =
@@ -300,6 +301,8 @@ export function GeneralSettings(props: {
   const pdfAnalysisEnabled = props.snapshot.general.pdfAnalysisEnabled;
   const notificationsEnabled = props.snapshot.general.notificationsEnabled;
   const themedDockIcon = props.snapshot.general.appearance.themedDockIcon;
+  const terminalMinimumContrast =
+    props.snapshot.general.appearance.terminalMinimumContrast;
   const messagingAcknowledgment =
     props.snapshot.general.messagingAcknowledgment;
   const activeOption = PASTED_IMAGE_PATCH_OPTIONS.find(
@@ -412,12 +415,22 @@ export function GeneralSettings(props: {
                 ) : null
               }
             />
+            <ToggleField
+              checked={terminalMinimumContrast.value}
+              disabled={props.saving}
+              label="Raise low-contrast terminal text"
+              sub="Lightens or darkens terminal text that falls below 4.5:1 on its background. Off shows each theme's ANSI colors as published, faint ones included."
+              source={sourceBadge(terminalMinimumContrast)}
+              onChange={(next) => {
+                return props.onTerminalMinimumContrastChange(next);
+              }}
+            />
             {props.desktopApi?.platform === "darwin" ? (
               <ToggleField
                 checked={themedDockIcon.value}
                 disabled={props.saving}
                 label="Match Dock icon to theme"
-                sub="While PwrAgent runs, its Dock icon wears the dark theme, so instances on different profiles are easy to tell apart."
+                sub="While PwrAgent runs, its Dock icon wears the theme on screen, light or dark, so instances on different profiles are easy to tell apart."
                 source={sourceBadge(themedDockIcon)}
                 onChange={(next) => {
                   return props.onThemedDockIconChange(next);

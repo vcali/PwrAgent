@@ -125,6 +125,12 @@ import type { HistoryNavControls } from "../chrome/HistoryNavButtons";
 import type { MastheadActionsProps } from "../chrome/MastheadActions";
 import { ThreadFindBar } from "./ThreadFindBar";
 import { ThreadHeader, type StarMapToggleControls } from "./ThreadHeader";
+import type { ThreadHeaderProject } from "./ThreadHeaderProjectCrumb";
+import type { FederationThreadTarget } from "../chrome/federation-thread-targets";
+import type {
+  CheckFederationTargetProject,
+  FederationProjectDirectory,
+} from "../chrome/useFederationProjectStates";
 import { ThreadWarnings } from "./ThreadWarnings";
 import { ThreadPlaceholderHeader } from "./ThreadPlaceholderHeader";
 import { ImageLightbox } from "./ImageLightbox";
@@ -880,6 +886,18 @@ export type ThreadViewProps = {
    */
   onOpenPluginSettings?: () => void;
   onRevealSelectedThreadInList?: () => void;
+  /** Show the breadcrumb's project in the Directories lens. */
+  onRevealSelectedProjectInList?: (directory: NavigationDirectorySummary) => void;
+  /** What the breadcrumb's project caret offers. */
+  projectThreadActions?: {
+    onCreateThread: (directory: NavigationDirectorySummary) => void;
+    federationTargets: readonly FederationThreadTarget[];
+    checkFederationTargetProject?: CheckFederationTargetProject;
+    onCreateThreadOnFederationTarget: (
+      instanceId: string,
+      directory: FederationProjectDirectory,
+    ) => void;
+  };
   /**
    * Window-level layout state (owned by App). The context rail pin +
    * active tab and the left-sidebar hide toggle are window preferences,
@@ -932,6 +950,8 @@ export type ThreadViewProps = {
   onLinkedMessageHandled?: () => void;
   /** Bumped on each ⌘F so an already-open bar pulls focus back to its field. */
   findFocusNonce?: number;
+  /** Changes when the operator clicked this thread's sidebar row; the composer takes focus. */
+  composerFocusRequestId?: number;
   onLoadOlder: () => Promise<void>;
   onArchiveThread?: (thread: NavigationThreadSummary) => Promise<void>;
   onRefreshNavigation?: () => Promise<void>;
@@ -3710,6 +3730,7 @@ export function ThreadView(props: ThreadViewProps) {
           replySubmission: asyncQuestionReply,
           onReplySubmissionSettled: handleReplySubmissionSettled,
           reviewRequest: todoReviewRequest,
+          focusRequestId: props.composerFocusRequestId,
           onReviewStarted: handleReviewStarted,
           workspaceActionsBlocked: props.workspaceActionsBlocked,
           contextWindow: props.contextWindow,
@@ -3884,6 +3905,44 @@ export function ThreadView(props: ThreadViewProps) {
     history: props.historyNav,
     starMap: props.starMap,
   };
+  // Only a project the thread list shows is a link. A remote thread whose
+  // project has no local counterpart still names it, as plain text.
+  // `selectedDirectory` waits for the selected thread's detail, so until it
+  // arrives the row's primary project is looked up the same way, by key. The
+  // link and its caret are then there from the first frame, instead of
+  // appearing a request later and pushing the title right.
+  const rowPrimaryDirectory = selectedThread?.linkedDirectories[0];
+  const rowPrimaryDirectoryKey = rowPrimaryDirectory
+    ? classifyDirectory(rowPrimaryDirectory).key
+    : undefined;
+  const headerDirectory = props.selectedDirectory
+    ?? (rowPrimaryDirectoryKey
+      ? props.directories?.find((directory) => directory.key === rowPrimaryDirectoryKey)
+      : undefined);
+  const onRevealSelectedProjectInList = props.onRevealSelectedProjectInList;
+  const projectThreadActions = props.projectThreadActions;
+  const headerProject: ThreadHeaderProject | undefined =
+    headerDirectory && onRevealSelectedProjectInList && projectThreadActions
+      ? {
+          directoryKey: headerDirectory.key,
+          onReveal: () => onRevealSelectedProjectInList(headerDirectory),
+          onCreateThread: () => projectThreadActions.onCreateThread(headerDirectory),
+          ...(projectThreadActions.federationTargets.length > 0
+            ? {
+                federation: {
+                  directory: headerDirectory,
+                  targets: projectThreadActions.federationTargets,
+                  check: projectThreadActions.checkFederationTargetProject,
+                  onCreateThread: (instanceId: string) =>
+                    projectThreadActions.onCreateThreadOnFederationTarget(
+                      instanceId,
+                      headerDirectory,
+                    ),
+                },
+              }
+            : {}),
+        }
+      : undefined;
   const header = pendingForkEnvironmentSetup ? (
     <ThreadPlaceholderHeader
       {...headerChrome}
@@ -3915,14 +3974,13 @@ export function ThreadView(props: ThreadViewProps) {
       hasApprovalRequest={Boolean(props.pendingRequest)}
       machine={props.threadMachine}
       projectLabel={
-        props.selectedDirectory?.label
-        // A remote-pinned thread whose project has no local counterpart
-        // belongs to no local directory summary; the breadcrumb still
-        // shows the owner-reported project name.
-        ?? (selectedThread?.federation
-          ? selectedThread.linkedDirectories?.[0]?.label
-          : undefined)
+        headerDirectory?.label
+        // Navigation rows already carry the primary project name. Keep it
+        // visible while selected detail or its directory summary is loading,
+        // including remote projects with no local directory counterpart.
+        ?? rowPrimaryDirectory?.label
       }
+      project={headerProject}
       thread={selectedThread!}
       backends={props.backends}
       onRevealSelectedThreadInList={props.onRevealSelectedThreadInList}

@@ -130,6 +130,31 @@ The integrated terminal has its own canvas and ANSI tokens. The ANSI values
 mirror VS Code's light/dark defaults so common shell output remains readable
 when the app theme changes.
 
+xterm takes its palette as values, not as CSS, so `IntegratedTerminal` rereads
+these tokens whenever `data-theme` or `data-color-theme` changes on `<html>`.
+The pane's background follows the theme through CSS either way; before the
+reread, a terminal opened under a dark theme kept dark-theme text on the
+light canvas after a scheme change.
+
+Settings → General → Appearance → **Raise low-contrast terminal text**
+(`[general.appearance] terminal_minimum_contrast`, off by default) sets
+xterm's `minimumContrastRatio` to 4.5. xterm then lightens or darkens any
+cell's text that falls below 4.5:1 on that cell's own background, in every
+theme, as it draws. It skips powerline and box-drawing glyphs, so prompt
+segments stay seamless. It is off by default because it changes how the
+published Catppuccin and Solarized ANSI colors render.
+
+The terminal's font stack is `--font-mono` plus one installed Nerd Font,
+found with the Local Font Access API (`lib/nerd-font-fallback.ts`). Shell
+prompts draw their icons from Nerd Font private-use codepoints, which no font
+in `--font-mono` carries, and Chromium does not fall back to a system font
+for a private-use glyph on its own. The Nerd Font goes just ahead of the
+generic `monospace`, so Geist Mono still draws every glyph it has and sets
+the cell size. A glyph Geist Mono lacks now comes from the Nerd Font rather
+than the system monospace (Menlo on macOS). The lookup takes about 1.5s, so
+the first terminal in a window opens without it and picks it up when it
+returns. A machine with no Nerd Font keeps `--font-mono` unchanged.
+
 | Token | Dark | Light |
 |---|---|---|
 | `--terminal-bg` | `#000000` | `#ffffff` |
@@ -196,7 +221,7 @@ The light block is **not** uniformly AA-clean. These predate the accent retune a
 | Token / pair | Worst-case | Rules |
 |---|---|---|
 | `--accent` on `--accent-soft` | 3.88–4.39 | 7 (6 onboarding wizard + `.launchpad-pending__status`) — should move to `--accent-bright` |
-| `--status-warning` `#a86b00` | 3.87:1 | 16 `color:` rules — move text to `--status-warning-text` |
+| `--status-warning` `#a86b00` | 3.87:1 | 0 `color:` rules — text reads `--status-warning-text`, and `theme-contract.test.tsx` fails on a `color:` that reads `--status-warning` |
 | `--info-teal` `#0e9b95` | 3.01:1 | 1 |
 | `--text-subtle` `rgba(26,22,18,.42)` | 2.38:1 | 3 |
 | `--status-ok` `#2e7d3c` | 4.49:1 | 2 (marginal) |
@@ -231,7 +256,9 @@ The light block is **not** uniformly AA-clean. These predate the accent retune a
 `--status-warning` is for dots, strokes, and meters. Use `--status-warning-text`
 when the warning is something read: a figure, a sentence, or a chip label. Its
 light value is the `--savings-over` amber, at least 4.5:1 on every light
-surface. The usage pace sentence and the Pricing rail's pace card use it.
+surface. Every warning `color:` rule reads it, and the theme contract test
+fails on one that reads `--status-warning`. Every theme except Tangerine light
+aliases the two, so only Tangerine light shows the difference.
 
 #### Token Miser verdict
 
@@ -363,6 +390,9 @@ because they need 3:1 on the surface with no ink to carry them.
 The integrated terminal keeps each palette's own ANSI colors, even below AA
 on its canvas. Programs pick ANSI colors without knowing the background,
 and the terminal is where operators compare PwrAgent with their own setup.
+An operator who wants readability over fidelity turns on **Raise
+low-contrast terminal text** (see Integrated Terminal above); the palettes
+themselves do not change.
 
 Per theme:
 
@@ -390,7 +420,11 @@ Per theme:
 - **Gray** and **Blue** are PwrAgent designs, and keep their designed values
   wherever those already clear the floor. Blue is an explicit product
   choice. Its navy surfaces stay low-saturation, so the anti-pattern below
-  against saturated navy dashboards still holds.
+  against saturated navy dashboards still holds. With no upstream terminal
+  to match, each sets its own ANSI colors rather than borrowing Tangerine's,
+  which are tuned for pure black and pure white. Every color clears 4.5:1 on
+  its canvas except the one drawn as a background: black in Dark, bright
+  white in Light.
 - **Phosphor** is a PwrAgent design after a green-phosphor CRT terminal, and
   an explicit product request. Its accent and terminal ink are phosphor
   green `#00ff41`, on green-tinted near-black surfaces, with red for danger
