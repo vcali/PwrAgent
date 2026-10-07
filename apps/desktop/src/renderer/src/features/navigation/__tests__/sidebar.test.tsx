@@ -403,6 +403,39 @@ afterEach(() => {
 });
 
 describe("Sidebar", () => {
+  it("asks for composer focus on a pointer click but not on keyboard activation", () => {
+    const onSelectThread = vi.fn();
+    render(
+      <Sidebar
+        backends={backends}
+        browseMode="recents"
+        directories={directories}
+        inboxThreads={[sharedThread]}
+        loaded
+        loading={false}
+        threads={[sharedThread]}
+        onBrowseModeChange={() => undefined}
+        onCreateThread={async () => undefined}
+        onOpenLaunchpad={async () => undefined}
+        onSelectThread={onSelectThread}
+      />,
+    );
+    const row = screen.getByRole("button", { name: /^Cross-project cleanup/ });
+
+    // Enter or Space on a focused button dispatches a click whose detail is 0.
+    fireEvent.click(row, { detail: 0 });
+    expect(onSelectThread).toHaveBeenLastCalledWith(
+      sharedThread,
+      { focusComposer: false },
+    );
+
+    fireEvent.click(row, { detail: 1 });
+    expect(onSelectThread).toHaveBeenLastCalledWith(
+      sharedThread,
+      { focusComposer: true },
+    );
+  });
+
   it("keeps a loaded thread snapshot visible when its refresh fails", () => {
     const staleThread: NavigationThreadSummary = {
       ...sharedThread,
@@ -4887,7 +4920,7 @@ describe("Sidebar", () => {
     expect(secondButton).toHaveAttribute("aria-pressed", "true");
     expect(thirdButton).toHaveAttribute("aria-pressed", "true");
     expect(onSelectThread).toHaveBeenCalledTimes(1);
-    expect(onSelectThread).toHaveBeenCalledWith(firstThread);
+    expect(onSelectThread).toHaveBeenCalledWith(firstThread, { focusComposer: false });
 
     fireEvent.contextMenu(secondButton, { clientX: 48, clientY: 64 });
     const menu = screen.getByRole("menu", {

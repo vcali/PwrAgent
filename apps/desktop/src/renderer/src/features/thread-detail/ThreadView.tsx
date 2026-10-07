@@ -950,6 +950,8 @@ export type ThreadViewProps = {
   onLinkedMessageHandled?: () => void;
   /** Bumped on each ⌘F so an already-open bar pulls focus back to its field. */
   findFocusNonce?: number;
+  /** Changes when the operator clicked this thread's sidebar row; the composer takes focus. */
+  composerFocusRequestId?: number;
   onLoadOlder: () => Promise<void>;
   onArchiveThread?: (thread: NavigationThreadSummary) => Promise<void>;
   onRefreshNavigation?: () => Promise<void>;
@@ -3728,6 +3730,7 @@ export function ThreadView(props: ThreadViewProps) {
           replySubmission: asyncQuestionReply,
           onReplySubmissionSettled: handleReplySubmissionSettled,
           reviewRequest: todoReviewRequest,
+          focusRequestId: props.composerFocusRequestId,
           onReviewStarted: handleReviewStarted,
           workspaceActionsBlocked: props.workspaceActionsBlocked,
           contextWindow: props.contextWindow,

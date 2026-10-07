@@ -341,7 +341,16 @@ type SidebarProps = {
   onOpenProfile?: (profile: string) => Promise<void>;
   /** Opens the Usage Activity window: account limits and spend across instances. */
   onOpenUsageActivity?: () => void;
-  onSelectThread: (thread: NavigationThreadSummary) => void;
+  /**
+   * `focusComposer` is true for a pointer click on a row: the operator's next
+   * move is usually to type a reply. A keyboard activation (Enter/Space,
+   * where the click's `detail` is 0) leaves focus on the row so Tab and
+   * Shift+Tab keep walking the list.
+   */
+  onSelectThread: (
+    thread: NavigationThreadSummary,
+    options?: { focusComposer?: boolean },
+  ) => void;
   onMarkThreadsSeen?: (threads: NavigationThreadSummary[]) => Promise<void>;
   onMarkDirectoriesSeen?: (directoryKeys: string[]) => Promise<void>;
   onArchiveDirectories?: (directoryKeys: string[]) => Promise<void>;
@@ -933,7 +942,7 @@ export function Sidebar(props: SidebarProps) {
       selectionAnchorKeyRef.current = threadKey;
       selectionAnchorDirectoryKeyRef.current = row?.directoryKey;
       setSelectedThreadKeys(new Set([threadKey]));
-      props.onSelectThread(thread);
+      props.onSelectThread(thread, { focusComposer: event.detail > 0 });
       return;
     }
 

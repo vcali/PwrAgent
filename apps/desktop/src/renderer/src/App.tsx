@@ -502,6 +502,12 @@ function DesktopAppShell(props: {
     threadKey: string;
   }>();
   const messageLinkNonceRef = useRef(0);
+  // A pointer click on a sidebar thread row asks the composer for focus once
+  // that thread is showing. Keyed by thread so it cannot land on another one.
+  const [composerFocusRequest, setComposerFocusRequest] = useState<{
+    id: number;
+    threadKey: string;
+  }>();
   // Bumped on every ⌘F so an already-open find bar takes focus back.
   const [findFocusNonce, setFindFocusNonce] = useState(0);
   // Initial section for SettingsScreen — non-undefined when navigation
@@ -3457,6 +3463,10 @@ function DesktopAppShell(props: {
     findInitialQuery: threadFindInitialQuery,
     findTurnId: threadFindTurnId,
     findFocusNonce,
+    composerFocusRequestId:
+      composerFocusRequest?.threadKey === navigation.selectedThreadKey
+        ? composerFocusRequest?.id
+        : undefined,
     linkedMessageId:
       messageLinkRequest?.threadKey === navigation.selectedThreadKey
         ? messageLinkRequest?.messageId
@@ -3762,9 +3772,17 @@ function DesktopAppShell(props: {
           onOpenUsageActivity={desktopApi?.openUsageActivity
             ? () => void desktopApi.openUsageActivity?.()
             : undefined}
-          onSelectThread={(thread) => {
+          onSelectThread={(thread, options) => {
             setMainView("thread");
             navigation.selectThread(thread);
+            setComposerFocusRequest((current) =>
+              options?.focusComposer
+                ? {
+                    id: (current?.id ?? 0) + 1,
+                    threadKey: threadSummaryIdentityKey(thread),
+                  }
+                : undefined,
+            );
           }}
           threadJumpOpen={threadJump.open}
           onThreadJumpOpenChange={(open) => {

@@ -7564,6 +7564,38 @@ describe("Composer", () => {
     await waitFor(() => expect(startReview).toHaveBeenCalledWith(expect.objectContaining({ runMode, delivery: "inline" })));
   });
 
+  it("puts the caret at the end of the draft once per focus request, after the composer enables", async () => {
+    const thread: NavigationThreadSummary = {
+      id: "thread-focus-request",
+      title: "Focus",
+      titleSource: "explicit",
+      source: "codex",
+      executionMode: "default",
+      linkedDirectories: [],
+      inbox: { inInbox: false },
+    };
+    const props = { backends: [backendSummary("codex")], skills: [], thread };
+    const view = render(<Composer {...props} />);
+    const textarea = screen.getByLabelText("Reply") as HTMLInputElement;
+    fireEvent.change(textarea, { target: { value: "Half a thought" } });
+    act(() => textarea.blur());
+
+    // A loading thread holds the request instead of spending it.
+    view.rerender(<Composer {...props} disabled focusRequestId={1} />);
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(resolve)); });
+    expect(textarea).not.toHaveFocus();
+
+    view.rerender(<Composer {...props} focusRequestId={1} />);
+    await waitFor(() => expect(textarea).toHaveFocus());
+    expect(textarea.selectionStart).toBe("Half a thought".length);
+
+    // The same id does not pull focus back after the operator moves on.
+    act(() => textarea.blur());
+    view.rerender(<Composer {...props} focusRequestId={1} />);
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(resolve)); });
+    expect(textarea).not.toHaveFocus();
+  });
+
   describe("async question replies", () => {
     const reply = "<send_user_message_question_reply>\n"
       + "[{\"answer\":\"Staging\",\"question\":\"Which environment?\","
