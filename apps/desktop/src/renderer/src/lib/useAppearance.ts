@@ -28,6 +28,8 @@ export type AppearanceController = {
   setDensity(density: DensityPreference): void;
   setSidebarTextSize(sidebarTextSize: TextSizePreference): void;
   setTranscriptTextSize(transcriptTextSize: TextSizePreference): void;
+  setUiFontFamily(uiFontFamily: string): void;
+  setCodeFontFamily(codeFontFamily: string): void;
   setAppearance(preference: AppearancePreference): void;
 };
 
@@ -66,6 +68,10 @@ export function useAppearance(input: UseAppearanceInput): AppearanceController {
   const snapshotLightTheme = snapshotPreference?.lightTheme;
   const snapshotSidebarTextSize = snapshotPreference?.sidebarTextSize;
   const snapshotTranscriptTextSize = snapshotPreference?.transcriptTextSize;
+  // "" is a real value here (the default font), so these are checked
+  // against undefined, not for truthiness.
+  const snapshotUiFontFamily = snapshotPreference?.uiFontFamily;
+  const snapshotCodeFontFamily = snapshotPreference?.codeFontFamily;
 
   const [appearance, setAppearanceState] = useState<AppearanceState>(() => {
     const initial = snapshotPreference ?? readBridgedAppearance();
@@ -87,6 +93,8 @@ export function useAppearance(input: UseAppearanceInput): AppearanceController {
       || !snapshotLightTheme
       || !snapshotSidebarTextSize
       || !snapshotTranscriptTextSize
+      || snapshotUiFontFamily === undefined
+      || snapshotCodeFontFamily === undefined
     ) {
       return;
     }
@@ -98,6 +106,8 @@ export function useAppearance(input: UseAppearanceInput): AppearanceController {
         && current.density === snapshotDensity
         && current.sidebarTextSize === snapshotSidebarTextSize
         && current.transcriptTextSize === snapshotTranscriptTextSize
+        && current.uiFontFamily === snapshotUiFontFamily
+        && current.codeFontFamily === snapshotCodeFontFamily
       ) {
         return current;
       }
@@ -108,6 +118,8 @@ export function useAppearance(input: UseAppearanceInput): AppearanceController {
         resolvedTheme: resolveTheme(snapshotTheme),
         sidebarTextSize: snapshotSidebarTextSize,
         transcriptTextSize: snapshotTranscriptTextSize,
+        uiFontFamily: snapshotUiFontFamily,
+        codeFontFamily: snapshotCodeFontFamily,
         theme: snapshotTheme,
       };
     });
@@ -118,6 +130,8 @@ export function useAppearance(input: UseAppearanceInput): AppearanceController {
     snapshotLightTheme,
     snapshotSidebarTextSize,
     snapshotTranscriptTextSize,
+    snapshotUiFontFamily,
+    snapshotCodeFontFamily,
   ]);
 
   // Apply DOM attributes whenever the resolved appearance changes. No
@@ -131,6 +145,8 @@ export function useAppearance(input: UseAppearanceInput): AppearanceController {
       appearance.density,
       appearance.sidebarTextSize,
       appearance.transcriptTextSize,
+      appearance.uiFontFamily,
+      appearance.codeFontFamily,
     );
   }, [
     appearance.resolvedTheme,
@@ -139,6 +155,8 @@ export function useAppearance(input: UseAppearanceInput): AppearanceController {
     appearance.density,
     appearance.sidebarTextSize,
     appearance.transcriptTextSize,
+    appearance.uiFontFamily,
+    appearance.codeFontFamily,
   ]);
 
   // Subscribe to prefers-color-scheme changes so `theme: "system"` flips
@@ -239,6 +257,16 @@ export function useAppearance(input: UseAppearanceInput): AppearanceController {
     [updateAxis],
   );
 
+  const setUiFontFamily = useCallback(
+    (uiFontFamily: string) => updateAxis("uiFontFamily", uiFontFamily),
+    [updateAxis],
+  );
+
+  const setCodeFontFamily = useCallback(
+    (codeFontFamily: string) => updateAxis("codeFontFamily", codeFontFamily),
+    [updateAxis],
+  );
+
   const setAppearance = useCallback(
     (preference: AppearancePreference) => {
       setAppearanceState((current) => {
@@ -249,6 +277,8 @@ export function useAppearance(input: UseAppearanceInput): AppearanceController {
           && current.density === preference.density
           && current.sidebarTextSize === preference.sidebarTextSize
           && current.transcriptTextSize === preference.transcriptTextSize
+          && current.uiFontFamily === preference.uiFontFamily
+          && current.codeFontFamily === preference.codeFontFamily
         ) {
           return current;
         }
@@ -272,6 +302,8 @@ export function useAppearance(input: UseAppearanceInput): AppearanceController {
     setDensity,
     setSidebarTextSize,
     setTranscriptTextSize,
+    setUiFontFamily,
+    setCodeFontFamily,
     setAppearance,
   };
 }

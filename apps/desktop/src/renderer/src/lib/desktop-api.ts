@@ -1580,6 +1580,8 @@ export type DesktopApi = Partial<NativeVoiceApi> & {
       density: DesktopAppearanceDensity;
       sidebarTextSize: DesktopTextSize;
       transcriptTextSize: DesktopTextSize;
+      uiFontFamily: string;
+      codeFontFamily: string;
     }) => void,
   ) => () => void;
   onSettingsRuntimeChanged?: (

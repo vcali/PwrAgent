@@ -50,10 +50,15 @@ import {
   DESKTOP_UI_LAYOUT_DEFAULTS,
   DESKTOP_DARK_THEME_DEFAULT,
   DESKTOP_LIGHT_THEME_DEFAULT,
+  DESKTOP_CODE_FONT_STACK,
+  DESKTOP_FONT_FAMILY_DEFAULT,
   DESKTOP_TEXT_SIZE_DEFAULT,
+  DESKTOP_UI_FONT_STACK,
+  desktopFontStack,
   isDesktopDarkTheme,
   isDesktopLightTheme,
   isDesktopTextSize,
+  normalizeDesktopFontFamily,
   normalizeNavigationBrowseMode,
 } from "@pwragent/shared";
 import {
@@ -2950,6 +2955,8 @@ const desktopApi = Object.freeze({
       density: DesktopAppearanceDensity;
       sidebarTextSize: DesktopTextSize;
       transcriptTextSize: DesktopTextSize;
+      uiFontFamily: string;
+      codeFontFamily: string;
     }) => void,
   ): (() => void) => {
     const listener = (
@@ -2961,6 +2968,8 @@ const desktopApi = Object.freeze({
         density: DesktopAppearanceDensity;
         sidebarTextSize: DesktopTextSize;
         transcriptTextSize: DesktopTextSize;
+        uiFontFamily: string;
+        codeFontFamily: string;
       },
     ) => callback(payload);
     ipcRenderer.on(APPEARANCE_CHANGED_EVENT_CHANNEL, listener);
@@ -3171,6 +3180,13 @@ function readBootstrapAppearance(): {
   density: "mission-control" | "compact";
   sidebarTextSize: DesktopTextSize;
   transcriptTextSize: DesktopTextSize;
+  uiFontFamily: string;
+  codeFontFamily: string;
+  /** The `--font-sans` / `--font-mono` values index.html sets when a family
+   *  is picked. Built here because the inline script cannot import the
+   *  shared stacks. */
+  uiFontStack?: string;
+  codeFontStack?: string;
 } {
   for (const arg of process.argv) {
     if (!arg.startsWith(APPEARANCE_ARG_PREFIX)) continue;
@@ -3207,6 +3223,8 @@ function readBootstrapAppearance(): {
           && isDesktopTextSize(raw.transcriptTextSize)
           ? raw.transcriptTextSize
           : DESKTOP_TEXT_SIZE_DEFAULT;
+      const uiFontFamily = normalizeDesktopFontFamily(raw?.uiFontFamily);
+      const codeFontFamily = normalizeDesktopFontFamily(raw?.codeFontFamily);
       return {
         theme,
         darkTheme,
@@ -3214,6 +3232,13 @@ function readBootstrapAppearance(): {
         density,
         sidebarTextSize,
         transcriptTextSize,
+        uiFontFamily,
+        codeFontFamily,
+        uiFontStack: desktopFontStack(uiFontFamily, DESKTOP_UI_FONT_STACK),
+        codeFontStack: desktopFontStack(
+          codeFontFamily,
+          DESKTOP_CODE_FONT_STACK,
+        ),
       };
     } catch {
       break;
@@ -3226,6 +3251,8 @@ function readBootstrapAppearance(): {
     density: "mission-control",
     sidebarTextSize: DESKTOP_TEXT_SIZE_DEFAULT,
     transcriptTextSize: DESKTOP_TEXT_SIZE_DEFAULT,
+    uiFontFamily: DESKTOP_FONT_FAMILY_DEFAULT,
+    codeFontFamily: DESKTOP_FONT_FAMILY_DEFAULT,
   };
 }
 const bootstrapAppearance = readBootstrapAppearance();

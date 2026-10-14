@@ -1,10 +1,14 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type {
   DesktopColorTheme,
   DesktopSettingsSnapshot,
 } from "@pwragent/shared";
 import { Select, type SelectOption } from "../../components/Select";
 import type { DesktopApi } from "../../lib/desktop-api";
+import {
+  canQueryLocalFonts,
+  queryLocalFontFamilies,
+} from "../../lib/local-font-families";
 import type {
   AppearanceController,
   DarkThemePreference,
@@ -208,6 +212,81 @@ function TextSizeField(props: {
   );
 }
 
+const INSTALLED_FONTS = "Installed fonts";
+
+/* The installed families, or undefined while the one-per-window lookup
+   (shared with the terminal's Nerd Font fallback) is still running, or
+   when this window has no Local Font Access API to run it with. */
+function useLocalFontFamilies(): readonly string[] | undefined {
+  const [families, setFamilies] = useState<readonly string[]>();
+  useEffect(() => {
+    if (!canQueryLocalFonts()) return;
+    let cancelled = false;
+    void queryLocalFontFamilies().then((next) => {
+      if (!cancelled) setFamilies(next);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  return families;
+}
+
+/* "" is the bundled stack. A saved family stays listed even when this
+   machine does not have it (the config can come from another machine),
+   so the field never reads as blank; the stack falls through to the
+   bundled face for it. */
+function fontFamilyOptions(
+  defaultLabel: string,
+  families: readonly string[] | undefined,
+  value: string,
+): SelectOption[] {
+  const options: SelectOption[] = [{ value: "", label: defaultLabel }];
+  if (value && !families?.includes(value)) {
+    options.push({
+      value,
+      label: value,
+      description: families ? "Not installed on this machine" : undefined,
+      group: INSTALLED_FONTS,
+    });
+  }
+  for (const family of families ?? []) {
+    options.push({ value: family, label: family, group: INSTALLED_FONTS });
+  }
+  return options;
+}
+
+function FontFamilyField(props: {
+  label: string;
+  sub: string;
+  defaultLabel: string;
+  families: readonly string[] | undefined;
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <SettingsField
+      label={props.label}
+      sub={props.sub}
+      control={
+        // Applied optimistically like the text-size axes: the window
+        // re-renders in the new family on the click.
+        <Select
+          aria-label={props.label}
+          className={THEME_PICKER_CLASS}
+          options={fontFamilyOptions(
+            props.defaultLabel,
+            props.families,
+            props.value,
+          )}
+          value={props.value}
+          onChange={props.onChange}
+        />
+      }
+    />
+  );
+}
+
 const PASTED_IMAGE_PATCH_OPTIONS: Array<{
   description: string;
   label: string;
@@ -314,6 +393,7 @@ export function GeneralSettings(props: {
   // the picked theme's pair. Never applied without a click: choosing the
   // two independently is the point of the two rows.
   const [pairOffer, setPairOffer] = useState<ThemePairOffer | null>(null);
+  const fontFamilies = useLocalFontFamilies();
 
   return (
     <SettingsSectionStack paneId="general" aria-label="General settings">
@@ -466,6 +546,26 @@ export function GeneralSettings(props: {
               value={appearance.transcriptTextSize}
               onChange={(value) => {
                 props.appearanceController?.setTranscriptTextSize(value);
+              }}
+            />
+            <FontFamilyField
+              label="Interface font"
+              sub="The font for menus, the sidebar, and message text. Default is Geist Sans, which ships with PwrAgent."
+              defaultLabel="Default (Geist Sans)"
+              families={fontFamilies}
+              value={appearance.uiFontFamily}
+              onChange={(value) => {
+                props.appearanceController?.setUiFontFamily(value);
+              }}
+            />
+            <FontFamilyField
+              label="Code font"
+              sub="The font for code blocks, diffs, and the terminal. Default is Geist Mono, which ships with PwrAgent. Pick a monospaced font so terminal columns line up."
+              defaultLabel="Default (Geist Mono)"
+              families={fontFamilies}
+              value={appearance.codeFontFamily}
+              onChange={(value) => {
+                props.appearanceController?.setCodeFontFamily(value);
               }}
             />
           </div>

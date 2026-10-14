@@ -18,6 +18,8 @@ const appearanceMocks = vi.hoisted(() => ({
     sidebarTextSize: "md" as const,
     theme: "system" as "system" | "dark" | "light",
     transcriptTextSize: "md" as const,
+    uiFontFamily: "",
+    codeFontFamily: "",
   },
 }));
 

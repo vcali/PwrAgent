@@ -429,6 +429,20 @@ export const DESKTOP_TEXT_SIZES = [
 export type DesktopTextSize = (typeof DESKTOP_TEXT_SIZES)[number];
 export const DESKTOP_TEXT_SIZE_DEFAULT: DesktopTextSize = "md";
 
+/**
+ * The font stacks `--font-sans` and `--font-mono` carry in app.css. A font
+ * the operator picks is put in front of its stack, so a family that is not
+ * installed (or a typo in config.toml) falls through to the bundled Geist
+ * face. The renderer's style tests hold these equal to app.css.
+ */
+export const DESKTOP_UI_FONT_STACK =
+  "\"Geist Sans\", \"Geist\", \"SF Pro Text\", \"Inter\", system-ui, sans-serif";
+export const DESKTOP_CODE_FONT_STACK =
+  "\"Geist Mono\", \"SF Mono\", \"JetBrains Mono\", Consolas, monospace";
+/** "" keeps the bundled default stack. */
+export const DESKTOP_FONT_FAMILY_DEFAULT = "";
+export const DESKTOP_FONT_FAMILY_MAX_LENGTH = 100;
+
 export type DesktopToolOutputAlertPolicy = {
   outputCapHitsEnabled: boolean;
   repeatedLargeOutputsEnabled: boolean;
@@ -797,6 +811,11 @@ export type DesktopAppearanceSnapshot = {
   density: DesktopSettingsValue<DesktopAppearanceDensity>;
   sidebarTextSize: DesktopSettingsValue<DesktopTextSize>;
   transcriptTextSize: DesktopSettingsValue<DesktopTextSize>;
+  /** Font family put in front of the UI stack; "" keeps the default. */
+  uiFontFamily: DesktopSettingsValue<string>;
+  /** Font family put in front of the code and terminal stack; "" keeps the
+   *  default. */
+  codeFontFamily: DesktopSettingsValue<string>;
 };
 
 export type DesktopGeneralSettingsSnapshot = {
@@ -1594,6 +1613,9 @@ export type DesktopSettingsConfigPatch = {
       density?: DesktopAppearanceDensity;
       sidebarTextSize?: DesktopTextSize;
       transcriptTextSize?: DesktopTextSize;
+      /** "" clears the persisted family. */
+      uiFontFamily?: string;
+      codeFontFamily?: string;
     };
     codexProfileModel?: DesktopCodexProfileModel;
     /** `null` clears the persisted acknowledgement. */
@@ -1882,6 +1904,8 @@ export type DesktopConfigBootstrapSnapshot = {
     density: DesktopAppearanceDensity;
     sidebarTextSize: DesktopTextSize;
     transcriptTextSize: DesktopTextSize;
+    uiFontFamily: string;
+    codeFontFamily: string;
   };
   onboarding: {
     completed: boolean;
@@ -2482,6 +2506,34 @@ export function isDesktopAppearanceDensity(
 
 export function isDesktopTextSize(value: string): value is DesktopTextSize {
   return DESKTOP_TEXT_SIZES.includes(value as DesktopTextSize);
+}
+
+/**
+ * A font family name as the appearance settings store it: trimmed, or ""
+ * (the default) when it is not a string, is too long, or carries a quote,
+ * backslash, or control character. Those are the characters that could end
+ * the quoted CSS string `desktopFontStack` wraps it in.
+ */
+export function normalizeDesktopFontFamily(value: unknown): string {
+  if (typeof value !== "string") return DESKTOP_FONT_FAMILY_DEFAULT;
+  const family = value.trim();
+  if (
+    family.length > DESKTOP_FONT_FAMILY_MAX_LENGTH
+    || /["\\\p{Cc}]/u.test(family)
+  ) {
+    return DESKTOP_FONT_FAMILY_DEFAULT;
+  }
+  return family;
+}
+
+/** `defaultStack` led by `family`, or undefined when `family` normalizes to
+ *  the default and the stylesheet's own stack applies. */
+export function desktopFontStack(
+  family: unknown,
+  defaultStack: string,
+): string | undefined {
+  const normalized = normalizeDesktopFontFamily(family);
+  return normalized ? `"${normalized}", ${defaultStack}` : undefined;
 }
 
 export function isDesktopIntegratedTerminalWindowsShell(

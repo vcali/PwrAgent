@@ -11,15 +11,12 @@
  * Geist Mono still draws every glyph it has and sets the cell size; the Nerd
  * Font only supplies what nothing before it can.
  *
- * `queryLocalFonts()` took 1.5s with 600 faces installed, so it runs once
- * per window, never blocks a terminal from opening, and is shared by every
- * terminal after the first.
+ * The lookup shares `queryLocalFontFamilies`, so it runs once per window,
+ * never blocks a terminal from opening, and is shared by every terminal
+ * after the first.
  */
 
-type LocalFontData = { family: string };
-type LocalFontWindow = Window & {
-  queryLocalFonts?: () => Promise<LocalFontData[]>;
-};
+import { queryLocalFontFamilies } from "./local-font-families";
 
 let discovery: Promise<string | undefined> | undefined;
 let discovered: string | undefined;
@@ -38,15 +35,8 @@ export function discoverNerdFontFamily(): Promise<string | undefined> {
 }
 
 async function queryNerdFontFamily(): Promise<string | undefined> {
-  const target = window as LocalFontWindow;
-  if (typeof target.queryLocalFonts !== "function") return undefined;
-  try {
-    const fonts = await target.queryLocalFonts();
-    return pickNerdFontFamily(fonts.map((font) => font.family));
-  } catch {
-    // Denied, or not a secure context: the terminal keeps its stack.
-    return undefined;
-  }
+  // Denied or unavailable reads as no families: the terminal keeps its stack.
+  return pickNerdFontFamily(await queryLocalFontFamilies());
 }
 
 /**

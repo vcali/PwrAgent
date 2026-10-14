@@ -3152,6 +3152,8 @@ describe("DesktopSettingsService", () => {
       density: "mission-control",
       sidebarTextSize: "md",
       transcriptTextSize: "md",
+      uiFontFamily: "",
+      codeFontFamily: "",
     });
 
     // Write non-default values. The byte-preserving patch path should
@@ -3166,6 +3168,8 @@ describe("DesktopSettingsService", () => {
           terminalMinimumContrast: true,
           density: "compact",
           sidebarTextSize: "lg",
+          uiFontFamily: "  Inter  ",
+          codeFontFamily: "JetBrains Mono",
         },
       },
     });
@@ -3179,6 +3183,9 @@ describe("DesktopSettingsService", () => {
     expect(writtenFile).toContain("terminal_minimum_contrast = true");
     expect(writtenFile).toContain('density = "compact"');
     expect(writtenFile).toContain('sidebar_text_size = "lg"');
+    // Trimmed on the way in, so the TOML holds the name CSS will ask for.
+    expect(writtenFile).toContain('ui_font_family = "Inter"');
+    expect(writtenFile).toContain('code_font_family = "JetBrains Mono"');
 
     const afterWrite = await service.readSettingsProjection();
     expect(afterWrite.general.appearance.theme).toEqual({
@@ -3209,6 +3216,14 @@ describe("DesktopSettingsService", () => {
       value: "lg",
       source: "config",
     });
+    expect(afterWrite.general.appearance.uiFontFamily).toEqual({
+      value: "Inter",
+      source: "config",
+    });
+    expect(afterWrite.general.appearance.codeFontFamily).toEqual({
+      value: "JetBrains Mono",
+      source: "config",
+    });
     expect(readBootstrapAppearance(configPath)).toEqual({
       theme: "light",
       darkTheme: "solarized-dark",
@@ -3216,6 +3231,8 @@ describe("DesktopSettingsService", () => {
       density: "compact",
       sidebarTextSize: "lg",
       transcriptTextSize: "md",
+      uiFontFamily: "Inter",
+      codeFontFamily: "JetBrains Mono",
     });
 
     // Restore to defaults: the patch path should DELETE the keys
@@ -3230,6 +3247,8 @@ describe("DesktopSettingsService", () => {
           terminalMinimumContrast: false,
           density: "mission-control",
           sidebarTextSize: "md",
+          uiFontFamily: "",
+          codeFontFamily: "",
         },
       },
     });
@@ -3242,6 +3261,8 @@ describe("DesktopSettingsService", () => {
     expect(restoredFile).not.toContain("terminal_minimum_contrast");
     expect(restoredFile).not.toContain('density = "');
     expect(restoredFile).not.toContain('sidebar_text_size = "');
+    expect(restoredFile).not.toContain("ui_font_family");
+    expect(restoredFile).not.toContain("code_font_family");
 
     const afterRestore = await service.readSettingsProjection();
     expect(afterRestore.general.appearance.theme.source).toBe("default");
@@ -3259,6 +3280,10 @@ describe("DesktopSettingsService", () => {
     expect(afterRestore.general.appearance.sidebarTextSize.source).toBe(
       "default",
     );
+    expect(afterRestore.general.appearance.uiFontFamily).toEqual({
+      value: "",
+      source: "default",
+    });
     expect(readBootstrapAppearance(configPath)).toEqual({
       theme: "system",
       darkTheme: "tangerine-dark",
@@ -3266,7 +3291,37 @@ describe("DesktopSettingsService", () => {
       density: "mission-control",
       sidebarTextSize: "md",
       transcriptTextSize: "md",
+      uiFontFamily: "",
+      codeFontFamily: "",
     });
+  });
+
+  it("never stores a font family that could end its quoted CSS string", async () => {
+    const root = createTempRoot();
+    const configPath = path.join(root, "config.toml");
+    fs.writeFileSync(
+      configPath,
+      '[general.appearance]\nui_font_family = "Evil\\", serif; color: red"\n',
+    );
+    const service = new DesktopSettingsService({
+      configPath,
+      env: {},
+      secretStore: new MemoryDesktopSecretStore(),
+    });
+
+    // A hand-edited value with a quote reads as the default...
+    const before = await service.readSettingsProjection();
+    expect(before.general.appearance.uiFontFamily).toEqual({
+      value: "",
+      source: "default",
+    });
+    expect(readBootstrapAppearance(configPath).uiFontFamily).toBe("");
+
+    // ...and a patch carrying one clears the key instead of writing it.
+    await service.writeConfigPatchTargeted({
+      general: { appearance: { uiFontFamily: 'Evil", serif' } },
+    });
+    expect(fs.readFileSync(configPath, "utf8")).not.toContain("ui_font_family");
   });
 
   it("drops the development-only palette key once a color theme is saved", async () => {
@@ -3337,6 +3392,8 @@ describe("DesktopSettingsService", () => {
       density: "compact",
       sidebarTextSize: "md",
       transcriptTextSize: "md",
+      uiFontFamily: "",
+      codeFontFamily: "",
     });
 
     // Patch that restores defaults still fires (the renderer needs to
@@ -3360,6 +3417,8 @@ describe("DesktopSettingsService", () => {
       density: "mission-control",
       sidebarTextSize: "md",
       transcriptTextSize: "md",
+      uiFontFamily: "",
+      codeFontFamily: "",
     });
 
     // Patch with `general` but only developerMode (not appearance) must
@@ -3386,6 +3445,8 @@ describe("DesktopSettingsService", () => {
       density: "mission-control",
       sidebarTextSize: "md",
       transcriptTextSize: "md",
+      uiFontFamily: "",
+      codeFontFamily: "",
     });
 
     // A theme-only patch is an appearance change too: every window has to
@@ -3403,6 +3464,8 @@ describe("DesktopSettingsService", () => {
       density: "mission-control",
       sidebarTextSize: "md",
       transcriptTextSize: "md",
+      uiFontFamily: "",
+      codeFontFamily: "",
     });
   });
 

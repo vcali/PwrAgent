@@ -18,6 +18,8 @@ const appearanceController = {
   setDensity: vi.fn(),
   setSidebarTextSize: vi.fn(),
   setTranscriptTextSize: vi.fn(),
+  setUiFontFamily: vi.fn(),
+  setCodeFontFamily: vi.fn(),
   setAppearance: vi.fn(),
 } as unknown as AppearanceController;
 

@@ -24,6 +24,7 @@ import {
   DESKTOP_APPEARANCE_THEME_DEFAULT,
   DESKTOP_SPEND_ALERT_POLICY_DEFAULT,
   DESKTOP_TEXT_SIZE_DEFAULT,
+  DESKTOP_FONT_FAMILY_DEFAULT,
   DESKTOP_TOOL_OUTPUT_ALERT_POLICY_DEFAULT,
   MAX_REPEATED_LARGE_OUTPUT_CALLS,
   MAX_REPEATED_LARGE_OUTPUT_PERCENT,
@@ -56,6 +57,8 @@ export type NormalizedGeneralConfig = Readonly<{
     density: DesktopAppearanceDensity;
     sidebarTextSize: DesktopTextSize;
     transcriptTextSize: DesktopTextSize;
+    uiFontFamily: string;
+    codeFontFamily: string;
   }>;
   settings: ConfigSection<"general">;
 }>;
@@ -267,6 +270,12 @@ export function normalizeConfigDomains(params: {
         transcriptTextSize:
           config.general?.appearance?.transcriptTextSize
           ?? DESKTOP_TEXT_SIZE_DEFAULT,
+        uiFontFamily:
+          config.general?.appearance?.uiFontFamily
+          ?? DESKTOP_FONT_FAMILY_DEFAULT,
+        codeFontFamily:
+          config.general?.appearance?.codeFontFamily
+          ?? DESKTOP_FONT_FAMILY_DEFAULT,
       },
       settings: config.general ?? {},
     },

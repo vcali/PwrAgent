@@ -342,6 +342,10 @@ export function App() {
           settings.snapshot.general.appearance.sidebarTextSize.value,
         transcriptTextSize:
           settings.snapshot.general.appearance.transcriptTextSize.value,
+        uiFontFamily:
+          settings.snapshot.general.appearance.uiFontFamily.value,
+        codeFontFamily:
+          settings.snapshot.general.appearance.codeFontFamily.value,
       }
       : undefined,
     writeConfig: settings.writeConfig,

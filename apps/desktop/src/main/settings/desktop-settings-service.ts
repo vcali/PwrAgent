@@ -77,6 +77,7 @@ import {
   DESKTOP_LIGHT_THEME_DEFAULT,
   DESKTOP_APPEARANCE_THEME_DEFAULT,
   DESKTOP_TEXT_SIZE_DEFAULT,
+  DESKTOP_FONT_FAMILY_DEFAULT,
   DESKTOP_SPEND_ALERT_POLICY_DEFAULT,
   DESKTOP_TOOL_OUTPUT_ALERT_POLICY_DEFAULT,
   DESKTOP_CHAT_REPLY_COMPOSER_DEFAULT,
@@ -336,6 +337,8 @@ type DesktopSettingsServiceOptions = {
     density: DesktopAppearanceDensity;
     sidebarTextSize: DesktopTextSize;
     transcriptTextSize: DesktopTextSize;
+    uiFontFamily: string;
+    codeFontFamily: string;
   }) => void;
   onManagedCodexRuntimeSwitchComplete?: () => void;
   /**
@@ -1077,6 +1080,12 @@ export class DesktopSettingsService {
           ),
           transcriptTextSize: this.resolveTextSize(
             config.general?.appearance?.transcriptTextSize,
+          ),
+          uiFontFamily: this.resolveFontFamily(
+            config.general?.appearance?.uiFontFamily,
+          ),
+          codeFontFamily: this.resolveFontFamily(
+            config.general?.appearance?.codeFontFamily,
           ),
         },
         codexProfileModel: this.resolveCodexProfileModel(
@@ -2256,7 +2265,9 @@ export class DesktopSettingsService {
         || appearancePatch.lightTheme !== undefined
         || appearancePatch.density !== undefined
         || appearancePatch.sidebarTextSize !== undefined
-        || appearancePatch.transcriptTextSize !== undefined)
+        || appearancePatch.transcriptTextSize !== undefined
+        || appearancePatch.uiFontFamily !== undefined
+        || appearancePatch.codeFontFamily !== undefined)
     ) {
       const next = update.values.general?.appearance;
       this.options.onAppearanceChange?.({
@@ -2268,6 +2279,8 @@ export class DesktopSettingsService {
           next?.sidebarTextSize ?? DESKTOP_TEXT_SIZE_DEFAULT,
         transcriptTextSize:
           next?.transcriptTextSize ?? DESKTOP_TEXT_SIZE_DEFAULT,
+        uiFontFamily: next?.uiFontFamily ?? DESKTOP_FONT_FAMILY_DEFAULT,
+        codeFontFamily: next?.codeFontFamily ?? DESKTOP_FONT_FAMILY_DEFAULT,
       });
     }
     // Any successful write notifies generic listeners so main-process services
@@ -3644,6 +3657,15 @@ export class DesktopSettingsService {
   ): DesktopSettingsValue<DesktopTextSize> {
     return {
       value: configValue ?? DESKTOP_TEXT_SIZE_DEFAULT,
+      source: configValue === undefined ? "default" : "config",
+    };
+  }
+
+  private resolveFontFamily(
+    configValue: string | undefined,
+  ): DesktopSettingsValue<string> {
+    return {
+      value: configValue ?? DESKTOP_FONT_FAMILY_DEFAULT,
       source: configValue === undefined ? "default" : "config",
     };
   }
