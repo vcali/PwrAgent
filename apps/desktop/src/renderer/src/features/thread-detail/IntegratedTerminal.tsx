@@ -226,6 +226,29 @@ export function IntegratedTerminal({
           attributeFilter: ["data-theme", "data-color-theme"],
         });
 
+        // Settings → Appearance → Code font overrides `--font-mono` inline
+        // on <html>. xterm measured its cells against the old family, so a
+        // change loads the new faces first, then hands xterm the stack and
+        // refits the grid to the new cell size.
+        let monoStack = cssVariable("--font-mono");
+        const fontObserver = new MutationObserver(() => {
+          const next = cssVariable("--font-mono");
+          if (next === monoStack) return;
+          monoStack = next;
+          void loadTerminalFonts(next).then(() => {
+            if (disposed || next !== monoStack) return;
+            terminal.options.fontFamily = withNerdFontFallback(
+              next,
+              discoveredNerdFontFamily(),
+            );
+            scheduleFitAndResize();
+          });
+        });
+        fontObserver.observe(document.documentElement, {
+          attributes: true,
+          attributeFilter: ["style"],
+        });
+
         // The first terminal in a window opens before the Nerd Font lookup
         // returns. The fallback sits behind Geist Mono, so adding it changes
         // no cell size; the refit only confirms that.
@@ -285,6 +308,7 @@ export function IntegratedTerminal({
         cleanupTerminal = () => {
           resizeObserver.disconnect();
           themeObserver.disconnect();
+          fontObserver.disconnect();
           if (resizeFrame !== undefined) window.cancelAnimationFrame(resizeFrame);
           dataDisposable.dispose();
           terminal.dispose();

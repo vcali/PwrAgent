@@ -3,6 +3,10 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import {
+  DESKTOP_CODE_FONT_STACK,
+  DESKTOP_UI_FONT_STACK,
+} from "@pwragent/shared";
 
 /**
  * A bundled face is drawn only when some rule asks for it by the exact family
@@ -97,6 +101,16 @@ describe("bundled fonts", () => {
       `no font token leads with "${family}" in every block that declares it; `
         + `stacks are ${JSON.stringify(Object.fromEntries(STACKS))}`,
     ).toHaveLength(1);
+  });
+
+  it("matches the stacks a picked font is put in front of", () => {
+    // Settings → Appearance overrides a token inline as `"<family>", <shared
+    // stack>`. A stack edited here and not there would change what an
+    // unpicked font falls back to only for operators who picked one.
+    const declared = (token: string) =>
+      appCss.match(new RegExp(`${token}\\s*:\\s*([^;]+);`))![1]!.trim();
+    expect(declared("--font-sans")).toBe(DESKTOP_UI_FONT_STACK);
+    expect(declared("--font-mono")).toBe(DESKTOP_CODE_FONT_STACK);
   });
 
   it("routes every monospace rule through --font-mono", () => {

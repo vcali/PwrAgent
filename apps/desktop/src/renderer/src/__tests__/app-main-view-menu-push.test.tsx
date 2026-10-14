@@ -43,6 +43,8 @@ function installDesktopApi(): {
               density: { value: "mission-control", source: "default" },
               sidebarTextSize: { value: "md", source: "default" },
               transcriptTextSize: { value: "md", source: "default" },
+              uiFontFamily: { value: "", source: "default" },
+              codeFontFamily: { value: "", source: "default" },
             },
           },
           onboarding: {

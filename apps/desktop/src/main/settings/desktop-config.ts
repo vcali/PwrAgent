@@ -48,6 +48,7 @@ import {
   DESKTOP_LIGHT_THEME_DEFAULT,
   DESKTOP_APPEARANCE_THEME_DEFAULT,
   DESKTOP_TEXT_SIZE_DEFAULT,
+  DESKTOP_FONT_FAMILY_DEFAULT,
   DESKTOP_CODEX_PROFILE_MODEL_DEFAULT,
   DESKTOP_FEDERATION_MODE_DEFAULT,
   DESKTOP_INTEGRATED_TERMINAL_WINDOWS_SHELL_DEFAULT,
@@ -56,6 +57,7 @@ import {
   isDesktopLightTheme,
   isDesktopAppearanceTheme,
   isDesktopTextSize,
+  normalizeDesktopFontFamily,
   isDesktopCodexProfileModel,
   isDesktopFederationMode,
   isFederationGatewayEndpointUrl,
@@ -137,6 +139,8 @@ export type DesktopSettingsConfig = {
       density?: DesktopAppearanceDensity;
       sidebarTextSize?: DesktopTextSize;
       transcriptTextSize?: DesktopTextSize;
+      uiFontFamily?: string;
+      codeFontFamily?: string;
     };
     codexProfileModel?: DesktopCodexProfileModel;
     messagingAcknowledgment?: DesktopMessagingAcknowledgment | null;
@@ -989,6 +993,20 @@ export function desktopSettingsPatchToEdits(
         ["general", "appearance", "transcript_text_size"],
         patch.general.appearance.transcriptTextSize,
       );
+    }
+  }
+
+  for (const [key, tomlKey] of [
+    ["uiFontFamily", "ui_font_family"],
+    ["codeFontFamily", "code_font_family"],
+  ] as const) {
+    const family = patch.general?.appearance?.[key];
+    if (family === undefined) continue;
+    const normalized = normalizeDesktopFontFamily(family);
+    if (normalized === DESKTOP_FONT_FAMILY_DEFAULT) {
+      edits.push({ op: "delete", path: ["general", "appearance", tomlKey] });
+    } else {
+      set(["general", "appearance", tomlKey], normalized);
     }
   }
 
@@ -2134,6 +2152,8 @@ function normalizeDesktopConfig(
         transcriptTextSize: readTextSize(
           generalAppearance?.transcript_text_size,
         ),
+        uiFontFamily: readFontFamily(generalAppearance?.ui_font_family),
+        codeFontFamily: readFontFamily(generalAppearance?.code_font_family),
       },
       codexProfileModel: readCodexProfileModel(general?.codex_profile_model),
       messagingAcknowledgment: readMessagingAcknowledgment(
@@ -2941,6 +2961,12 @@ function readTextSize(
   return typeof value === "string" && isDesktopTextSize(value)
     ? value
     : undefined;
+}
+
+function readFontFamily(
+  value: TomlScalar | undefined,
+): string | undefined {
+  return normalizeDesktopFontFamily(value) || undefined;
 }
 
 function readIntegratedTerminalWindowsShell(

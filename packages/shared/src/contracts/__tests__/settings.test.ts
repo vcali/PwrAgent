@@ -2,11 +2,14 @@ import { describe, expect, it } from "vitest";
 
 import type { DesktopSettingsSnapshot } from "../settings";
 import {
+  DESKTOP_CODE_FONT_STACK,
   DESKTOP_UPDATE_SELECTION_SOURCE_DEFAULT,
+  desktopFontStack,
   inferDesktopUpdateSelection,
   isDesktopChatReplyComposer,
   isDesktopUpdateSelectionSource,
   legacyDesktopUpdateSelectionSource,
+  normalizeDesktopFontFamily,
   resolveDesktopUpdateSelection,
 } from "../settings";
 
@@ -96,6 +99,8 @@ describe("desktop settings contracts", () => {
           density: { value: "mission-control", source: "default" },
           sidebarTextSize: { value: "md", source: "default" },
           transcriptTextSize: { value: "md", source: "default" },
+          uiFontFamily: { value: "", source: "default" },
+          codeFontFamily: { value: "", source: "default" },
         },
         codexProfileModel: { value: "shared", source: "default" },
         messagingAcknowledgment: { value: null, source: "default" },
@@ -578,5 +583,32 @@ describe("legacyDesktopUpdateSelectionSource", () => {
     expect(legacyDesktopUpdateSelectionSource("prerelease", "stable")).toBe("user");
     expect(legacyDesktopUpdateSelectionSource("latest", "beta")).toBe("user");
     expect(legacyDesktopUpdateSelectionSource("prerelease", "beta")).toBe("user");
+  });
+});
+
+describe("desktop font families", () => {
+  it("keeps a plain family name, trimmed", () => {
+    expect(normalizeDesktopFontFamily("  JetBrains Mono ")).toBe("JetBrains Mono");
+    expect(normalizeDesktopFontFamily("Hiragino Kaku Gothic ProN")).toBe(
+      "Hiragino Kaku Gothic ProN",
+    );
+    expect(normalizeDesktopFontFamily("游ゴシック")).toBe("游ゴシック");
+  });
+
+  it("reads anything that could end the quoted CSS string as the default", () => {
+    expect(normalizeDesktopFontFamily('Evil", serif')).toBe("");
+    expect(normalizeDesktopFontFamily("Evil\\")).toBe("");
+    expect(normalizeDesktopFontFamily("Line\nBreak")).toBe("");
+    expect(normalizeDesktopFontFamily("x".repeat(101))).toBe("");
+    expect(normalizeDesktopFontFamily(42)).toBe("");
+    expect(normalizeDesktopFontFamily(undefined)).toBe("");
+  });
+
+  it("leads the default stack with the picked family", () => {
+    expect(desktopFontStack("Fira Code", DESKTOP_CODE_FONT_STACK)).toBe(
+      `"Fira Code", ${DESKTOP_CODE_FONT_STACK}`,
+    );
+    expect(desktopFontStack("", DESKTOP_CODE_FONT_STACK)).toBeUndefined();
+    expect(desktopFontStack('a"b', DESKTOP_CODE_FONT_STACK)).toBeUndefined();
   });
 });

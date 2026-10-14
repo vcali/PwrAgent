@@ -30,7 +30,11 @@ import type {
 } from "@pwragent/shared";
 import { GIT_LFS_UNAVAILABLE_REASON } from "@pwragent/shared";
 import type { DesktopApi } from "../../../lib/desktop-api";
-import { chooseSelectOption, selectOptionLabels } from "../../../test/select";
+import {
+  chooseSelectOption,
+  selectListbox,
+  selectOptionLabels,
+} from "../../../test/select";
 import { pressEscape, tabEscapes } from "../../../test/tab-walk";
 import type { AppearanceController } from "../../../lib/useAppearance";
 import { SettingsScreen } from "../SettingsScreen";
@@ -38,6 +42,18 @@ import { AppNoticeToast, type AppNoticeToastNotice } from "../../notifications/A
 import { CodexLaunchNotice } from "../../notifications/CodexLaunchNotice";
 import type { ConfirmSettingsLeave } from "../UnsavedSettingsChanges";
 import type { DesktopSettingsState } from "../useDesktopSettings";
+
+// The installed-font lookup caches one answer per window (module), so the
+// tests set the families through this mock instead of `queryLocalFonts`.
+// Off by default, as in jsdom: the pickers then never update after render.
+const localFonts = vi.hoisted(() => ({
+  available: false,
+  families: [] as string[],
+}));
+vi.mock("../../../lib/local-font-families", () => ({
+  canQueryLocalFonts: () => localFonts.available,
+  queryLocalFontFamilies: () => Promise.resolve(localFonts.families),
+}));
 
 const originalScrollTo = window.scrollTo;
 
@@ -170,6 +186,8 @@ function createSnapshot(
         density: { value: "mission-control", source: "default" },
         sidebarTextSize: { value: "md", source: "default" },
         transcriptTextSize: { value: "md", source: "default" },
+        uiFontFamily: { value: "", source: "default" },
+        codeFontFamily: { value: "", source: "default" },
       },
       codexProfileModel: { value: "shared", source: "default" },
       messagingAcknowledgment: { value: null, source: "default" },
@@ -632,6 +650,103 @@ describe("SettingsScreen segmented pending", () => {
   });
 });
 
+describe("SettingsScreen fonts", () => {
+  function fontController(
+    appearance: Partial<AppearanceController["appearance"]> = {},
+  ): AppearanceController {
+    return {
+      appearance: {
+        theme: "system",
+        darkTheme: "tangerine-dark",
+        lightTheme: "tangerine-light",
+        density: "mission-control",
+        sidebarTextSize: "md",
+        transcriptTextSize: "md",
+        uiFontFamily: "",
+        codeFontFamily: "",
+        resolvedTheme: "dark",
+        ...appearance,
+      },
+      setTheme: vi.fn(),
+      setDarkTheme: vi.fn(),
+      setLightTheme: vi.fn(),
+      setDensity: vi.fn(),
+      setSidebarTextSize: vi.fn(),
+      setTranscriptTextSize: vi.fn(),
+      setUiFontFamily: vi.fn(),
+      setCodeFontFamily: vi.fn(),
+      setAppearance: vi.fn(),
+    };
+  }
+
+  afterEach(() => {
+    localFonts.available = false;
+    localFonts.families = [];
+  });
+
+  it("lists the installed families after the default and picks one", async () => {
+    localFonts.available = true;
+    localFonts.families = ["Fira Code", "Inter"];
+    const controller = fontController();
+    render(
+      <SettingsScreen
+        appearanceController={controller}
+        settings={createSettingsState()}
+        onClose={() => undefined}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "General" }));
+
+    const ui = screen.getByRole("combobox", { name: "Interface font" });
+    const code = screen.getByRole("combobox", { name: "Code font" });
+    expect(ui).toHaveTextContent("Default (Geist Sans)");
+    await waitFor(() => {
+      expect(selectOptionLabels(ui)).toEqual([
+        "Default (Geist Sans)",
+        "Fira Code",
+        "Inter",
+      ]);
+    });
+
+    chooseSelectOption(ui, "Inter");
+    expect(controller.setUiFontFamily).toHaveBeenCalledWith("Inter");
+    chooseSelectOption(code, "Fira Code");
+    expect(controller.setCodeFontFamily).toHaveBeenCalledWith("Fira Code");
+    expect(controller.setUiFontFamily).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a saved family this machine does not have, and resets to the default", async () => {
+    localFonts.available = true;
+    localFonts.families = ["Inter"];
+    const controller = fontController({ codeFontFamily: "Berkeley Mono" });
+    render(
+      <SettingsScreen
+        appearanceController={controller}
+        settings={createSettingsState()}
+        onClose={() => undefined}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "General" }));
+
+    const code = screen.getByRole("combobox", { name: "Code font" });
+    expect(code).toHaveTextContent("Berkeley Mono");
+    await waitFor(() => {
+      expect(selectOptionLabels(code)).toEqual([
+        "Default (Geist Mono)",
+        "Berkeley Mono",
+        "Inter",
+      ]);
+    });
+    fireEvent.click(code);
+    expect(
+      within(selectListbox(code)).getByRole("option", { name: /Berkeley Mono/ }),
+    ).toHaveTextContent("Not installed on this machine");
+
+    chooseSelectOption(code, "Default (Geist Mono)");
+    expect(controller.setCodeFontFamily).toHaveBeenCalledWith("");
+  });
+});
+
 describe("SettingsScreen color themes", () => {
   it("picks the dark and light themes independently", () => {
     const controller: AppearanceController = {
@@ -642,6 +757,8 @@ describe("SettingsScreen color themes", () => {
         density: "mission-control",
         sidebarTextSize: "md",
         transcriptTextSize: "md",
+        uiFontFamily: "",
+        codeFontFamily: "",
         resolvedTheme: "dark",
       },
       setTheme: vi.fn(),
@@ -650,6 +767,8 @@ describe("SettingsScreen color themes", () => {
       setDensity: vi.fn(),
       setSidebarTextSize: vi.fn(),
       setTranscriptTextSize: vi.fn(),
+      setUiFontFamily: vi.fn(),
+      setCodeFontFamily: vi.fn(),
       setAppearance: vi.fn(),
     };
     render(
@@ -698,6 +817,8 @@ describe("SettingsScreen color themes", () => {
         density: "mission-control",
         sidebarTextSize: "md",
         transcriptTextSize: "md",
+        uiFontFamily: "",
+        codeFontFamily: "",
         resolvedTheme: "dark",
       },
       setTheme: vi.fn(),
@@ -706,6 +827,8 @@ describe("SettingsScreen color themes", () => {
       setDensity: vi.fn(),
       setSidebarTextSize: vi.fn(),
       setTranscriptTextSize: vi.fn(),
+      setUiFontFamily: vi.fn(),
+      setCodeFontFamily: vi.fn(),
       setAppearance: vi.fn(),
     };
     render(
@@ -1403,6 +1526,8 @@ describe("SettingsScreen", () => {
         density: "mission-control",
         sidebarTextSize: "md",
         transcriptTextSize: "md",
+        uiFontFamily: "",
+        codeFontFamily: "",
         resolvedTheme: "dark",
       },
       setTheme: vi.fn(),
@@ -1411,6 +1536,8 @@ describe("SettingsScreen", () => {
       setDensity: vi.fn(),
       setSidebarTextSize: vi.fn(),
       setTranscriptTextSize: vi.fn(),
+      setUiFontFamily: vi.fn(),
+      setCodeFontFamily: vi.fn(),
       setAppearance: vi.fn(),
     };
     const settings = createSettingsState();

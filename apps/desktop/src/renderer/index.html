@@ -97,6 +97,16 @@
           }
           applyTextSize(bridged.sidebarTextSize, "data-sidebar-text");
           applyTextSize(bridged.transcriptTextSize, "data-transcript-text");
+          // Font axes: the preload builds the whole stack (the picked
+          // family ahead of the bundled default), so this script needs
+          // no copy of it. Absent means the stylesheet's stack applies.
+          function applyFontStack(value, token) {
+            if (typeof value === "string" && value) {
+              document.documentElement.style.setProperty(token, value);
+            }
+          }
+          applyFontStack(bridged.uiFontStack, "--font-sans");
+          applyFontStack(bridged.codeFontStack, "--font-mono");
         } catch (_) {
           // Bridge unavailable or shape wrong — fall back to dark + mission-
           // control defaults. The useAppearance hook will resync once the

@@ -26,9 +26,11 @@ import {
   DESKTOP_LIGHT_THEME_DEFAULT,
   DESKTOP_APPEARANCE_THEME_DEFAULT,
   DESKTOP_TEXT_SIZE_DEFAULT,
+  DESKTOP_FONT_FAMILY_DEFAULT,
   isDesktopDarkTheme,
   isDesktopLightTheme,
   isDesktopTextSize,
+  normalizeDesktopFontFamily,
 } from "@pwragent/shared";
 import { resolveDesktopConfigPath } from "./desktop-config";
 import { readProfileConfigFile } from "./config-store/profile-config-file";
@@ -41,6 +43,8 @@ export type BootstrapAppearance = {
   density: DesktopAppearanceDensity;
   sidebarTextSize: DesktopTextSize;
   transcriptTextSize: DesktopTextSize;
+  uiFontFamily: string;
+  codeFontFamily: string;
 };
 
 export const BOOTSTRAP_APPEARANCE_ARG_PREFIX = "--pwragent-appearance=";
@@ -86,6 +90,12 @@ export function readBootstrapAppearance(
       transcriptTextSize:
         config.general?.appearance?.transcriptTextSize
         ?? DESKTOP_TEXT_SIZE_DEFAULT,
+      uiFontFamily:
+        config.general?.appearance?.uiFontFamily
+        ?? DESKTOP_FONT_FAMILY_DEFAULT,
+      codeFontFamily:
+        config.general?.appearance?.codeFontFamily
+        ?? DESKTOP_FONT_FAMILY_DEFAULT,
     };
   } catch {
     // Config missing / unreadable / malformed → fall back to defaults.
@@ -98,6 +108,8 @@ export function readBootstrapAppearance(
       density: DESKTOP_APPEARANCE_DENSITY_DEFAULT,
       sidebarTextSize: DESKTOP_TEXT_SIZE_DEFAULT,
       transcriptTextSize: DESKTOP_TEXT_SIZE_DEFAULT,
+      uiFontFamily: DESKTOP_FONT_FAMILY_DEFAULT,
+      codeFontFamily: DESKTOP_FONT_FAMILY_DEFAULT,
     };
   }
 }
@@ -152,6 +164,8 @@ export function parseBootstrapAppearanceArg(
         density,
         sidebarTextSize,
         transcriptTextSize,
+        uiFontFamily: normalizeDesktopFontFamily(raw?.uiFontFamily),
+        codeFontFamily: normalizeDesktopFontFamily(raw?.codeFontFamily),
       };
     } catch {
       return undefined;

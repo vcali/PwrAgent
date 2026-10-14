@@ -6,6 +6,8 @@
  * resolves it into `DesktopSettingsSnapshot.general.appearance`, the
  * renderer reads it through the existing settings IPC, and writes back
  * via `writeSettingsConfig({ general: { appearance: { theme, density } } })`.
+ * Font families are not attributes: a picked family overrides the
+ * `--font-sans` / `--font-mono` token inline on `<html>`.
  *
  * The flash-of-wrong-theme path is:
  *   main `readBootstrapAppearance` (sync file read)
@@ -32,10 +34,15 @@ import {
   DESKTOP_DARK_THEME_DEFAULT,
   DESKTOP_LIGHT_THEME_DEFAULT,
   DESKTOP_APPEARANCE_THEME_DEFAULT,
+  DESKTOP_CODE_FONT_STACK,
+  DESKTOP_FONT_FAMILY_DEFAULT,
   DESKTOP_TEXT_SIZE_DEFAULT,
+  DESKTOP_UI_FONT_STACK,
+  desktopFontStack,
   isDesktopDarkTheme,
   isDesktopLightTheme,
   isDesktopTextSize,
+  normalizeDesktopFontFamily,
 } from "@pwragent/shared";
 
 export type ThemePreference = DesktopAppearanceTheme;
@@ -52,6 +59,9 @@ export type AppearancePreference = {
   density: DensityPreference;
   sidebarTextSize: TextSizePreference;
   transcriptTextSize: TextSizePreference;
+  /** "" keeps the bundled stack. */
+  uiFontFamily: string;
+  codeFontFamily: string;
 };
 
 export const DEFAULT_APPEARANCE: AppearancePreference = {
@@ -61,6 +71,8 @@ export const DEFAULT_APPEARANCE: AppearancePreference = {
   density: DESKTOP_APPEARANCE_DENSITY_DEFAULT,
   sidebarTextSize: DESKTOP_TEXT_SIZE_DEFAULT,
   transcriptTextSize: DESKTOP_TEXT_SIZE_DEFAULT,
+  uiFontFamily: DESKTOP_FONT_FAMILY_DEFAULT,
+  codeFontFamily: DESKTOP_FONT_FAMILY_DEFAULT,
 };
 
 /** Resolve `"system"` to either `"dark"` or `"light"` by querying the
@@ -103,6 +115,8 @@ export function applyAppearanceAttributes(
   density: DensityPreference,
   sidebarTextSize: TextSizePreference,
   transcriptTextSize: TextSizePreference,
+  uiFontFamily: string,
+  codeFontFamily: string,
 ): void {
   if (typeof document === "undefined") return;
   const root = document.documentElement;
@@ -135,6 +149,30 @@ export function applyAppearanceAttributes(
   } else {
     root.removeAttribute("data-transcript-text");
   }
+  applyFontStack(
+    root,
+    "--font-sans",
+    desktopFontStack(uiFontFamily, DESKTOP_UI_FONT_STACK),
+  );
+  applyFontStack(
+    root,
+    "--font-mono",
+    desktopFontStack(codeFontFamily, DESKTOP_CODE_FONT_STACK),
+  );
+}
+
+/** A picked family overrides the token inline on `<html>`; the default
+ *  removes the override so app.css's own stack applies. */
+function applyFontStack(
+  root: HTMLElement,
+  token: "--font-sans" | "--font-mono",
+  stack: string | undefined,
+): void {
+  if (stack) {
+    root.style.setProperty(token, stack);
+  } else {
+    root.style.removeProperty(token);
+  }
 }
 
 /**
@@ -156,6 +194,8 @@ export function readBridgedAppearance(): AppearancePreference {
     density: normalizeDensity(bridged?.density),
     sidebarTextSize: normalizeTextSize(bridged?.sidebarTextSize),
     transcriptTextSize: normalizeTextSize(bridged?.transcriptTextSize),
+    uiFontFamily: normalizeDesktopFontFamily(bridged?.uiFontFamily),
+    codeFontFamily: normalizeDesktopFontFamily(bridged?.codeFontFamily),
   };
 }
 
