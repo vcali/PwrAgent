@@ -76,8 +76,14 @@ const EDITORS: KnownApplication[] = [
     kind: "editor",
     name: "Zed",
     appPaths: applicationPaths("Zed.app"),
-    binaryNames: ["zed"],
-    binaryPaths: homebrewBinaryPaths("zed"),
+    // `zeditor` is the launcher name some Linux distro packages install.
+    binaryNames: ["zed", "zeditor"],
+    binaryPaths: [
+      // An app-only install has no `zed` on PATH, and `open -a` cannot carry a
+      // line number; the bundle's own CLI can.
+      ...applicationExecutablePaths("Zed.app", "Contents", "MacOS", "cli"),
+      ...homebrewBinaryPaths("zed"),
+    ],
   },
   {
     id: "sublime-text",
@@ -537,14 +543,23 @@ function editorCliArgs(
     return args;
   }
 
-  if (!supportsVsCodeGoto(applicationId) || !isPositiveInteger(request.targetLine)) {
+  const supportsGoto = supportsVsCodeGoto(applicationId);
+  if (
+    !(supportsGoto || supportsPathLocation(applicationId))
+    || !isPositiveInteger(request.targetLine)
+  ) {
     return [targetPath];
   }
 
   const location = isPositiveInteger(request.targetColumn)
     ? `${targetPath}:${request.targetLine}:${request.targetColumn}`
     : `${targetPath}:${request.targetLine}`;
-  return ["--goto", location];
+  return supportsGoto ? ["--goto", location] : [location];
+}
+
+/** Editors that take `path:line[:column]` as the positional argument itself. */
+function supportsPathLocation(applicationId: string): boolean {
+  return applicationId === "zed";
 }
 
 function supportsJetBrainsLineArgs(applicationId: string): boolean {

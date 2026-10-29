@@ -125,6 +125,84 @@ describe("application discovery", () => {
     expect(spawnMock).not.toHaveBeenCalled();
   });
 
+  it.skipIf(process.platform === "win32")("discovers Zed from the zed launcher on PATH", async () => {
+    blockHostZedDiscoveryPaths();
+    const binDir = path.join(tempDir, "bin");
+    const zedPath = path.join(binDir, "zed");
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(zedPath, "#!/bin/sh\nexit 0\n", "utf8");
+    chmodSync(zedPath, 0o755);
+
+    const snapshot = await discoverDesktopApplications({ env: { PATH: binDir } });
+
+    expect(snapshot.editors).toContainEqual(
+      expect.objectContaining({
+        id: "zed",
+        kind: "editor",
+        name: "Zed",
+        source: "path",
+        executablePath: zedPath,
+        canOpenWorkspace: true,
+      })
+    );
+  });
+
+  it.skipIf(process.platform === "win32")("discovers Zed from the zeditor launcher on PATH", async () => {
+    blockHostZedDiscoveryPaths();
+    const binDir = path.join(tempDir, "bin");
+    const zeditorPath = path.join(binDir, "zeditor");
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(zeditorPath, "#!/bin/sh\nexit 0\n", "utf8");
+    chmodSync(zeditorPath, 0o755);
+
+    const snapshot = await discoverDesktopApplications({ env: { PATH: binDir } });
+
+    expect(snapshot.editors).toContainEqual(
+      expect.objectContaining({ id: "zed", executablePath: zeditorPath })
+    );
+  });
+
+  it.skipIf(process.platform === "win32")("opens Zed source links with path:line:column", async () => {
+    blockHostZedDiscoveryPaths();
+    const binDir = path.join(tempDir, "bin");
+    const zedPath = path.join(binDir, "zed");
+    const targetPath = path.join(tempDir, "source.rs");
+    const capturePath = path.join(tempDir, "application-open.json");
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(zedPath, "#!/bin/sh\nexit 0\n", "utf8");
+    chmodSync(zedPath, 0o755);
+    writeFileSync(targetPath, "line 1\nline 2\n", "utf8");
+
+    const env = {
+      PATH: binDir,
+      PWRAGENT_E2E_APPLICATION_OPEN_CAPTURE_PATH: capturePath,
+    };
+    const readArgs = () =>
+      (JSON.parse(readFileSync(capturePath, "utf8")) as {
+        invocation: { args: string[]; command: string };
+      }).invocation;
+
+    await openDesktopApplication(
+      { applicationId: "zed", kind: "editor", targetPath, targetLine: 12, targetColumn: 4 },
+      { env }
+    );
+    expect(readArgs().command).toBe(zedPath);
+    expect(readArgs().args).toEqual([`${targetPath}:12:4`]);
+
+    await openDesktopApplication(
+      { applicationId: "zed", kind: "editor", targetPath, targetLine: 12 },
+      { env }
+    );
+    expect(readArgs().args).toEqual([`${targetPath}:12`]);
+
+    await openDesktopApplication(
+      { applicationId: "zed", kind: "editor", targetPath },
+      { env }
+    );
+    expect(readArgs().args).toEqual([targetPath]);
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
   it.skipIf(process.platform === "win32")("discovers IntelliJ IDEA from the idea launcher on PATH", async () => {
     blockHostIntelliJDiscoveryPaths();
     const binDir = path.join(tempDir, "bin");
@@ -305,6 +383,19 @@ describe("icns icon extraction", () => {
     expect(extractIcnsPng(icns)).toBeUndefined();
   });
 });
+
+function blockHostZedDiscoveryPaths(): void {
+  for (const appPath of [
+    path.join("/Applications", "Zed.app"),
+    path.join(os.homedir(), "Applications", "Zed.app"),
+  ]) {
+    blockedAccessPaths.add(appPath);
+    blockedAccessPaths.add(path.join(appPath, "Contents", "MacOS", "cli"));
+  }
+  for (const binaryPath of ["/opt/homebrew/bin/zed", "/usr/local/bin/zed"]) {
+    blockedAccessPaths.add(binaryPath);
+  }
+}
 
 function blockHostIntelliJDiscoveryPaths(): void {
   for (const appName of ["IntelliJ IDEA.app", "IntelliJ IDEA CE.app"]) {
