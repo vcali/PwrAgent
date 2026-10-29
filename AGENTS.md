@@ -708,6 +708,10 @@ Render a brand through `BrandLockup`
     so the renderer also filters each page by each root's own pin.
   - Draw no group when no pin exists or none matches the lens filter.
   - The list below the group keeps no pin-order controls.
+  - An **Unpinned threads** divider under the group folds that list away so
+    only the pins show. It is window-local view state, not persisted, and
+    independent of the Pinned group's own collapse. It draws only while a
+    pin exists, and a newly selected thread inside the folded list reopens it.
 - Offer visible pin ordering in Directories and in the Pinned group.
   Both use `useThreadPinOrdering`; do not fork it.
 - The pin-order controls are:

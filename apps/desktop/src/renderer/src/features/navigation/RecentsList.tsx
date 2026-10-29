@@ -2,8 +2,9 @@ import { readNavigationPresentationOrder, readOwnerChildOrder, type NavigationPr
 import type { NavigationPresentedThread } from "../../lib/navigation-loaded-rows";
 import type { useBoundedNavigationWindow } from "../../lib/useBoundedNavigationWindow";
 import { isNavigationPeerUnavailable, navigationIdentityKey, navigationThreadSelectionKey } from "../../lib/navigation-query-state";
-import { Fragment, useId, type MouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
+import { Fragment, useEffect, useId, useRef, type MouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { useEventCallback } from "../../lib/useEventCallback";
+import { useRecoverableState } from "../../lib/RendererRecoveryState";
 import type {
   MessagingThreadBindingSummary,
   NavigationThreadSummary,
@@ -184,6 +185,11 @@ export function RecentsList(props: RecentsListProps) {
     onReorderThreadPins: props.onReorderThreadPins,
     onSetThreadPin: props.onSetThreadPin,
   });
+  // The list below the Pinned group folds away so only the pins stay on
+  // screen. Window-local like the Draft chips: it is a view preference, not
+  // thread data, so it costs no persisted write and a restart opens the list.
+  const [unpinnedListCollapsed, setUnpinnedListCollapsed] = useRecoverableState<boolean>(
+    "navigation.unpinnedListCollapsed", false);
   const threadByKey = new Map(
     (props.loadedThreads ?? props.threads).map((thread) => [
       threadSummaryIdentityKey(thread),
@@ -266,6 +272,25 @@ export function RecentsList(props: RecentsListProps) {
   for (const key of topLevelKeys) {
     for (const child of trays.subtree(key)) renderedThreadKeys.add(threadSummaryIdentityKey(child));
   }
+  // Folding needs a Pinned group to fold under: with no pin the list is all
+  // there is, and hiding it would leave the lens blank.
+  const unpinnedCollapsed = unpinnedListCollapsed && pinnedRoots.length > 0;
+  const shownTopLevelThreads = unpinnedCollapsed ? [] : topLevelThreads;
+  // A selection that lands in the folded list (⌘K, a notification) would sit
+  // out of sight, so a new selection reopens the list, as it does the Pinned
+  // group. Collapsing with a thread open must not reopen it, hence the effect
+  // keys on the selection and reads this through a ref.
+  const selectionFolded = unpinnedCollapsed && props.selectedThreadKey !== undefined
+    && topLevelThreads.some((thread) => {
+      const key = threadSummaryIdentityKey(thread);
+      return key === props.selectedThreadKey
+        || trays.subtree(key).some((child) => threadSummaryIdentityKey(child) === props.selectedThreadKey);
+    });
+  const selectionFoldedRef = useRef(selectionFolded);
+  selectionFoldedRef.current = selectionFolded;
+  useEffect(() => {
+    if (selectionFoldedRef.current) setUnpinnedListCollapsed(false);
+  }, [props.selectedThreadKey, props.revealSelectedThreadRequest, setUnpinnedListCollapsed]);
   const childResourcesOf = (parent: NavigationThreadSummary) => {
     const childResourceId = `children:${navigationIdentityKey({ backend: parent.source, threadId: parent.id,
       ownerInstanceId: parent.federation?.ref.target.scope === "remote" ? parent.federation.ref.target.instanceId : undefined })}`;
@@ -420,7 +445,7 @@ export function RecentsList(props: RecentsListProps) {
   // deliberately absent, just like Finder ranges do not reach into a closed
   // disclosure.
   const pinnedGroupCollapsed = Boolean(props.pinnedGroupCollapsed);
-  const selectionOrder = [...(pinnedGroupCollapsed ? [] : pinnedRoots), ...topLevelThreads].flatMap((thread) => {
+  const selectionOrder = [...(pinnedGroupCollapsed ? [] : pinnedRoots), ...shownTopLevelThreads].flatMap((thread) => {
     const threadKey = threadSummaryIdentityKey(thread);
     return [
       threadKey,
@@ -623,6 +648,23 @@ export function RecentsList(props: RecentsListProps) {
   return (
     <div className={`sidebar-list sidebar-list--dense${pinnedRoots.length > 0 ? " sidebar-list--pinned-group" : ""}`}>
       {pinnedGroup}
+      {pinnedRoots.length > 0 && (topLevelThreads.length > 0 || props.pager) ? (
+        <button
+          type="button"
+          className="recents-pinned-divider directory-row__thread-divider"
+          aria-expanded={!unpinnedCollapsed}
+          aria-label={`${unpinnedCollapsed ? "Show" : "Hide"} unpinned threads`}
+          onClick={() => setUnpinnedListCollapsed(!unpinnedCollapsed)}
+        >
+          <span className="directory-row__thread-divider-label">
+            <span
+              aria-hidden="true"
+              className={`directory-row__thread-divider-chevron${unpinnedCollapsed ? "" : " is-open"}`}
+            />
+            <span>Unpinned threads</span>
+          </span>
+        </button>
+      ) : null}
       <div className="sidebar-list sidebar-list--compact" role="list">
         {startingRootThreads.map((creation) => (
           <div key={creation.selectionKey} className="thread-group">
@@ -636,9 +678,9 @@ export function RecentsList(props: RecentsListProps) {
             />
           </div>
         ))}
-        {topLevelThreads.map((thread) => renderThreadGroup(thread))}
+        {shownTopLevelThreads.map((thread) => renderThreadGroup(thread))}
       </div>
-      {props.pager}
+      {unpinnedCollapsed ? null : props.pager}
       {visitingSlot}
       {props.footer}
     </div>

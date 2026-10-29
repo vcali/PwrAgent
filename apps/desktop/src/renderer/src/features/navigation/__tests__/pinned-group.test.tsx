@@ -568,3 +568,116 @@ describe("Pinned group before its pages are read again", () => {
     ]);
   });
 });
+
+describe("Unpinned list fold", () => {
+  const unpinnedToggle = () => screen.getByRole("button", { name: /unpinned threads$/ });
+
+  it("folds the list away and leaves the pins on screen", () => {
+    renderRecents();
+    expect(unpinnedToggle()).toHaveAccessibleName("Hide unpinned threads");
+    expect(unpinnedToggle()).toHaveAttribute("aria-expanded", "true");
+
+    fireEvent.click(unpinnedToggle());
+
+    expect(unpinnedToggle()).toHaveAccessibleName("Show unpinned threads");
+    expect(unpinnedToggle()).toHaveAttribute("aria-expanded", "false");
+    expect(listTitles()).toEqual([]);
+    expect(titlesIn(pinnedGroup()!)).toEqual([
+      "Release manager",
+      "Docs IA migration",
+      "Rate limiter rewrite",
+    ]);
+
+    fireEvent.click(unpinnedToggle());
+    expect(listTitles()).toEqual([
+      "Dark-mode chart tokens",
+      "Glossary search index",
+      "Flaky auth fixture",
+    ]);
+  });
+
+  it("folds independently of the Pinned group", () => {
+    renderRecents({ pinnedGroupCollapsed: true });
+    fireEvent.click(unpinnedToggle());
+
+    expect(groupHeader()).toHaveAttribute("aria-expanded", "false");
+    expect(listTitles()).toEqual([]);
+  });
+
+  it("offers no fold without a pin to fold under", () => {
+    renderRecents({ threads: [chartTokens, glossary, flakyFixture] });
+
+    expect(screen.queryByRole("button", { name: /unpinned threads$/ })).toBeNull();
+    expect(listTitles()).toHaveLength(3);
+  });
+
+  it("shows the whole list again once the last pin goes", () => {
+    const view = renderRecents();
+    fireEvent.click(unpinnedToggle());
+    expect(listTitles()).toEqual([]);
+
+    view.rerender(
+      <Sidebar
+        backends={backends}
+        browseMode="recents"
+        directories={[]}
+        loading={false}
+        threads={[chartTokens, glossary, flakyFixture]}
+        onBrowseModeChange={() => undefined}
+        onCreateThread={async () => undefined}
+        onOpenLaunchpad={async () => undefined}
+        onSelectThread={() => undefined}
+      />,
+    );
+
+    expect(listTitles()).toHaveLength(3);
+  });
+
+  it("reopens a folded list for a newly selected thread, and only then", () => {
+    const view = renderRecents({ selectedItemKey: "codex:release" });
+    fireEvent.click(unpinnedToggle());
+    expect(listTitles()).toEqual([]);
+
+    // Folding with a pin selected, or re-rendering, leaves the list folded.
+    view.rerender(
+      <Sidebar
+        backends={backends}
+        browseMode="recents"
+        directories={[]}
+        loading={false}
+        selectedItemKey="codex:release"
+        threads={population}
+        onBrowseModeChange={() => undefined}
+        onCreateThread={async () => undefined}
+        onOpenLaunchpad={async () => undefined}
+        onSelectThread={() => undefined}
+      />,
+    );
+    expect(listTitles()).toEqual([]);
+
+    view.rerender(
+      <Sidebar
+        backends={backends}
+        browseMode="recents"
+        directories={[]}
+        loading={false}
+        selectedItemKey="codex:glossary"
+        threads={population}
+        onBrowseModeChange={() => undefined}
+        onCreateThread={async () => undefined}
+        onOpenLaunchpad={async () => undefined}
+        onSelectThread={() => undefined}
+      />,
+    );
+    expect(unpinnedToggle()).toHaveAttribute("aria-expanded", "true");
+    expect(listTitles()).toContain("Glossary search index");
+  });
+
+  it("keeps a folded list folded when a selected thread inside it is merely folded", () => {
+    renderRecents({ selectedItemKey: "codex:glossary" });
+    fireEvent.click(unpinnedToggle());
+
+    expect(unpinnedToggle()).toHaveAttribute("aria-expanded", "false");
+    expect(listTitles()).toEqual([]);
+  });
+});
