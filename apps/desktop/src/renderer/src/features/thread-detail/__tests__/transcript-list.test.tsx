@@ -1880,6 +1880,42 @@ Implementation notes remain in a readable bubble.`;
     });
   });
 
+  it("draws a Codex visualize directive as a link that opens the file preview", async () => {
+    const filePath = "/Users/example/.pwragent/profiles/dev/projects/audit/ctr-sources.html";
+    const readMarkdownFile = vi.fn(async () => ({
+      path: filePath,
+      content: "<p>Sources</p>",
+    }));
+
+    render(
+      <TranscriptList
+        desktopApi={{ readMarkdownFile }}
+        entries={[
+          {
+            type: "message",
+            id: "message-visualize-directive",
+            role: "assistant",
+            text: `Here is the audit.\n\nvisualize{"path":"${filePath}"}`,
+          },
+        ]}
+        loading={false}
+        loadingMore={false}
+        onLoadOlder={async () => undefined}
+      />
+    );
+
+    expect(screen.getByText("Here is the audit.")).toBeInTheDocument();
+    expect(screen.queryByText(/visualize\{/)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("link", { name: "ctr-sources.html" }));
+
+    await waitFor(() => {
+      expect(readMarkdownFile).toHaveBeenCalledWith(
+        expect.objectContaining({ path: filePath }),
+      );
+    });
+  });
+
   it("copies both markdown text and rendered HTML when the rich clipboard bridge exists", async () => {
     const copyText = vi.fn(async () => undefined);
     const copyRichText = vi.fn(async () => undefined);

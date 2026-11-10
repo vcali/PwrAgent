@@ -14,6 +14,7 @@ import {
   parseCodexAsyncQuestionReply,
   parseLinearPaste,
   parseThreadCorrespondenceMessage,
+  renderCodexVisualizeDirectives,
   stripCodexGitActionDirectives,
   summarizeThreadDependencyPrompt,
   threadTodoMessageOriginFromUnknown,
@@ -1702,7 +1703,7 @@ function buildMessageCopyText(
 ): string {
   if (typeof message.text === "string" && message.text.length > 0) {
     return message.role === "assistant"
-      ? stripCodexGitActionDirectives(message.text)
+      ? renderCodexVisualizeDirectives(stripCodexGitActionDirectives(message.text))
       : message.text;
   }
 
@@ -1721,7 +1722,7 @@ function stripCodexGitActionDirectivesFromParts(
     if (part.type !== "text") {
       return part;
     }
-    const text = stripCodexGitActionDirectives(part.text);
+    const text = renderCodexVisualizeDirectives(stripCodexGitActionDirectives(part.text));
     return text === part.text ? part : { ...part, text };
   });
 }
