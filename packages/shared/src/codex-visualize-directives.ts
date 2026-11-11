@@ -1,10 +1,15 @@
-const CODEX_VISUALIZE_DIRECTIVE_PREFIXES = [
-  "visualize{",
-  "::visualize{",
-] as const;
+// Codex wraps the directive in private-use marker characters, which draw as
+// empty boxes: one before the name, one before the payload, one after it.
+const MARKER = "[\\ue000-\\uf8ff]";
 
-const COMPLETE_CODEX_VISUALIZE_DIRECTIVE =
-  /^ {0,3}(?:::)?visualize(\{.*\})\s*$/;
+const COMPLETE_CODEX_VISUALIZE_DIRECTIVE = new RegExp(
+  `^ {0,3}(?:::|${MARKER})?visualize${MARKER}?(\\{.*\\})${MARKER}?\\s*$`,
+);
+
+const INLINE_CODEX_VISUALIZE_DIRECTIVE = new RegExp(
+  `${MARKER}visualize${MARKER}?(\\{[^\\ue000-\\uf8ff]*\\})${MARKER}`,
+  "g",
+);
 
 /**
  * Rewrites Codex's assistant-authored `visualize{"path":"…"}` lines into
@@ -15,7 +20,7 @@ const COMPLETE_CODEX_VISUALIZE_DIRECTIVE =
  * payload is not an absolute POSIX path is left as written.
  */
 export function renderCodexVisualizeDirectives(text: string): string {
-  if (!text.includes("visualize{")) {
+  if (!text.includes("visualize{") && !/[\ue000-\uf8ff]/.test(text)) {
     return text;
   }
 
@@ -52,7 +57,7 @@ export function renderCodexVisualizeDirectives(text: string): string {
       continue;
     }
 
-    const link = visualizeDirectiveLink(line);
+    const link = visualizeDirectiveLink(COMPLETE_CODEX_VISUALIZE_DIRECTIVE.exec(line)?.[1]);
     if (link) {
       // A link line would otherwise join the paragraph on either side.
       if (output.length > 0 && output[output.length - 1]?.trim() !== "") {
@@ -75,14 +80,19 @@ export function renderCodexVisualizeDirectives(text: string): string {
       continue;
     }
 
-    output.push(line);
+    // Mid-sentence, only the marked form is unambiguous.
+    const inline = line.replace(
+      INLINE_CODEX_VISUALIZE_DIRECTIVE,
+      (match, payload: string) => visualizeDirectiveLink(payload) ?? match,
+    );
+    changed ||= inline !== line;
+    output.push(inline);
   }
 
   return changed ? output.join(lineEnding) : text;
 }
 
-function visualizeDirectiveLink(line: string): string | undefined {
-  const payload = COMPLETE_CODEX_VISUALIZE_DIRECTIVE.exec(line)?.[1];
+function visualizeDirectiveLink(payload: string | undefined): string | undefined {
   if (!payload) {
     return undefined;
   }
@@ -122,9 +132,17 @@ function visualizeDirectiveLink(line: string): string | undefined {
 }
 
 function isPartialVisualizeDirective(line: string): boolean {
+  if (COMPLETE_CODEX_VISUALIZE_DIRECTIVE.test(line)) {
+    return false;
+  }
   const candidate = line.replace(/^ {0,3}/, "");
-  return (
-    CODEX_VISUALIZE_DIRECTIVE_PREFIXES.some((prefix) => candidate.startsWith(prefix))
-    && !COMPLETE_CODEX_VISUALIZE_DIRECTIVE.test(line)
-  );
+  if (/^(?:::)?visualize\{/.test(candidate)) {
+    return true;
+  }
+  if (!/^[\ue000-\uf8ff]/.test(candidate)) {
+    return false;
+  }
+  // The opening marker never reaches the operator, even before the name.
+  const name = candidate.slice(1);
+  return "visualize".startsWith(name) || name.startsWith("visualize");
 }

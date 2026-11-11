@@ -13,7 +13,7 @@ function linkedPath(line: string): string | undefined {
 const pathSegment = fc
   .string({ minLength: 1, maxLength: 12, unit: "grapheme" })
   .filter((segment) =>
-    !/[\u0000-\u001f\u007f/]/.test(segment)
+    !/[\u0000-\u001f\u007f/\ue000-\uf8ff]/.test(segment)
     && !/[\ud800-\udfff]/.test(segment.replace(/[\ud800-\udbff][\udc00-\udfff]/g, ""))
     && segment !== "."
     && segment !== "..");
@@ -22,7 +22,7 @@ const absolutePath = fc
   .map((segments) => `/${segments.join("/")}`);
 const proseLine = fc
   .string({ maxLength: 30 })
-  .filter((line) => !/[\r\n`~]/.test(line) && !line.includes("visualize"));
+  .filter((line) => !/[\r\n`~\ue000-\uf8ff]/.test(line) && !line.includes("visualize"));
 
 describe("Codex visualize directives", () => {
   it("links the exact line Codex wrote to the file it names", () => {
@@ -33,22 +33,41 @@ describe("Codex visualize directives", () => {
     );
   });
 
+  it("links the marked form Codex streams, whose markers draw as empty boxes", () => {
+    const path = "/Users/example/projects/ctr_audit/platform-adjusted-ctr.html";
+    const marked = `\ue200visualize\ue202{"path":"${path}"}\ue201`;
+    const link = `[platform\\-adjusted\\-ctr\\.html](file://${path})`;
+    expect(renderCodexVisualizeDirectives(`Android has the largest drop.\n\n${marked}`))
+      .toBe(`Android has the largest drop.\n\n${link}`);
+    expect(renderCodexVisualizeDirectives(`See ${marked} for detail.`))
+      .toBe(`See ${link} for detail.`);
+    // Without only its closing marker the directive is already complete.
+    for (let length = 1; length < marked.length - 1; length += 1) {
+      expect(renderCodexVisualizeDirectives(`Here it is.\n\n${marked.slice(0, length)}`))
+        .toBe("Here it is.");
+    }
+  });
+
   it("replaces every directive with a link that decodes to its path, and keeps every other line", () => {
     fc.assert(fc.property(
       fc.array(fc.oneof(proseLine, absolutePath.map((path) => ({ path }))), { maxLength: 8 }),
-      fc.boolean(),
+      fc.constantFrom(
+        (payload: string) => `visualize${payload}`,
+        (payload: string) => `::visualize${payload}`,
+        (payload: string) => `\ue200visualize\ue202${payload}\ue201`,
+      ),
       fc.constantFrom("\n", "\r\n"),
-      (entries, prefixed, lineEnding) => {
+      (entries, form, lineEnding) => {
         const text = entries
           .map((entry) =>
             typeof entry === "string"
               ? entry
-              : `${prefixed ? "::" : ""}visualize${JSON.stringify(entry)}`)
+              : form(JSON.stringify(entry)))
           .join(lineEnding);
         const rendered = renderCodexVisualizeDirectives(text);
         const lines = rendered.split(/\r?\n/);
 
-        expect(rendered).not.toMatch(/visualize\{/);
+        expect(rendered).not.toMatch(/visualize[\ue000-\uf8ff]?\{/);
         expect(lines.flatMap((line) => linkedPath(line) ?? []))
           .toEqual(entries.flatMap((entry) => typeof entry === "string" ? [] : [entry.path]));
         // Prose survives in order; only blank separators are added.

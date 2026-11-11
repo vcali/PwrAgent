@@ -1895,7 +1895,7 @@ Implementation notes remain in a readable bubble.`;
             type: "message",
             id: "message-visualize-directive",
             role: "assistant",
-            text: `Here is the audit.\n\nvisualize{"path":"${filePath}"}`,
+            text: `Here is the audit.\n\n\ue200visualize\ue202{"path":"${filePath}"}\ue201`,
           },
         ]}
         loading={false}
@@ -1905,7 +1905,8 @@ Implementation notes remain in a readable bubble.`;
     );
 
     expect(screen.getByText("Here is the audit.")).toBeInTheDocument();
-    expect(screen.queryByText(/visualize\{/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/visualize/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/[\ue000-\uf8ff]/)).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("link", { name: "ctr-sources.html" }));
 
