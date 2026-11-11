@@ -51,6 +51,9 @@ import type {
   ThreadReview,
   ListThreadReviewsRequest,
   UpdateThreadReviewRequest,
+  ReadReviewAutoFixRequest,
+  DisarmReviewAutoFixRequest,
+  ReviewAutoFixStatus,
   DismissOperatorQuestionRequest,
   OperatorQuestionThreadRequest,
   ListOperatorRequestsResponse,
@@ -179,6 +182,7 @@ import type {
   RemoveMcpConnectionRequest,
   SetMcpConnectionEnabledRequest,
   SetMcpConnectionSelectForNewThreadsRequest,
+  SetMcpConnectionProjectToolApprovalRequest,
   SetMcpConnectionToolApprovalRequest,
   SetSandboxerCleanupOnPrCloseRequest,
   SetLinearPasteImagesRequest,
@@ -248,6 +252,13 @@ import type {
   CodexAppServerRestartResult,
   CodexAppServerRestartStatus,
   DesktopThreadArchiveSweepStatus,
+  DesktopAutomaticArchiveRetiredNotice,
+  ThreadMaintenanceApplyRequest,
+  ThreadMaintenanceRules,
+  ThreadMaintenanceRun,
+  ThreadMaintenanceScan,
+  ThreadMaintenanceScanProgress,
+  ThreadMaintenanceScanStep,
   CheckThreadBranchDriftRequest,
   CheckThreadBranchDriftResponse,
   CompactThreadRequest,
@@ -318,6 +329,8 @@ import type {
   SetThreadReactionRequest,
   SetThreadReactionResponse,
   SetThreadLockRequest,
+  SetThreadCheckoutHibernationRequest,
+  SetThreadCheckoutHibernationResponse,
   SetThreadLockResponse,
   RecentThreadLockNotesResponse,
   ThreadLockNoteRequest,
@@ -387,6 +400,8 @@ import type {
   InspectCodeSignaturesResponse,
   PickGhCommandResponse,
   PickGitCommandResponse,
+  ManagedGitActionRequest,
+  ManagedGitActionResponse,
   PickReferenceFromDiskResponse,
   ConnectPwrGitResponse,
   ConnectPwrSnapResponse,
@@ -557,6 +572,9 @@ import type {
   HandoffInstanceThreadResult,
   CancelComposerFilePushRequest,
   ComposerFilePushProgress,
+  CancelThreadHandoffRequest,
+  RetryThreadHandoffNowRequest,
+  ThreadHandoffProgress,
   PushComposerFileRequest,
   PushComposerFileResult,
   SetCelestialIconRequest,
@@ -708,6 +726,8 @@ import {
   THREAD_TODOS_SNAPSHOT_CHANNEL,
   THREAD_REVIEWS_LIST_CHANNEL,
   THREAD_REVIEWS_UPDATE_CHANNEL,
+  THREAD_REVIEWS_READ_AUTO_FIX_CHANNEL,
+  THREAD_REVIEWS_DISARM_AUTO_FIX_CHANNEL,
   THREAD_TODOS_LIST_PROJECTS_CHANNEL,
   THREAD_TODOS_RESOLVE_CHANNEL,
   THREAD_TODOS_RUN_ACTION_CHANNEL,
@@ -743,6 +763,7 @@ import {
   AGENT_PREVIEW_THREAD_REWIND_CHANNEL,
   AGENT_REWIND_THREAD_CHANNEL,
   AGENT_UNDO_THREAD_REWIND_CHANNEL,
+  AGENT_CONTINUE_CLAUDE_THREAD_IN_NEW_SESSION_CHANNEL,
   AGENT_RUN_CODEX_ENVIRONMENT_ACTION_CHANNEL,
   AGENT_STOP_CODEX_ENVIRONMENT_ACTION_CHANNEL,
   AGENT_SET_CODEX_THREAD_ENVIRONMENT_CHANNEL,
@@ -819,7 +840,16 @@ import {
   RESTART_GATE_STATUS_CHANNEL,
   APP_SERVER_GET_THREAD_ARCHIVE_SWEEP_STATUS_CHANNEL,
   APP_SERVER_RUN_THREAD_ARCHIVE_SWEEP_CHANNEL,
+  APP_SERVER_GET_AUTOMATIC_ARCHIVE_RETIRED_NOTICE_CHANNEL,
+  APP_SERVER_DISMISS_AUTOMATIC_ARCHIVE_RETIRED_NOTICE_CHANNEL,
   THREAD_ARCHIVE_SWEEP_STATUS_CHANGED_EVENT_CHANNEL,
+  APP_SERVER_SCAN_THREAD_MAINTENANCE_CHANNEL,
+  APP_SERVER_APPLY_THREAD_MAINTENANCE_CHANNEL,
+  APP_SERVER_GET_THREAD_MAINTENANCE_RUN_CHANNEL,
+  APP_SERVER_STOP_THREAD_MAINTENANCE_CHANNEL,
+  THREAD_MAINTENANCE_RUN_CHANGED_EVENT_CHANNEL,
+  THREAD_MAINTENANCE_SCAN_PROGRESS_EVENT_CHANNEL,
+  WINDOW_OPEN_THREAD_MAINTENANCE_CHANNEL,
   GITHUB_PR_SAML_ENFORCEMENT_EVENT_CHANNEL,
   MANAGED_GROK_SIGNATURE_REJECTED_EVENT_CHANNEL,
   MANAGED_RUNTIME_PROGRESS_EVENT_CHANNEL,
@@ -894,6 +924,9 @@ import {
   FEDERATION_PUSH_COMPOSER_FILE_CHANNEL,
   FEDERATION_CANCEL_COMPOSER_FILE_PUSH_CHANNEL,
   FEDERATION_COMPOSER_FILE_PUSH_PROGRESS_CHANNEL,
+  FEDERATION_CANCEL_HANDOFF_THREAD_CHANNEL,
+  FEDERATION_HANDOFF_THREAD_PROGRESS_CHANNEL,
+  FEDERATION_RETRY_HANDOFF_THREAD_NOW_CHANNEL,
   FEDERATION_SET_CELESTIAL_ICON_CHANNEL,
   FEDERATION_SET_SHORT_NAME_CHANNEL,
   FEDERATION_SET_EVENT_SUBSCRIPTIONS_CHANNEL,
@@ -950,6 +983,7 @@ import {
   MCP_CONNECTION_SET_ENABLED_CHANNEL,
   MCP_CONNECTION_SET_SELECT_FOR_NEW_THREADS_CHANNEL,
   MCP_CONNECTION_SET_TOOL_APPROVAL_CHANNEL,
+  MCP_CONNECTION_SET_PROJECT_TOOL_APPROVAL_CHANNEL,
   MCP_CONNECTION_SET_SANDBOXER_CLEANUP_ON_PR_CLOSE_CHANNEL,
   MCP_CONNECTION_SET_LINEAR_PASTE_IMAGES_CHANNEL,
   MCP_CONNECTION_FETCH_LINEAR_PASTED_IMAGES_CHANNEL,
@@ -1043,6 +1077,7 @@ import {
   NAVIGATION_SET_THREAD_PIN_CHANNEL,
   NAVIGATION_SET_THREAD_REACTION_CHANNEL,
   NAVIGATION_SET_THREAD_LOCK_CHANNEL,
+  NAVIGATION_SET_THREAD_CHECKOUT_HIBERNATION_CHANNEL,
   NAVIGATION_RECENT_THREAD_LOCK_NOTES_CHANNEL,
   NAVIGATION_REMEMBER_THREAD_LOCK_NOTE_CHANNEL,
   NAVIGATION_FORGET_THREAD_LOCK_NOTE_CHANNEL,
@@ -1053,14 +1088,11 @@ import {
   NAVIGATION_ACKNOWLEDGE_THREAD_ENVIRONMENT_FAILURE_CHANNEL,
   NAVIGATION_SET_ELIGIBLE_THREADS_PR_AUTO_DISPATCH_CHANNEL,
   NAVIGATION_RESET_DIRECTORY_LAUNCHPAD_CHANNEL,
-  NAVIGATION_QUERY_PAGE_CHANNEL,
+  OWNER_REQUEST_CHANNEL,
   NAVIGATION_QUERY_RELEASE_CHANNEL,
   NAVIGATION_ATTENTION_VIEW_RELEASE_CHANNEL,
-  NAVIGATION_QUEUE_PROJECTION_CHANNEL,
   NAVIGATION_REMOVE_DIRECTORY_CHANNEL,
   NAVIGATION_MARK_DIRECTORY_SEEN_CHANNEL,
-  NAVIGATION_LAUNCHPAD_CONFIG_CHANNEL,
-  NAVIGATION_SELECTED_DETAIL_CHANNEL,
   NAVIGATION_SNAPSHOT_CHANNEL,
   NAVIGATION_UPDATE_SUBTHREAD_ORDER_CHANNEL,
   NAVIGATION_UPDATE_DIRECTORY_LAUNCHPAD_CHANNEL,
@@ -1105,6 +1137,7 @@ import {
   SETTINGS_PICK_GLAB_COMMAND_CHANNEL,
   SETTINGS_PICK_GIT_COMMAND_CHANNEL,
   SETTINGS_REFRESH_GIT_DISCOVERY_CHANNEL,
+  SETTINGS_MANAGED_GIT_ACTION_CHANNEL,
   SETTINGS_READ_CHANNEL,
   TOKEN_MISER_READ_USAGE_CHANNEL,
   SETTINGS_READ_BOOTSTRAP_CHANNEL,
@@ -1352,6 +1385,10 @@ const desktopApi = Object.freeze({
     request: SetMcpConnectionToolApprovalRequest,
   ): Promise<MutateMcpConnectionResponse> =>
     await ipcRenderer.invoke(MCP_CONNECTION_SET_TOOL_APPROVAL_CHANNEL, request),
+  setMcpConnectionProjectToolApproval: async (
+    request: SetMcpConnectionProjectToolApprovalRequest,
+  ): Promise<MutateMcpConnectionResponse> =>
+    await ipcRenderer.invoke(MCP_CONNECTION_SET_PROJECT_TOOL_APPROVAL_CHANNEL, request),
   setSandboxerTransport: async (request: SetSandboxerTransportRequest): Promise<MutateMcpConnectionResponse> =>
     await ipcRenderer.invoke(MCP_CONNECTION_SET_SANDBOXER_TRANSPORT_CHANNEL, request),
   setSandboxerCleanupOnPrClose: async (
@@ -1674,6 +1711,22 @@ const desktopApi = Object.freeze({
     request: HandoffInstanceThreadRequest,
   ): Promise<HandoffInstanceThreadResult> =>
     await ipcRenderer.invoke(FEDERATION_HANDOFF_THREAD_CHANNEL, request),
+  cancelThreadHandoff: async (request: CancelThreadHandoffRequest): Promise<void> =>
+    await ipcRenderer.invoke(FEDERATION_CANCEL_HANDOFF_THREAD_CHANNEL, request),
+  retryThreadHandoffNow: async (request: RetryThreadHandoffNowRequest): Promise<void> =>
+    await ipcRenderer.invoke(FEDERATION_RETRY_HANDOFF_THREAD_NOW_CHANNEL, request),
+  onThreadHandoffProgress: (
+    callback: (progress: ThreadHandoffProgress) => void,
+  ): (() => void) => {
+    const listener = (
+      _event: Electron.IpcRendererEvent,
+      payload: ThreadHandoffProgress,
+    ) => callback(payload);
+    ipcRenderer.on(FEDERATION_HANDOFF_THREAD_PROGRESS_CHANNEL, listener);
+    return () => {
+      ipcRenderer.off(FEDERATION_HANDOFF_THREAD_PROGRESS_CHANNEL, listener);
+    };
+  },
   pushComposerFile: async (
     request: PushComposerFileRequest,
   ): Promise<PushComposerFileResult> =>
@@ -1836,6 +1889,24 @@ const desktopApi = Object.freeze({
     await ipcRenderer.invoke(APP_SERVER_GET_THREAD_ARCHIVE_SWEEP_STATUS_CHANNEL),
   runThreadArchiveSweep: async (): Promise<DesktopThreadArchiveSweepStatus> =>
     await ipcRenderer.invoke(APP_SERVER_RUN_THREAD_ARCHIVE_SWEEP_CHANNEL),
+  getAutomaticArchiveRetiredNotice: async (): Promise<DesktopAutomaticArchiveRetiredNotice> =>
+    await ipcRenderer.invoke(APP_SERVER_GET_AUTOMATIC_ARCHIVE_RETIRED_NOTICE_CHANNEL),
+  dismissAutomaticArchiveRetiredNotice: async (): Promise<void> =>
+    await ipcRenderer.invoke(APP_SERVER_DISMISS_AUTOMATIC_ARCHIVE_RETIRED_NOTICE_CHANNEL),
+  scanThreadMaintenance: async (request?: {
+    rules?: Partial<ThreadMaintenanceRules>;
+    projectKey?: string;
+    steps?: ThreadMaintenanceScanStep[];
+    hibernateIdleDays?: number;
+    progressId?: string;
+  }): Promise<ThreadMaintenanceScan> =>
+    await ipcRenderer.invoke(APP_SERVER_SCAN_THREAD_MAINTENANCE_CHANNEL, request),
+  applyThreadMaintenance: async (request: ThreadMaintenanceApplyRequest): Promise<ThreadMaintenanceRun> =>
+    await ipcRenderer.invoke(APP_SERVER_APPLY_THREAD_MAINTENANCE_CHANNEL, request),
+  getThreadMaintenanceRun: async (): Promise<ThreadMaintenanceRun | null> =>
+    await ipcRenderer.invoke(APP_SERVER_GET_THREAD_MAINTENANCE_RUN_CHANNEL),
+  stopThreadMaintenance: async (): Promise<void> =>
+    await ipcRenderer.invoke(APP_SERVER_STOP_THREAD_MAINTENANCE_CHANNEL),
   listBackends: async (
     request?: ListBackendsRequest
   ): Promise<ListBackendsResponse> =>
@@ -1973,6 +2044,10 @@ const desktopApi = Object.freeze({
     await ipcRenderer.invoke(SETTINGS_PICK_GIT_COMMAND_CHANNEL),
   refreshGitDiscovery: async (): Promise<ReadDesktopSettingsResponse> =>
     await ipcRenderer.invoke(SETTINGS_REFRESH_GIT_DISCOVERY_CHANNEL),
+  managedGitAction: async (
+    request: ManagedGitActionRequest,
+  ): Promise<ManagedGitActionResponse> =>
+    await ipcRenderer.invoke(SETTINGS_MANAGED_GIT_ACTION_CHANNEL, request),
   inspectCodeSignatures: async (
     request: InspectCodeSignaturesRequest,
   ): Promise<InspectCodeSignaturesResponse> =>
@@ -2426,6 +2501,12 @@ const desktopApi = Object.freeze({
     await ipcRenderer.invoke(THREAD_REVIEWS_LIST_CHANNEL, request ?? {}),
   updateThreadReview: async (request: UpdateThreadReviewRequest): Promise<{ review: ThreadReview }> =>
     await ipcRenderer.invoke(THREAD_REVIEWS_UPDATE_CHANNEL, request),
+  readReviewAutoFix: async (request: ReadReviewAutoFixRequest): Promise<{ status: ReviewAutoFixStatus }> =>
+    await ipcRenderer.invoke(THREAD_REVIEWS_READ_AUTO_FIX_CHANNEL, request),
+  disarmReviewAutoFix: async (
+    request: DisarmReviewAutoFixRequest,
+  ): Promise<{ disarmed: boolean; status: ReviewAutoFixStatus }> =>
+    await ipcRenderer.invoke(THREAD_REVIEWS_DISARM_AUTO_FIX_CHANNEL, request),
   resolveThreadTodo: async (
     request: ResolveThreadTodoRequest,
   ): Promise<ThreadTodoMutationResponse> =>
@@ -2543,6 +2624,10 @@ const desktopApi = Object.freeze({
     request: UndoThreadRewindRequest,
   ): Promise<UndoThreadRewindResponse> =>
     await ipcRenderer.invoke(AGENT_UNDO_THREAD_REWIND_CHANNEL, request),
+  continueClaudeThreadInNewSession: async (
+    request: { threadId: string },
+  ): Promise<{ threadId: string }> =>
+    await ipcRenderer.invoke(AGENT_CONTINUE_CLAUDE_THREAD_IN_NEW_SESSION_CHANNEL, request),
   configureGrokWorkflowBudget: async (
     request: ConfigureGrokWorkflowBudgetRequest,
   ): Promise<ConfigureGrokWorkflowBudgetResponse> =>
@@ -2691,7 +2776,7 @@ const desktopApi = Object.freeze({
     request: NavigationQueryRequest,
     consumerId?: string,
   ): Promise<NavigationQueryPage> =>
-    unwrapNavigationRead(await ipcRenderer.invoke(NAVIGATION_QUERY_PAGE_CHANNEL, request, consumerId)),
+    unwrapNavigationRead(await ipcRenderer.invoke(OWNER_REQUEST_CHANNEL, { method: "backend.getNavigationQueryPage", params: request }, consumerId)),
   releaseNavigationQuery: async (consumerId: string): Promise<void> =>
     await ipcRenderer.invoke(NAVIGATION_QUERY_RELEASE_CHANNEL, consumerId),
   releaseNavigationAttentionView: async (request: NavigationAttentionViewReleaseRequest): Promise<void> =>
@@ -2704,17 +2789,17 @@ const desktopApi = Object.freeze({
     request: NavigationLaunchpadConfigRequest,
     consumerId?: string,
   ): Promise<NavigationLaunchpadConfigResponse> =>
-    unwrapNavigationRead(await ipcRenderer.invoke(NAVIGATION_LAUNCHPAD_CONFIG_CHANNEL, request, consumerId)),
+    unwrapNavigationRead(await ipcRenderer.invoke(OWNER_REQUEST_CHANNEL, { method: "backend.getNavigationLaunchpadConfig", params: request }, consumerId)),
   getNavigationSelectedDetail: async (
     request: NavigationSelectedDetailRequest,
     consumerId?: string,
   ): Promise<NavigationSelectedDetailResponse> =>
-    unwrapNavigationRead(await ipcRenderer.invoke(NAVIGATION_SELECTED_DETAIL_CHANNEL, request, consumerId)),
+    unwrapNavigationRead(await ipcRenderer.invoke(OWNER_REQUEST_CHANNEL, { method: "backend.getNavigationSelectedDetail", params: request }, consumerId)),
   getNavigationQueueProjection: async (
     request: NavigationQueueProjectionRequest,
     consumerId?: string,
   ): Promise<NavigationQueueProjection> =>
-    unwrapNavigationRead(await ipcRenderer.invoke(NAVIGATION_QUEUE_PROJECTION_CHANNEL, request, consumerId)),
+    unwrapNavigationRead(await ipcRenderer.invoke(OWNER_REQUEST_CHANNEL, { method: "backend.getNavigationQueueProjection", params: request }, consumerId)),
   getNavigationSnapshotTransport: async (
     request: GetNavigationSnapshotTransportRequest,
   ): Promise<NavigationSnapshotTransportResponse> =>
@@ -2745,6 +2830,10 @@ const desktopApi = Object.freeze({
     request: SetThreadLockRequest,
   ): Promise<SetThreadLockResponse> =>
     await ipcRenderer.invoke(NAVIGATION_SET_THREAD_LOCK_CHANNEL, request),
+  setThreadCheckoutHibernation: async (
+    request: SetThreadCheckoutHibernationRequest,
+  ): Promise<SetThreadCheckoutHibernationResponse> =>
+    await ipcRenderer.invoke(NAVIGATION_SET_THREAD_CHECKOUT_HIBERNATION_CHANNEL, request),
   listRecentThreadLockNotes: async (): Promise<RecentThreadLockNotesResponse> =>
     await ipcRenderer.invoke(NAVIGATION_RECENT_THREAD_LOCK_NOTES_CHANNEL),
   rememberThreadLockNote: async (
@@ -3310,6 +3399,39 @@ const desktopApi = Object.freeze({
     ipcRenderer.on(RESTART_GATE_STATUS_CHANGED_EVENT_CHANNEL, listener);
     return () => {
       ipcRenderer.off(RESTART_GATE_STATUS_CHANGED_EVENT_CHANNEL, listener);
+    };
+  },
+  onThreadMaintenanceRunChanged: (
+    callback: (run: ThreadMaintenanceRun) => void,
+  ): (() => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, run: ThreadMaintenanceRun) => callback(run);
+    ipcRenderer.on(THREAD_MAINTENANCE_RUN_CHANGED_EVENT_CHANNEL, listener);
+    return () => {
+      ipcRenderer.off(THREAD_MAINTENANCE_RUN_CHANGED_EVENT_CHANNEL, listener);
+    };
+  },
+  onThreadMaintenanceScanProgress: (
+    callback: (progress: ThreadMaintenanceScanProgress) => void,
+  ): (() => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, progress: ThreadMaintenanceScanProgress) => callback(progress);
+    ipcRenderer.on(THREAD_MAINTENANCE_SCAN_PROGRESS_EVENT_CHANNEL, listener);
+    return () => {
+      ipcRenderer.off(THREAD_MAINTENANCE_SCAN_PROGRESS_EVENT_CHANNEL, listener);
+    };
+  },
+  onOpenThreadMaintenanceRequested: (
+    callback: (request: { projectKey?: string }) => void,
+  ): (() => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, request: unknown) => {
+      const projectKey = request && typeof request === "object"
+        && typeof (request as { projectKey?: unknown }).projectKey === "string"
+        ? (request as { projectKey: string }).projectKey
+        : undefined;
+      callback(projectKey ? { projectKey } : {});
+    };
+    ipcRenderer.on(WINDOW_OPEN_THREAD_MAINTENANCE_CHANNEL, listener);
+    return () => {
+      ipcRenderer.off(WINDOW_OPEN_THREAD_MAINTENANCE_CHANNEL, listener);
     };
   },
   onThreadArchiveSweepStatusChanged: (

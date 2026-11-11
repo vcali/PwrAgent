@@ -1,9 +1,13 @@
 import path from "node:path";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
-import { expect, test } from "@playwright/test";
+import Database from "better-sqlite3";
+import { expect, test } from "./fixtures/electron-test";
 import { launchElectronApp, threadRowCard } from "./fixtures/electron-app";
+import { stateDbPathForHomeRoot } from "./fixtures/readme-state-seeding";
+import type { ReplayFixture } from "../src/main/testing/replay-fixture";
+import type { DesktopApi } from "../src/renderer/src/lib/desktop-api";
 
 const turnLifecycleSpecDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -275,6 +279,83 @@ async function createActiveTurnWorkspaceFixture(): Promise<{
     fixturePath,
   };
 }
+
+test("retires a refused optimistic start and admits the next turn", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "pwragent-refused-start-"));
+  const fixture = JSON.parse(await readFile(path.join(turnLifecycleSpecDir, "fixtures/turn-lifecycle/replay.fixture.json"), "utf8")) as ReplayFixture;
+  fixture.metadata.scenario = "refused-turn-start";
+  const startIndex = fixture.steps.findIndex((step) => step.kind === "response" && step.method === "turn/start");
+  if (startIndex < 0) throw new Error("Missing turn start fixture");
+  fixture.steps.splice(startIndex, 0, { id: "start-refused", kind: "response", method: "turn/start",
+    error: { message: "Fixture provider refused the start" } });
+  const fixturePath = path.join(root, "replay.fixture.json");
+  await writeFile(fixturePath, JSON.stringify(fixture));
+  const app = await launchElectronApp({ fixturePath });
+  try {
+    await app.window.getByRole("button", { name: /Turn lifecycle replay/i }).first().click();
+    await expect(app.window.getByText("lifecycle baseline ready", { exact: true })).toBeVisible();
+    const refused = await app.window.evaluate(async () => {
+      const api = (window as unknown as { pwragent: DesktopApi }).pwragent;
+      return await api.startTurn!({ backend: "codex", threadId: "thread-turn-lifecycle",
+        input: [{ type: "text", text: "Refuse this fixture start" }] })
+        .then(() => "accepted", (error: unknown) => error instanceof Error ? error.message : String(error));
+    });
+    expect(refused).toContain("Fixture provider refused the start");
+    await expect(app.window.getByTestId("composer-stop-turn")).toHaveCount(0);
+    await app.window.getByRole("textbox", { name: "Reply", exact: true }).fill("Start after the refusal");
+    await app.window.getByRole("button", { name: "Send", exact: true }).click();
+    await expect(app.window.getByTestId("composer-stop-turn")).toBeVisible();
+    for (const step of fixture.steps) {
+      if (step.kind === "notification") await app.advance({ stepId: step.id });
+    }
+    await expect(app.window.getByTestId("composer-stop-turn")).toHaveCount(0);
+  } finally {
+    await app.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("completes an accepted turn after settings persistence rejects", async () => {
+  const fixturePath = path.join(turnLifecycleSpecDir, "fixtures/turn-lifecycle/replay.fixture.json");
+  const fixture = JSON.parse(await readFile(fixturePath, "utf8")) as ReplayFixture;
+  const app = await launchElectronApp({ fixturePath });
+  const output: string[] = [];
+  const collect = (chunk: Buffer) => { output.push(chunk.toString()); };
+  app.electronApp.process().stderr?.on("data", collect);
+  app.electronApp.process().stdout?.on("data", collect);
+  const db = new Database(stateDbPathForHomeRoot(app.homeRoot));
+  try {
+    await app.window.getByRole("button", { name: /Turn lifecycle replay/i }).first().click();
+    await expect(app.window.getByText("lifecycle baseline ready", { exact: true })).toBeVisible();
+    // This isolated profile's trigger rejects exactly the post-acceptance
+    // fast-mode write. No production fault flag or process hook is needed.
+    db.exec(`CREATE TRIGGER reject_accepted_settings BEFORE UPDATE OF payload ON threads
+      WHEN json_extract(NEW.payload, '$.threadId') = 'thread-turn-lifecycle'
+        AND json_extract(NEW.payload, '$.fastMode') = 1
+      BEGIN SELECT RAISE(ABORT, 'Fixture accepted settings rejected'); END`);
+    const accepted = await app.window.evaluate(async () => {
+      const api = (window as unknown as { pwragent: DesktopApi }).pwragent;
+      return await api.startTurn!({ backend: "codex", threadId: "thread-turn-lifecycle",
+        input: [{ type: "text", text: "Continue after accepted settings fail" }], fastMode: true, executionMode: "auto" });
+    });
+    expect(accepted).toMatchObject({ backend: "codex", threadId: "thread-turn-lifecycle", turnId: "turn-turn-lifecycle-2" });
+    expect(await app.getLastStartTurn()).toMatchObject({ fastMode: true });
+    await expect.poll(() => output.join("")).toContain("Fixture accepted settings rejected");
+    expect(output.join("")).toContain("accepted_turn_finalization_failed");
+    expect(output.join("")).toContain("stage=model");
+    await expect(app.window.getByTestId("composer-stop-turn")).toBeVisible();
+    for (const step of fixture.steps) {
+      if (step.kind === "notification") await app.advance({ stepId: step.id });
+    }
+    await expect(app.window.getByTestId("composer-stop-turn")).toHaveCount(0);
+    await expect(app.window.getByRole("region", { name: "Transcript" }).getByText(
+      "Created /tmp/pwragent-turn-lifecycle.txt with exactly the text lifecycle second turn.",
+    )).toBeVisible();
+  } finally {
+    db.close();
+    await app.close();
+  }
+});
 
 test("keeps transient turn UI through metadata and premature idle notifications", async () => {
   const app = await launchElectronApp({

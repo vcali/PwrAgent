@@ -192,14 +192,18 @@ and offers **Reopen**. Declining is a final outcome the agent can see in
 `list_reviews`, not a hidden row. The head's dismiss control dismisses the
 whole review, and the stack's **Undo** reopens it.
 
-The footer button reads **Fix all** and sends every open finding. Selecting
-rows turns it into **Fix N selected**. **Fix now** sends its one finding.
-Each sends one reply to the review's thread: "Fix these N findings from
-<review>", the findings by priority and title, and one line pointing the
-agent at `list_reviews`. That result holds the details, the ids, and how to
-record each fix, so no per-turn note repeats it. The selection clears once
-the reply is sent. The card stays open until the last finding is settled. A
-review with nothing left open offers **Mark handled** instead.
+The footer button is a split button. Its label reads **Auto-fix** and sends
+every open finding to the thread's own agent, which decides each one (see
+[Auto-fix](#auto-fix)). Its menu offers **Fix all N**, which asks for every
+open finding to be fixed. Selecting rows turns the label into **Fix N
+selected**, and the menu then also offers **Auto-fix N selected**. **Fix
+now** sends its one finding. Fix sends one reply to the review's thread:
+"Fix these N findings from <review>", the findings by priority and title, and
+one line pointing the agent at `list_reviews`. That result holds the details,
+the ids, and how to record each fix, so no per-turn note repeats it. The
+selection clears once the reply is sent. The card stays open until the last
+finding is settled. A review with nothing left open offers **Mark handled**
+instead.
 
 Fix actions show a spinner and **Sending…** while the composer takes the
 request, then **Working…** while the owning thread has an active turn. Both
@@ -232,3 +236,92 @@ no-op, covered by `thread-review-legacy-enrollment`. The checked-in
 `thread-review-lifecycle` write budget measures a two-finding review and both
 resolutions at three commits and about 29 KB WAL, approximately 2.9 MB/day at
 100 such review lifecycles per day. Larger findings increase the payload cost.
+
+## Auto-fix
+
+The review panel's **Auto-fix findings** switch appears in the composer and
+in Star Map. When it is on, the review's open findings go to the thread's own
+agent as soon as the review lands, so nobody has to come back and click Fix.
+The thread's agent runs the fix, with the thread's own provider, model and
+reasoning, never the reviewer: it has the change's history, and a reviewer on
+another provider cannot edit the checkout.
+
+The switch starts at **Settings → General → Reviews → Start reviews with
+Auto-fix on**, stored per profile as `general.auto_fix_reviews` in
+`config.toml` and on when unset. Changing the switch in the panel lasts for
+that one review, as a reviewer override does. A queued review keeps the
+choice it was queued with, whatever the setting says later.
+
+The request carries `afterReview: "auto-fix"`. An omitted value means
+`"wait"`, so an owner never starts fixing for a viewer that did not ask. The
+panel shows the switch only when the thread owner's backend advertises the
+`reviewAutoFix` capability. A queued or scheduled review keeps the choice in
+its payload.
+
+Messaging `/review` offers the same **Auto-fix findings** toggle, on by
+default when the owner advertises support. The configurator keeps the choice
+through picker changes and pending-intent restoration. Review commands with
+arguments also request Auto-fix by default when supported.
+
+The owner arms the review in memory when the start is requested
+(`review-auto-fix.ts`), and matches the landed review to its start by turn
+id: a review runs as a turn of its own thread, and its artifact lands in that
+turn, inline or from a sub-agent. A review that lands before its start
+returns matches the thread's pending start. A refused start removes only
+itself, so a running review keeps its own choice. A review PwrAgent did not
+start, such as a typed `/code-review`, never fixes. An app restart ends the
+review's turn, so nothing needs to outlive it.
+`review-auto-fix.property.test.ts` holds these rules against a model of the
+reviews.
+
+When an armed review lands with open findings, the owner submits one turn to
+the thread. Behind a running turn it queues and never steers. The prompt
+(`autoFixReviewFindingsPrompt`) lists the findings by priority and asks the
+agent to settle each with `update_review_item`: fix a real problem in the
+change; defer work that needs a new system or is well outside the change,
+with a stand-alone `add_todo` card; decline a contrived case. It asks the
+agent to weigh whether minor findings are worth a push, because each push
+starts a CI run, and not to decline a correctness bug to avoid one. The
+card's **Auto-fix** sends the same prompt. The transcript folds the message
+to "Auto-fix started for <review>" with its finding count, from the
+`reviewAutoFix` message origin.
+
+Arming writes nothing to SQLite. The fix turn is an ordinary queued turn.
+
+### Auto-fix status
+
+The owner tells its viewers what Auto-fix is doing. Both answers come from
+the owner's memory, so a viewer never infers them.
+
+- **Armed.** While an armed review runs, the transcript's review status row
+  says **Auto-fix armed**: the thread's agent settles the findings when the
+  review ends. **Don't auto-fix** turns it off for that one review. The
+  setting and later reviews keep their own choice.
+- **Run.** The review card shows a line under its head for the fix turn:
+  **Auto-fixing** while the turn runs, **Auto-fix queued** while it waits
+  behind a running turn, and **Auto-fix left N open** when the turn ends
+  with findings still open. A cancelled fix turn shows nothing. When the
+  send fails or the queue refuses the turn, the line says **Auto-fix could
+  not start** with the reason. The failure goes away once an agent or the
+  operator settles a finding or resolves the review, because someone has
+  taken the findings on. A reviewer's own reported outcomes do not count. A
+  fix sent from the card's own buttons hides the failure on that card at
+  once, before any finding changes. A later failure shows again.
+
+The run follows the owner's own `thread/turnQueue/updated` events for the
+turn, matched by the review id in its `reviewAutoFix` message origin
+(`nextReviewAutoFixRun`). The owner keeps the last 20 runs per thread.
+`review-auto-fix-runs.property.test.ts` holds the phase table and that a
+viewer is told exactly when a run's phase changes, so a queue position
+update sends nothing.
+
+Viewers read the state with the `readReviewAutoFix` thread operation and
+disarm with `disarmReviewAutoFix`, through the same routes as the other
+thread to-do operations. A peer reaches them as `threadReviews.readAutoFix`
+(`thread_detail`) and `threadReviews.disarmAutoFix` (`turn_control`). A
+change publishes the thread's to-do change event, and viewers read again. An
+owner that predates these methods does not answer, and its reviews show no
+Auto-fix state.
+
+None of this writes to SQLite. An app restart ends the review's turn and its
+fix turn, so the state has nothing to outlive.

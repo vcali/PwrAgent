@@ -1,3 +1,4 @@
+import Database from "better-sqlite3";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
@@ -93,6 +94,30 @@ test("encrypted desktop protocol enrolls, browses, runs, reconnects and reads wh
   await assert.rejects(viewer(invite, v.identity, "reconnect"), /revoked_peer/);
 });
 
+test("an explicit title survives the shared client's derived first-turn name and restart", { timeout: 20000 }, async (t) => {
+  const h = await setup(t);
+  const invite = decodeFederationInvite((await h.rpc("federation-invite", { port: 0 })).invite);
+  let v = await viewer(invite);
+  t.after(() => v.connection.close());
+  v.subscribe();
+  const { threadId } = await v.call("startThread", { backend: "codex", cwd: h.workspace });
+  await v.call("renameThread", { threadId, title: "Release checklist" });
+  await v.call("startTurn", { backend: "codex", threadId, input: [{ type: "text", text: "Rewrite everything" }] });
+  await eventually(async () => (await v.call("resolveThread", { threadId })).thread.threadStatus === "idle");
+  const thread = (await v.call("resolveThread", { threadId })).thread;
+  assert.deepEqual([thread.title, thread.titleSource], ["Release checklist", "explicit"]);
+  const names = v.events.filter((event) => event.method === "backend.event")
+    .map((event) => event.params.notification).filter((event) => event.method === "thread/name/updated");
+  assert.ok(names.length > 0);
+  assert.ok(names.every((event) => event.params.threadName === "Release checklist"));
+  v.connection.close();
+  await h.stop(h.daemon);
+  await h.start();
+  v = await viewer(invite, v.identity, "reconnect");
+  const reopened = (await v.call("resolveThread", { threadId })).thread;
+  assert.deepEqual([reopened.title, reopened.titleSource], ["Release checklist", "explicit"]);
+});
+
 test("launchpad creation validates ownership and unsupported settings before creating a thread", { timeout: 20000 }, async (t) => {
   const h = await setup(t);
   const invite = decodeFederationInvite((await h.rpc("federation-invite", { port: 0 })).invite);
@@ -151,8 +176,10 @@ test("a thread is named from its first prompt, persists the name and tells subsc
   const cliThread = (await h.finished("cli-job")).threadId;
   v.connection.close();
   await h.stop(h.daemon);
-  const registry = JSON.parse(readFileSync(path.join(h.directory, "threads.json"), "utf8"));
-  assert.deepEqual(registry.threads.map(({ id, title: name, titleSource }) => ({ id, name, titleSource })), [
+  const db = new Database(path.join(path.dirname(h.directory), "state.db"), { readonly: true });
+  const threads = db.prepare("SELECT payload FROM threads ORDER BY rowid").all().map(row => JSON.parse(row.payload));
+  db.close();
+  assert.deepEqual(threads.map(({ threadId: id, title: name, titleSource }) => ({ id, name, titleSource })), [
     { id: created.threadId, name: title, titleSource: "derived" },
     { id: cliThread, name: "Check the release checklist for 1.3.8?", titleSource: "derived" },
   ]);
@@ -237,7 +264,7 @@ test("ungranted mutation capabilities and wrong pinned keys fail closed", { time
   const second = decodeFederationInvite((await h.rpc("federation-invite", { port: Number(new URL(invite.gatewayUrl).port) })).invite);
   await assert.rejects(viewer({ ...second, gatewayPublicKeyPem: generateFederationIdentityKeyPair().publicKeyPem }), /Invalid federation auth challenge/);
   assert.equal(h.calls().filter((message) => message.method === "thread/start").length, 0);
-  const limited = await viewer(second, undefined, "enroll", [...HEADLESS_CAPABILITIES, "durable_turn_requests_v1"]);
+  const limited = await viewer(second, undefined, "enroll", [...HEADLESS_CAPABILITIES, "pending_request_control"]);
   t.after(() => limited.connection.close());
   assert.deepEqual(limited.connection.capabilities, HEADLESS_CAPABILITIES);
   limited.connection.close();
@@ -259,14 +286,55 @@ test("owner methods require the same grants as on desktop", { timeout: 15000 }, 
   const navigation = await enroll(["thread_navigation"]);
   assert.equal((await navigation.call("getNavigationQueryPage", { protocol: 2, query: { kind: "lens", lens: "inbox" } })).entries.length, 1);
   for (const [method, params] of [["getNavigationSelectedDetail", { protocol: 2, ref }], ["getNavigationQueueProjection", { protocol: 2, ref }],
-    ["getNavigationLaunchpadConfig", { protocol: 2, directoryKey: h.workspace }], ["listBackends", {}]]) {
+    ["getNavigationLaunchpadConfig", { protocol: 2, directoryKey: h.workspace }], ["listBackends", {}],
+    ["readQueuedTurn", { ...ref, queueEntryId: "absent", forEdit: true }]]) {
     await assert.rejects(navigation.call(method, params), /capability/i, `${method} needs thread_detail`);
   }
   const detail = await enroll(["thread_navigation", "thread_detail"]);
   assert.equal((await detail.call("getNavigationSelectedDetail", { protocol: 2, ref })).identity, "present");
+  await owner.call("startTurn", { ...ref, input: [{ type: "text", text: "slow" }] });
+  const waiting = await owner.call("startTurn", { ...ref, queueEntryId: "detail-read", input: [{ type: "text", text: "Private queued input" }] });
+  assert.equal((await detail.call("readQueuedTurn", { ...ref, queueEntryId: waiting.queueEntryId, forEdit: true })).input[0].text, "Private queued input");
+  for (const method of ["releaseQueuedTurn", "cancelQueuedTurn", "setQueuedTurnPaused", "moveQueuedTurn"]) {
+    await assert.rejects(detail.call(method, { queueEntryId: "absent" }), /capability/i, `${method} needs turn_control`);
+  }
   const noEnvironment = await enroll(HEADLESS_CAPABILITIES.filter((capability) => capability !== "environment_actions"));
   await assert.rejects(noEnvironment.call("materializeDirectoryLaunchpad", { directoryKey: h.workspace, launchpad: {} }), /capability/i);
   assert.equal(h.calls().filter((message) => message.method === "thread/start").length, 1, "a refused launchpad creates no thread");
+});
+
+test("encrypted owner controls release held jobs and cancel waiting input without interrupting admitted work", { timeout: 20000 }, async t => {
+  const h = await setup(t);
+  const invite = decodeFederationInvite((await h.rpc("federation-invite", { port: 0 })).invite);
+  const owner = await viewer(invite);
+  t.after(() => owner.connection.close());
+  const created = await owner.call("startThread", { backend: "codex", cwd: h.workspace });
+  const ref = { backend: "codex", threadId: created.threadId };
+  owner.subscribe();
+  const active = await owner.call("startTurn", { ...ref, input: [{ type: "text", text: "slow" }] });
+  const failed = await owner.call("startTurn", { ...ref, queueEntryId: "failed", input: [{ type: "text", text: "fail" }] });
+  const waiting = await owner.call("startTurn", { ...ref, queueEntryId: "waiting", input: [{ type: "text", text: "slow" }] });
+  const deleted = await owner.call("startTurn", { ...ref, queueEntryId: "deleted", input: [{ type: "text", text: "deleted-private-input" }] });
+  const fingerprint = (await h.rpc("show", { id: waiting.queueEntryId })).fingerprint;
+  const cancel = h.launch(["cancel", "--id", deleted.queueEntryId]);
+  assert.equal((await cancel.done).code, 0, cancel.errors);
+  assert.equal(JSON.parse(cancel.output).disposition, "cancelled");
+  assert.equal((await h.rpc("show", { id: deleted.queueEntryId })).status, "interrupted");
+  await owner.call("interruptTurn", { ...ref, turnId: active.turnId });
+  await eventually(async () => (await owner.call("getNavigationQueueProjection", { protocol: 2, ref })).entries[0]?.manualReleaseRequired);
+  assert.equal((await h.rpc("show", { id: failed.queueEntryId })).status, "failed");
+  assert.equal((await owner.call("releaseQueuedTurn", { queueEntryId: waiting.queueEntryId })).disposition, "started");
+  assert.deepEqual(await owner.call("cancelQueuedTurn", { queueEntryId: waiting.queueEntryId }), {
+    queueEntryId: waiting.queueEntryId, cancelled: false, disposition: "already_admitted",
+    turnId: (await h.rpc("show", { id: waiting.queueEntryId })).turnId,
+  });
+  const admitted = await h.rpc("show", { id: waiting.queueEntryId });
+  assert.equal(admitted.status, "running");
+  assert.equal(admitted.fingerprint, fingerprint);
+  await owner.call("interruptTurn", { ...ref, turnId: admitted.turnId });
+  await eventually(() => owner.events.some(event => event.params?.notification?.method === "thread/turnQueue/updated" && event.params.notification.params.status === "cancelled"));
+  assert.equal(h.calls().filter(call => call.method === "turn/start" && call.params.input[0].text === "deleted-private-input").length, 0);
+  assert.equal(h.calls().filter(call => call.method === "turn/interrupt").length, 2);
 });
 
 for (const relay of [false, true]) {

@@ -85,6 +85,7 @@ const TELEGRAM_COMMAND_DESCRIPTIONS: Record<MessagingCommandVerb, string> = {
   agent: "Choose or create a PwrAgent Agent",
   new: "Start a new PwrAgent thread",
   status: "Show the current PwrAgent binding",
+  continue: "Continue a Claude thread after its session was deleted",
   detach: "Detach this chat from PwrAgent",
   monitor: "Monitor recent PwrAgent threads",
   schedule: "Schedule a message for this thread",
@@ -539,6 +540,7 @@ export class TelegramAdapter implements TelegramProviderAdapter {
       maxCallbackPayloadBytes: 64,
     },
     text: {
+      supportsApprovalContinuation: true,
       maxLength: 4096,
       encoding: "utf8-bytes",
       markdownDialect: "html",

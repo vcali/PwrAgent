@@ -10,11 +10,11 @@ import {
   updateLastUsed,
 } from "../profile";
 import fs from "node:fs";
-import { AppRuntimeInstanceStore } from "./app-runtime-instance-store.js";
-import { AutomationStore } from "../automations/automation-store.js";
-import { ScheduledThreadActionStore } from "../scheduled-actions/scheduled-thread-action-store.js";
-import { SqliteMessagingStore } from "./messaging-store-sqlite.js";
-import { SqliteOverlayStore } from "./overlay-store-sqlite.js";
+import { AppRuntimeInstanceStore } from "../storage/app-runtime-instance-store.js";
+import { AutomationStore } from "../storage/automation-store.js";
+import { ScheduledThreadActionStore } from "../storage/scheduled-thread-action-store.js";
+import { SqliteMessagingStore } from "../storage/messaging-store-sqlite.js";
+import { SqliteOverlayStore } from "../storage/overlay-store-sqlite.js";
 import { type AutoVacuumConversion, StateDb } from "./state-db.js";
 
 let stateDb: StateDb | null = null;
@@ -180,6 +180,15 @@ export function getAppScheduledThreadActionStore(): ScheduledThreadActionStore {
     throw new Error("App state not initialized. Call initializeAppState() first.");
   }
   return scheduledThreadActionStore;
+}
+
+/**
+ * Shutdown has released the runtime: stop the heartbeat's periodic
+ * main-thread writes. The marker stays until `disposeAppState` removes it at
+ * process exit, and its last write keeps it fresh for the heartbeat TTL.
+ */
+export function stopProfileRuntimeHeartbeatRefresh(): void {
+  profileRuntimeHeartbeat?.stopRefreshing();
 }
 
 export function disposeAppState(): void {

@@ -3,13 +3,14 @@ import { SqliteOverlayStore } from "../state/overlay-store-sqlite";
 import { measureSqliteWrites, SQLITE_WRITE_METRICS_ENV } from "../state/sqlite-write-metrics";
 import { expectSqliteWriteBudget } from "./fixtures/sqlite-write-budget";
 import { openInMemoryStateDb } from "./sqlite-test-utils";
+import { LocalOwnerNavigationTransport } from "../federation/local-owner-navigation-transport";
 import { buildFederatedThreadRef, type NavigationThreadSummary } from "@pwragent/shared";
 
 const mocks = vi.hoisted(() => ({
   store: undefined as unknown as SqliteOverlayStore,
   threads: [] as NavigationThreadSummary[],
 }));
-vi.mock("../app-server/desktop-overlay-store", () => ({ getDesktopOverlayStore: () => mocks.store }));
+vi.mock("../storage/desktop-overlay-store", () => ({ getDesktopOverlayStore: () => mocks.store }));
 vi.mock("../app-server/backend-registry", () => ({ getDesktopBackendRegistry: () => ({
   listThreads: async () => mocks.threads,
   canonicalizeNavigationThreadPullRequests: async (threads: NavigationThreadSummary[]) => threads,
@@ -42,6 +43,12 @@ it("adds zero SQLite commits for real overlay-backed query, model inventory, fac
       expect(pins).toHaveLength(1);
       expect(pins[0]).not.toHaveProperty("summary");
       const loadIndex = () => loadLocalNavigationQueryIndex({ callerReason: "navigation-write-budget" });
+      const local = new LocalOwnerNavigationTransport({ getNavigationQueryPage: (request) =>
+        queries.readPage({ loadIndex, scopeKey: "native-budget", request }) });
+      const native = await local.request({ method: "backend.getNavigationQueryPage", params: {
+        protocol: 2, consumer: "main-sidebar", inventory: "viewer", query: { kind: "lens", lens: "inbox" },
+      } }, "native-budget");
+      expect(native).toMatchObject({ protocol: 2, counts: { active: 1000 } });
       const updated = await queries.readPage({ loadIndex, scopeKey: "exact", request: {
         protocol: 2, consumer: "main-sidebar", query: { kind: "exact", identities: [{ backend: "codex", threadId: "thread-0" }] },
       } });

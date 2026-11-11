@@ -1,13 +1,14 @@
 import { automatedWorkStartedLabel, correspondenceNotice, incomingWorkText } from "./messaging-thread-notifications";
 import { codexSpeedOptions, codexSpeedSettings, nextCodexSpeed, selectedCodexSpeed } from "@pwragent/shared";
 import { finalTurnOutputText } from "@pwragent/shared";
-import type { ReviewRunMode } from "@pwragent/shared";
+import type { ReviewAfterAction, ReviewRunMode } from "@pwragent/shared";
 import { isThreadLockRefusal } from "@pwragent/shared";
 import { buildMessagingModelMenuActions } from "./messaging-model-menu";
 import { MessagingBrowseQueryPool } from "./messaging-browse-query-pool";
 import type { NavigationQuery } from "@pwragent/shared";
 import { readMessagingLaunchpadContext, isMessagingLaunchpadContext, type MessagingLaunchpadDirectory, type MessagingLaunchpadContext, type MessagingNewThreadNavigation } from "./messaging-launchpad-context";
 import { rememberBoundedMap } from "../../bounded-map";
+import { transitionQueueNotice, type QueueNoticeState, type QueueNoticeEvent } from "@pwragent/owner-core/queue-notice-lifecycle";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -98,7 +99,7 @@ import type {
   UpdateDirectoryLaunchpadRequest,
 } from "@pwragent/shared";
 import type { MessagingRbacPolicyProvider } from "../rbac-policy-service";
-import type { MessagingRequestSource, MessagingRequestStore } from "../../state/messaging-request-store";
+import type { MessagingRequestSource, MessagingRequestStore, MessagingStoreLike } from "./messaging-storage";
 import type {
   MessagingBindingRecord,
   MessagingCallbackHandleRecord,
@@ -183,7 +184,6 @@ import {
   defaultAgentScopeForChannel,
   type MessagingDefaultAgentScopeKind,
 } from "./messaging-default-agent.js";
-import type { MessagingStoreLike } from "../../state/messaging-store-sqlite";
 import type { MessagingCapabilityProfile } from "@pwragent/messaging-interface";
 import type {
   MessagingAdapter,
@@ -192,7 +192,7 @@ import type {
   MessagingThreadAdmissionState,
 } from "./messaging-adapter.js";
 import { MessagingFederatedThreadTargetError } from "./messaging-adapter.js";
-import type { MessagingActivityLog } from "../messaging-activity-log.js";
+import type { MessagingActivityStorage } from "@pwragent/owner-core/messaging-activity-storage";
 import {
   buildActivityIntent,
   buildApprovalIntent,
@@ -902,7 +902,7 @@ export type MessagingControllerDeliveryBudgetEvent = {
 
 type QueuedTurnAction = {
   entryId: string;
-  kind: "cancel" | "steer";
+  kind: "cancel" | "steer" | "retry";
 };
 
 type PrivateReplyAction =
@@ -996,7 +996,7 @@ export type MessagingControllerOptions = {
   fullAccessPolicyRevision?: () => number;
   deliveryBudget?: MessagingDeliveryBudget;
   sleepUntil?: (retryAt: number, now: () => number) => Promise<void>;
-  activityLog?: () => MessagingActivityLog;
+  activityLog?: () => MessagingActivityStorage;
   onDeliveryBudgetEvent?: (event: MessagingControllerDeliveryBudgetEvent) => void;
   onFullAccessPolicyViolation?: (event: {
     actorId: string;
@@ -1092,6 +1092,8 @@ export class MessagingController {
   >();
   private readonly pendingIntentTtlMs: number;
   private readonly pendingRequestPresentations = new Map<string, Promise<void>>();
+  private readonly queuedTurnActions = new Set<Promise<void>>();
+  private readonly queuedTurnDrainRequests = new Set<string>();
   private readonly interactionMapper: MessagingInteractionMapper;
   private readonly activeTurnsByThreadKey = new Map<string, MessagingActiveTurnSummary>();
   private readonly contextUsageSummariesByThreadKey = new Map<string, string>();
@@ -1139,6 +1141,10 @@ export class MessagingController {
     { parentTurnId: string; suppressed: boolean }
   >();
   private readonly turnAdmission: MessagingTurnAdmission;
+  private readonly queuedTurnDrainTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly queuedTurnDrains = new Map<string, Promise<void>>();
+  private readonly sharedQueueNotices = new Map<string, QueueNoticeState<MessagingQueuedTurnEntry>>();
+  private readonly sharedQueueNoticeHistory = new Set<string>();
   private readonly pendingNewThreadPrompts = new Map<string, PendingNewThreadPromptWindow>();
   private readonly pendingFullAccessNewThreadPrompts = new Map<
     string,
@@ -1628,6 +1634,12 @@ export class MessagingController {
     const eventTurnId = turnIdForBackendEvent(event);
     const turnQueueUpdate = turnQueueUpdateForBackendEvent(event);
     if (turnQueueUpdate) {
+      if (turnQueueUpdate.queueEntryId && (turnQueueUpdate.status === "started" || turnQueueUpdate.status === "cancelled" || turnQueueUpdate.status === "failed")) {
+        const key = `${threadKeyForBackendEvent(event, threadId)}:${turnQueueUpdate.queueEntryId}`;
+        await this.applySharedQueueNoticeEvent(key, {
+          type: "ownerOutcome", outcome: { status: turnQueueUpdate.status, turnId: turnQueueUpdate.turnId },
+        });
+      }
       await this.reconcileQueuedAgentMessagingOrigin({
         backend: event.backend,
         threadId,
@@ -1768,6 +1780,9 @@ export class MessagingController {
       );
       return;
     }
+    // Status surfaces show nothing about a hibernated checkout. A send from
+    // a conversation restores it on the owner like any other send.
+    if (event.notification.method === "thread/checkoutHibernation/updated") return;
     if (
       event.notification.method === "thread/executionMode/updated" ||
       event.notification.method === "thread/modelSettings/updated" ||
@@ -2359,7 +2374,7 @@ export class MessagingController {
         if (shouldRenderStatusForTurnStateChange(event, lifecycle)) {
           await this.renderAutomaticBindingStatus(binding);
         }
-        await this.startNextQueuedTurn(binding);
+        this.scheduleNextQueuedTurn(binding);
       } else if (activeTurn?.status === "waiting" && isTurnWorkActivityEvent(event, activeTurn)) {
         const previousTurn = activeTurn;
         activeTurn = {
@@ -2747,6 +2762,10 @@ export class MessagingController {
     }
     if (verb === "scheduled") {
       await this.handleScheduledCommand(event);
+      return;
+    }
+    if (verb === "continue") {
+      await this.continueClaudeThreadInNewSession(event);
       return;
     }
     if (verb === "status") {
@@ -3192,6 +3211,7 @@ export class MessagingController {
     navigation: MessagingNavigationContext;
     phase: MessagingReviewIntent["review"]["phase"];
     runMode?: ReviewRunMode;
+    afterReview?: ReviewAfterAction;
     cwd?: string;
     repositoryPath?: string;
     workspacePageIndex?: number;
@@ -3239,7 +3259,7 @@ export class MessagingController {
     // No advertised review runners means this instance predates reviewer
     // overrides; the Reviewer button stays off rather than offering a choice
     // that cannot land.
-    const reviewerOverridesSupported = reviewerBackends.some((entry) => entry.capabilities?.reviewRunner !== false);
+    const reviewerOverridesSupported = reviewerBackends.some((entry) => entry.capabilities?.reviewRunner === true);
     const reviewerBackendKind = params.reviewer?.backend ?? params.binding.backend;
     const reviewerEntry = reviewerBackends.find(
       (entry) => entry.backend === reviewerBackendKind,
@@ -3270,6 +3290,11 @@ export class MessagingController {
 
     const owner = reviewerBackends.find((entry) => entry.backend === params.binding.backend);
     const modeSupported = owner?.capabilities?.reviewRunMode === true;
+    const autoFixSupported = owner?.capabilities?.reviewAutoFix === true;
+    const afterReview = params.afterReview ?? (autoFixSupported ? "auto-fix" : undefined);
+    const autoFixUnavailable = !autoFixSupported && afterReview === "auto-fix"
+      ? "This owner no longer supports review Auto-fix. Update that PwrAgent instance before starting this review."
+      : undefined;
     const primaryCwd = thread ? findPrimaryReviewWorkspaceCwd(thread) : undefined;
     const managedReason = reviewerBackendKind !== params.binding.backend
       ? "PwrAgent Sub Agent is required for a different review provider."
@@ -3337,6 +3362,8 @@ export class MessagingController {
       if (runMode) summaryLines.push(`Mode: ${modeLabel}`);
       if (modeUnavailable) summaryLines.push(modeUnavailable);
       if (modeSupported && managedReason) summaryLines.push(managedReason);
+      if (autoFixSupported) summaryLines.push(`Auto-fix findings: ${afterReview === "auto-fix" ? "On" : "Off"}`);
+      if (autoFixUnavailable) summaryLines.push(autoFixUnavailable);
       body = summaryLines.join("\n");
       actions = [
         ...(linkedWorkspaces.length > 1
@@ -3385,6 +3412,12 @@ export class MessagingController {
           : []),
         ...(modeSupported ? [{
           id: "review:summary:mode", label: "Review Mode", fallbackText: "review mode", priority: 3,
+        }] : []),
+        ...(autoFixSupported ? [{
+          id: "review:summary:auto-fix",
+          label: `Auto-fix findings: ${afterReview === "auto-fix" ? "On" : "Off"}`,
+          fallbackText: "auto-fix findings",
+          priority: 4,
         }] : []),
         {
           id: "review:summary:start",
@@ -3541,7 +3574,7 @@ export class MessagingController {
         "It applies to this review only — the thread keeps its own settings.",
       ].join("\n");
       actions = [
-        ...reviewerBackends.flatMap((entry, index) => entry.capabilities?.reviewRunner === false ? [] : [{
+        ...reviewerBackends.flatMap((entry, index) => entry.capabilities?.reviewRunner !== true ? [] : [{
           id: `review:reviewer:provider:${index}`,
           label: entry.label,
           fallbackText: entry.backend,
@@ -3629,6 +3662,7 @@ export class MessagingController {
         threadId: params.binding.threadId,
         phase: params.phase,
         ...(runMode ? { runMode } : {}),
+        ...(afterReview ? { afterReview } : {}),
         ...(params.reviewer ? { reviewer: params.reviewer } : {}),
         ...(reviewerBackends.length > 0 ? { reviewerBackends } : {}),
         ...(params.cwd ? { cwd: params.cwd } : {}),
@@ -4595,6 +4629,7 @@ export class MessagingController {
 
     if (
       !isDefaultAgentRouteBinding(currentBinding)
+      && !this.options.backend.ownsTurnQueue
       && await this.isTurnOccupied(
         currentBinding,
         bundle.threadKey,
@@ -5266,6 +5301,27 @@ export class MessagingController {
           requestedExecutionMode: turnSettings.executionMode ?? "unset",
           ...acceptanceTiming,
         });
+        if (this.options.backend.ownsTurnQueue) {
+          const ownerQueueEntryId = started.queueEntryId ?? started.turnId;
+          const entry: MessagingQueuedTurnEntry = {
+            ...params, id: ownerQueueEntryId, ownerQueueEntryId, status: "queued",
+            createdAt: this.now(), updatedAt: this.now(),
+            pdfSourceRequest: startingOrigin?.source?.ref,
+          };
+          const key = `${params.threadKey}:${ownerQueueEntryId}`;
+          await this.applySharedQueueNoticeEvent(key, { type: "accepted", entry });
+          try {
+            await this.deliverQueuedTurnNotice(entry);
+          } catch (error) {
+            // A provider notice cannot undo the owner's accepted input.
+            this.logger.warn?.("messaging shared queue notice failed", {
+              queueEntryId: ownerQueueEntryId,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          } finally {
+            await this.applySharedQueueNoticeEvent(key, { type: "noticeReady" });
+          }
+        }
         return "queued";
       }
       turnStarted = true;
@@ -5486,8 +5542,13 @@ export class MessagingController {
       capabilityProfile: this.capabilityProfile,
       createdAt: this.now(),
       title: "Message queued",
-      body: buildQueuedTurnNoticeBody(entry.preview, canSteer),
+      body: buildQueuedTurnNoticeBody(entry.preview, canSteer, entry.manualRetryRequired),
       actions: [
+        ...(entry.manualRetryRequired ? [{
+          id: `queued-turn:retry:${entry.id}`,
+          label: "Retry",
+          style: "primary" as const,
+        }] : []),
         {
           id: `queued-turn:steer:${entry.id}`,
           label: "Steer",
@@ -5503,6 +5564,7 @@ export class MessagingController {
     });
     const result = await this.deliver(intent, entry.binding);
     if (result.surface) {
+      if (entry.ownerQueueEntryId) entry.surface = result.surface;
       this.turnAdmission.updateQueuedEntry(entry, {
         surface: result.surface,
       });
@@ -5557,11 +5619,49 @@ export class MessagingController {
     }
   }
 
+  private async applySharedQueueNoticeEvent(key: string, event: QueueNoticeEvent<MessagingQueuedTurnEntry>): Promise<void> {
+    const transition = transitionQueueNotice(this.sharedQueueNotices.get(key), event);
+    if (!transition.state) return;
+    this.sharedQueueNotices.set(key, transition.state);
+    if (transition.state.phase === "observed" || transition.state.phase === "settled") {
+      this.sharedQueueNoticeHistory.add(key);
+      while (this.sharedQueueNoticeHistory.size > 1000) {
+        const oldest = this.sharedQueueNoticeHistory.values().next().value!;
+        this.sharedQueueNoticeHistory.delete(oldest);
+        this.sharedQueueNotices.delete(oldest);
+      }
+    } else {
+      this.sharedQueueNoticeHistory.delete(key);
+    }
+    if (transition.started) {
+      const { entry, turnId } = transition.started;
+      this.pdfAttachmentStore.bindTurn({
+        backend: entry.binding.backend, threadId: entry.binding.threadId, turnId,
+        sourceInstanceId: entry.binding.federatedThread?.target.scope === "remote"
+          ? entry.binding.federatedThread.target.instanceId : undefined,
+        sourceRequest: entry.pdfSourceRequest,
+      }, entry.pdfAttachments ?? []);
+    }
+    if (!transition.retire) return;
+    const { entry, outcome: { status, turnId } } = transition.retire;
+    entry.status = status === "started" ? "submitted" : status === "cancelled" ? "cancelled" : "failed";
+    await this.retireQueuedTurnNotice(entry, status === "started"
+      ? "Queued message sent as the next turn."
+      : status === "cancelled" ? "Queued message cancelled." : "Queued message could not start. Check the thread queue.");
+    await this.reconcileQueuedAgentMessagingOrigin({
+      backend: entry.binding.backend, threadId: entry.binding.threadId,
+      update: { status, turnId, queueEntryId: entry.id, origin: "messaging" },
+    });
+  }
+
   private async handleQueuedTurnCallback(
     event: MessagingInboundCallbackEvent,
     action: QueuedTurnAction,
   ): Promise<void> {
-    const entry = this.turnAdmission.findQueuedEntry(action.entryId);
+    const entry = this.turnAdmission.findQueuedEntry(action.entryId)
+      ?? [...this.sharedQueueNotices.values()].flatMap((state) =>
+        state.phase === "announcing" || state.phase === "queued" ? [state.entry] : [],
+      ).find((candidate) => candidate.id === action.entryId);
     if (!entry || entry.status !== "queued") {
       await this.deliver(
         buildErrorIntent({
@@ -5577,6 +5677,37 @@ export class MessagingController {
       return;
     }
 
+    if (action.kind === "retry") {
+      if (!entry.manualRetryRequired
+        || !(await this.requirePermission(event, "message.reply", "queued-turn:retry"))
+        || !(await this.requireRemoteScopeForBinding(event, entry.binding, "queued-turn:retry:remote-instance"))
+        || this.turnAdmission.findQueuedEntry(entry.id)?.status !== "queued"
+        || this.turnAdmission.isStarting(entry.threadKey)) return;
+      const result = await this.startPreparedInput({
+        binding: entry.binding, event: entry.event, input: entry.input,
+        pdfAttachments: entry.pdfAttachments, privateResponseRequested: entry.privateResponseRequested,
+        preview: entry.preview, threadKey: entry.threadKey, queueOnConcurrentStart: false,
+      });
+      if (result === "failed") return;
+      this.turnAdmission.removeQueuedEntry(entry);
+      await this.retireQueuedTurnNotice(entry, result === "queued"
+        ? "Queued message handed to the thread queue."
+        : "Queued message sent as the next turn.", event);
+      return;
+    }
+
+    if (entry.ownerQueueEntryId) {
+      if (action.kind === "cancel") {
+        await this.handleSharedQueuedTurnCallback(entry, event, action.kind);
+      } else {
+        entry.status = "steering";
+        this.trackQueuedTurnAction(entry, this.handleSharedQueuedTurnCallback(entry, event, action.kind).finally(() => {
+          if (entry.status === "steering") entry.status = "queued";
+        }));
+      }
+      return;
+    }
+
     if (action.kind === "cancel") {
       const cancelled = this.turnAdmission.updateQueuedEntry(entry, {
         status: "cancelled",
@@ -5589,10 +5720,52 @@ export class MessagingController {
       return;
     }
 
+    // Claim before the first await. Duplicate clicks and turn completion
+    // cannot dispatch the same queued input while its provider call waits.
+    const claimed = this.turnAdmission.updateQueuedEntry(entry, { status: "steering" });
+    // Ingress must return even if steering waits for an escalation answer:
+    // sequential provider polling needs ingress to deliver that answer.
+    this.trackQueuedTurnAction(entry, this.steerQueuedTurn(claimed, event));
+  }
+
+  private trackQueuedTurnAction(entry: MessagingQueuedTurnEntry, action: Promise<void>): void {
+    const task = action.catch((error: unknown) => {
+      this.logger.warn?.("messaging queued action failed", {
+        queuedTurnId: entry.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }).finally(() => { this.queuedTurnActions.delete(task); });
+    this.queuedTurnActions.add(task);
+  }
+
+  private async steerQueuedTurn(
+    entry: MessagingQueuedTurnEntry,
+    event: MessagingInboundCallbackEvent,
+  ): Promise<void> {
+    try {
+      await this.submitQueuedTurnSteer(entry, event);
+    } finally {
+      // A failed status lookup or delivery must also release the claim.
+      if (this.turnAdmission.findQueuedEntry(entry.id)?.status === "steering") {
+        this.turnAdmission.updateQueuedEntry(entry, { status: "queued" });
+      }
+      // Turn completion can arrive before the steer acknowledgement. Its
+      // drain stopped at this claim, so recheck the owning backend now.
+      if (this.queuedTurnDrainRequests.delete(entry.threadKey) && !this.disposed) {
+        await this.startNextQueuedTurn(entry.binding);
+      }
+    }
+  }
+
+  private async submitQueuedTurnSteer(
+    entry: MessagingQueuedTurnEntry,
+    event: MessagingInboundCallbackEvent,
+  ): Promise<void> {
     const activeTurn = await this.resolveSteerableActiveTurn(
       entry.binding,
       "queued_turn_steer",
     );
+    if (this.disposed) return;
     if (
       entry.pdfAttachments?.length ||
       !this.options.backend.steerTurn ||
@@ -5624,6 +5797,7 @@ export class MessagingController {
         messageOrigin: messageOriginForInboundEvent(entry.event, entry.event ? this.rememberHumanMessagingSource(entry.binding, entry.event)?.ref : undefined),
       });
     } catch (error) {
+      if (this.disposed) return;
       await this.deliver(
         buildErrorIntent({
           id: this.newIntentId("queued-turn-steer-failed"),
@@ -5639,6 +5813,7 @@ export class MessagingController {
       );
       return;
     }
+    if (this.disposed) return;
     const steered = this.turnAdmission.updateQueuedEntry(entry, {
       status: "steered",
     });
@@ -5647,6 +5822,92 @@ export class MessagingController {
       "Queued message was sent as a steering message.",
       event,
     );
+  }
+
+  private async handleSharedQueuedTurnCallback(
+    entry: MessagingQueuedTurnEntry,
+    event: MessagingInboundCallbackEvent,
+    kind: "cancel" | "steer",
+  ): Promise<void> {
+    const backend = this.options.backend;
+    const target = federationTargetForBinding(entry.binding);
+    try {
+      if (!backend.cancelQueuedTurn || !backend.readQueuedTurn) throw new Error("The thread owner cannot edit this queue.");
+      // Desktop viewers can edit queued content. Read the owner before
+      // removing it; its hash makes cancellation refuse a concurrent edit.
+      const content = await backend.readQueuedTurn({ backend: entry.binding.backend,
+        threadId: entry.binding.threadId, federationTarget: target, queueEntryId: entry.id, forEdit: true });
+      const active = kind === "steer" ? await this.resolveSteerableActiveTurn(entry.binding, "queued_turn_steer") : undefined;
+      if (kind === "steer" && (entry.pdfAttachments?.length || !backend.steerTurn || !active || !["working", "waiting"].includes(active.status))) {
+        throw new Error("There is no active turn available to steer. The message is still queued.");
+      }
+      const cancelled = await backend.cancelQueuedTurn({ federationTarget: target,
+        queueEntryId: entry.id, expectedContentHash: content.contentHash });
+      if (!cancelled.cancelled) throw new Error("The queued message changed or has already been admitted. Refresh the thread queue.");
+      if (kind === "steer" && active && backend.steerTurn) {
+        try {
+          await backend.steerTurn({ backend: entry.binding.backend, federationTarget: target,
+            threadId: entry.binding.threadId, expectedTurnId: active.turnId, requestId: entry.id,
+            input: content.input, messageOrigin: content.messageOrigin });
+        } catch (error) {
+          // Cancellation succeeded, so restore the owner's current content
+          // through normal admission if the turn ended before steering.
+          const restored = await this.startPreparedInput({
+            binding: entry.binding, event: entry.event, input: content.input,
+            pdfAttachments: entry.pdfAttachments, privateResponseRequested: entry.privateResponseRequested,
+            preview: entry.preview, threadKey: entry.threadKey, queueOnConcurrentStart: false,
+          });
+          if (restored === "failed") {
+            // The owner no longer has this input. Retain a separate recovery
+            // entry until an operator's Retry is accepted; idle events must
+            // not repeatedly submit it while the owner is unavailable.
+            const recovery = this.turnAdmission.enqueue({
+              binding: entry.binding, event: entry.event, input: content.input,
+              pdfAttachments: entry.pdfAttachments,
+              privateResponseRequested: entry.privateResponseRequested,
+              preview: buildQueuedInputPreview(content.input.flatMap((item) => item.type === "text" ? [item.text] : [])) || entry.preview,
+              threadKey: entry.threadKey, manualRetryRequired: true,
+            });
+            await this.deliverQueuedTurnNotice(recovery);
+          }
+          throw error;
+        }
+      }
+      await this.applySharedQueueNoticeEvent(`${entry.threadKey}:${entry.id}`, {
+        type: "ownerOutcome", outcome: { status: "cancelled" },
+      });
+      await this.retireQueuedTurnNotice(entry, kind === "steer"
+        ? "Queued message was sent as a steering message." : "Queued message cancelled.", event);
+    } catch (error) {
+      await this.deliver(buildErrorIntent({ id: this.newIntentId("queued-turn-action-failed"),
+        createdAt: this.now(), title: "Queued message could not be updated",
+        body: error instanceof Error ? error.message : String(error), recoverable: true,
+      }), entry.binding, event);
+    }
+  }
+
+  private scheduleNextQueuedTurn(binding: MessagingBindingRecord): void {
+    const key = this.threadKeyForBinding(binding);
+    const entry = this.turnAdmission.peekNextQueued(key);
+    if (!entry && this.turnAdmission.hasDispatchingEntry(key)) this.queuedTurnDrainRequests.add(key);
+    if (this.disposed || this.queuedTurnDrainTimers.has(key)
+      || this.queuedTurnDrains.has(key) || !entry || entry.manualRetryRequired) return;
+    // A start emits ordered lifecycle events. It cannot acknowledge while
+    // the event that released it is still awaiting this listener. Leave the
+    // delivery stack before draining, and coalesce terminal + idle releases.
+    const timer = setTimeout(() => {
+      this.queuedTurnDrainTimers.delete(key);
+      if (this.disposed) return;
+      const drain = this.startNextQueuedTurn(binding).catch((error) => {
+        this.logger.warn?.("messaging queued turn dispatch failed", {
+          threadId: binding.threadId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+      this.queuedTurnDrains.set(key, drain);
+      void drain.finally(() => this.queuedTurnDrains.delete(key));
+    }, 0);
+    this.queuedTurnDrainTimers.set(key, timer);
   }
 
   private async startNextQueuedTurn(binding: MessagingBindingRecord): Promise<void> {
@@ -5661,21 +5922,30 @@ export class MessagingController {
     }
 
     const entry = this.turnAdmission.peekNextQueued(threadKey);
-    if (!entry) {
+    if (!entry || entry.manualRetryRequired) {
+      if (this.turnAdmission.hasDispatchingEntry(threadKey)) this.queuedTurnDrainRequests.add(threadKey);
       return;
     }
 
-    const startResult = await this.startPreparedInput({
-      binding: entry.binding,
-      event: entry.event,
-      input: entry.input,
-      pdfAttachments: entry.pdfAttachments,
-      privateResponseRequested: entry.privateResponseRequested,
-      preview: entry.preview,
-      queueOnConcurrentStart: false,
-      threadKey,
-      admissionState,
-    });
+    this.turnAdmission.updateQueuedEntry(entry, { status: "submitting" });
+    let startResult: "started" | "queued" | "failed";
+    try {
+      startResult = await this.startPreparedInput({
+        binding: entry.binding,
+        event: entry.event,
+        input: entry.input,
+        pdfAttachments: entry.pdfAttachments,
+        privateResponseRequested: entry.privateResponseRequested,
+        preview: entry.preview,
+        queueOnConcurrentStart: false,
+        threadKey,
+        admissionState,
+      });
+    } finally {
+      if (this.turnAdmission.findQueuedEntry(entry.id)?.status === "submitting") {
+        this.turnAdmission.updateQueuedEntry(entry, { status: "queued" });
+      }
+    }
     if (startResult !== "started") {
       return;
     }
@@ -5688,9 +5958,16 @@ export class MessagingController {
       submitted,
       "Queued message sent as the next turn.",
     );
+    if (this.queuedTurnDrainRequests.delete(threadKey) && !this.disposed) {
+      await this.startNextQueuedTurn(binding);
+    }
   }
 
   private async handleCallback(event: MessagingInboundCallbackEvent): Promise<void> {
+    if (event.actionId === "claude:continue-session") {
+      await this.continueClaudeThreadInNewSession(event);
+      return;
+    }
     const privateReplyAction = readPrivateReplyAction(event);
     if (privateReplyAction) {
       await this.handlePrivateReplyCallback(event, privateReplyAction);
@@ -6074,6 +6351,11 @@ export class MessagingController {
         });
       } else if (action.id === "review:summary:mode") {
         await this.updateReviewPendingIntent(pendingIntent, event, { phase: "run_mode" });
+      } else if (action.id === "review:summary:auto-fix") {
+        await this.updateReviewPendingIntent(pendingIntent, event, {
+          phase: "summary",
+          afterReview: pendingIntent.intent.review.afterReview === "auto-fix" ? "wait" : "auto-fix",
+        });
       } else if (action.id === "review:summary:reviewer") {
         await this.updateReviewPendingIntent(pendingIntent, event, {
           phase: "reviewer_provider",
@@ -6279,7 +6561,8 @@ export class MessagingController {
     event: MessagingInboundCallbackEvent | MessagingInboundTextEvent,
     review: {
       phase: MessagingReviewIntent["review"]["phase"];
-    runMode?: ReviewRunMode;
+      runMode?: ReviewRunMode;
+      afterReview?: ReviewAfterAction;
       cwd?: string;
       repositoryPath?: string;
       workspacePageIndex?: number;
@@ -6346,6 +6629,7 @@ export class MessagingController {
       navigation,
       phase: review.phase,
       runMode: review.runMode ?? pendingIntent.intent.review.runMode,
+      afterReview: review.afterReview ?? pendingIntent.intent.review.afterReview,
       cwd,
       repositoryPath,
       workspacePageIndex: review.workspacePageIndex,
@@ -6421,6 +6705,7 @@ export class MessagingController {
       target,
       cwd: pendingIntent.intent.review.cwd,
       runMode: pendingIntent.intent.review.runMode,
+      afterReview: pendingIntent.intent.review.afterReview,
       reviewerLabel: reviewerBackends?.find(
         (candidate) => candidate.backend === reviewerBackend,
       )?.label,
@@ -6444,6 +6729,7 @@ export class MessagingController {
     target: AppServerReviewTarget;
     cwd?: string;
     runMode?: ReviewRunMode;
+    afterReview?: ReviewAfterAction;
     /** Reviewer override typed on the command; absent means inherit. */
     reviewBackend?: AppServerBackendKind;
     /** Human-facing reviewer label resolved by the picker, when known. */
@@ -6462,11 +6748,15 @@ export class MessagingController {
     }
 
     try {
+      const owner = await this.getBackendSummary(params.binding.backend);
       if (params.runMode !== undefined) {
-        const owner = await this.getBackendSummary(params.binding.backend);
         if (owner?.capabilities.reviewRunMode !== true) {
           throw new Error("This owner no longer supports explicit review modes. Update that PwrAgent instance before starting this review.");
         }
+      }
+      const afterReview = params.afterReview ?? (owner?.capabilities.reviewAutoFix === true ? "auto-fix" : undefined);
+      if (afterReview === "auto-fix" && owner?.capabilities.reviewAutoFix !== true) {
+        throw new Error("This owner no longer supports review Auto-fix. Update that PwrAgent instance before starting this review.");
       }
       const navigation = await this.readBoundThreadConfiguration(params.binding);
       const settings = turnSettingsForBinding(params.binding, navigation);
@@ -6495,6 +6785,7 @@ export class MessagingController {
         target: params.target,
         delivery: "inline",
         ...(params.runMode ? { runMode: params.runMode } : {}),
+        ...(afterReview ? { afterReview } : {}),
         ...(params.cwd ? { cwd: params.cwd } : {}),
         // An explicit reviewer replaces the binding's inherited settings
         // wholesale — its model belongs to a different catalog.
@@ -7089,6 +7380,18 @@ export class MessagingController {
   ): Promise<MessagingPendingIntentRecord | undefined> {
     const clicked = event.sourceSurface;
     const actionId = event.actionId ?? event.interaction.id;
+    if (actionId.startsWith("approval:")) {
+      if (newest?.intent.kind !== "approval") return undefined;
+      // Action ids (such as approval:mcp:accept) are shared by every card.
+      // A provider's durable handle or the clicked surface must identify
+      // this exact proposal; an old button must never approve a newer one.
+      const handle = await this.resolveCallbackHandleForEvent(event);
+      if (handle?.pendingIntentId) {
+        return handle.pendingIntentId === newest.id ? newest : undefined;
+      }
+      return clicked && newest.surface && isSameMessagingSurface(clicked, newest.surface)
+        ? newest : undefined;
+    }
     if (
       !clicked
       || (newest && isSameMessagingSurface(clicked, newest.surface))
@@ -8363,6 +8666,30 @@ export class MessagingController {
     this.logger.debug?.(
       `messaging turn-failure deliver thread=${binding.threadId} binding=${binding.id} preview="${compactLogPreview(text)}"`,
     );
+    if (
+      isClaudeSessionGoneFailure(event)
+      && !federationTargetForBinding(binding)
+      && this.options.backend.continueClaudeThreadInNewSession
+    ) {
+      await this.deliver(
+        buildConfirmationIntent({
+          id: this.newIntentId("claude-session-gone"),
+          capabilityProfile: this.capabilityProfile,
+          createdAt: this.now(),
+          title: "Turn failed",
+          body: `${text}\n\nSend /continue to continue in a new session.`,
+          actions: [{
+            id: "claude:continue-session",
+            label: "Continue in a new session",
+            style: "primary",
+            value: { bindingId: binding.id, threadId: binding.threadId },
+            fallbackText: "/continue",
+          }],
+        }),
+        binding,
+      );
+      return;
+    }
     await this.deliver(
       buildErrorIntent({
         id: this.newIntentId("turn-failed"),
@@ -8516,6 +8843,11 @@ export class MessagingController {
     this.unregisterAutomationSourceMessageDeliveryHandler();
     this.unregisterAutomationTargetMessageDeliveryHandler();
     this.turnAdmission.dispose();
+    for (const timer of this.queuedTurnDrainTimers.values()) clearTimeout(timer);
+    this.queuedTurnDrainTimers.clear();
+    this.sharedQueueNotices.clear();
+    this.sharedQueueNoticeHistory.clear();
+    this.queuedTurnDrainRequests.clear();
     this.admissionStageMarks.clear();
     for (const timer of this.monitorTimersByBindingId.values()) {
       clearTimeout(timer);
@@ -8565,6 +8897,11 @@ export class MessagingController {
    */
   async whenToolUpdatesSettled(): Promise<void> {
     await this.toolUpdatePolicy.whenIdle();
+    await Promise.allSettled([...this.queuedTurnDrains.values()]);
+  }
+
+  async whenQueuedTurnActionsSettled(): Promise<void> {
+    await Promise.all(this.queuedTurnActions);
   }
 
   /**
@@ -15081,6 +15418,58 @@ export class MessagingController {
     // Refresh handled by the thread-state update bus.
   }
 
+  private async continueClaudeThreadInNewSession(
+    event: MessagingInboundCommandEvent | MessagingInboundCallbackEvent,
+  ): Promise<void> {
+    // Recovery replaces only a session Claude confirms is gone. It preserves
+    // the thread's messages and execution settings, so the reply floor applies.
+    if (!(await this.requirePermission(event, "message.reply", "claude:continue-session"))) {
+      return;
+    }
+    const binding = await this.options.store.findActiveBindingForChannel(event.channel);
+    if (!(await this.requireRemoteScopeForBinding(event, binding, "claude:continue-session:remote-instance"))) {
+      return;
+    }
+    let errorMessage: string | undefined;
+    if (!binding) {
+      errorMessage = "This conversation is not attached to a thread. Use /resume to choose one.";
+    } else if (
+      event.kind === "callback"
+      && (readStringValue(event.value, "bindingId") !== binding.id
+        || readStringValue(event.value, "threadId") !== binding.threadId)
+    ) {
+      errorMessage = "This conversation is now attached to a different thread. Send /continue for the current thread.";
+    } else if (binding.backend !== "claude") {
+      errorMessage = "Only Claude threads can continue in a new session.";
+    } else if (federationTargetForBinding(binding)) {
+      errorMessage = "Continue this Claude thread on its owning instance.";
+    } else if (!this.options.backend.continueClaudeThreadInNewSession) {
+      errorMessage = "This backend does not support continuing Claude in a new session.";
+    } else {
+      try {
+        await this.options.backend.continueClaudeThreadInNewSession({ threadId: binding.threadId });
+      } catch (error) {
+        errorMessage = error instanceof Error ? error.message : String(error);
+      }
+    }
+    if (errorMessage !== undefined) {
+      await this.deliver(buildErrorIntent({
+        id: this.newIntentId("claude-continue-failed"),
+        createdAt: this.now(),
+        title: "Could not continue in a new session",
+        body: errorMessage,
+        recoverable: true,
+      }), binding, event);
+      return;
+    }
+    await this.deliver(buildConfirmationIntent({
+      id: this.newIntentId("claude-continue-ready"),
+      createdAt: this.now(),
+      title: "Ready to continue",
+      body: "Your next message starts a new Claude session with this thread's conversation as context.",
+    }), binding, event);
+  }
+
   private async compactThread(
     binding: MessagingBindingRecord,
     event: MessagingInboundEvent,
@@ -15327,7 +15716,11 @@ export class MessagingController {
         includeUnavailable: false,
       });
       return (response?.backends ?? [])
-        .filter((candidate) => candidate.capabilities.reviewRunner === true || candidate.capabilities.reviewRunMode === true)
+        .filter((candidate) =>
+          candidate.capabilities.reviewRunner === true
+          || candidate.capabilities.reviewRunMode === true
+          || candidate.capabilities.reviewAutoFix === true,
+        )
         .map((candidate) => ({
           backend: candidate.kind,
           label: candidate.label,
@@ -16919,7 +17312,7 @@ export class MessagingController {
     threadId: ThreadIdentifier;
     update: NonNullable<ReturnType<typeof turnQueueUpdateForBackendEvent>>;
   }): Promise<void> {
-    if (!params.update.queueEntryId || params.update.origin !== "messaging") {
+    if (!params.update.queueEntryId) {
       return;
     }
     const queueKey = agentMessagingQueueKey(
@@ -17684,7 +18077,7 @@ export class MessagingController {
     }
   }
 
-  private desktopActivityLog(): MessagingActivityLog | undefined {
+  private desktopActivityLog(): MessagingActivityStorage | undefined {
     return this.options.activityLog?.();
   }
 
@@ -21217,6 +21610,11 @@ function readQueuedTurnAction(
     };
   }
 
+  const retryPrefix = "queued-turn:retry:";
+  if (actionId.startsWith(retryPrefix)) {
+    return { kind: "retry", entryId: actionId.slice(retryPrefix.length) };
+  }
+
   const cancelPrefix = "queued-turn:cancel:";
   if (actionId.startsWith(cancelPrefix)) {
     return {
@@ -23420,6 +23818,15 @@ function errorTextForBackendEvent(event: AgentEvent): string | undefined {
   return parseCodexTurnErrorMessage(message);
 }
 
+function isClaudeSessionGoneFailure(event: AgentEvent): boolean {
+  if (event.backend !== "claude" || event.notification.method !== "turn/failed") {
+    return false;
+  }
+  const turn = asPlainRecord(event.notification.params.turn);
+  const error = asPlainRecord(turn?.error);
+  return error?.recovery === "claudeSessionGone";
+}
+
 function assistantDeltaForBackendEvent(
   event: AgentEvent,
 ): AssistantStreamDelta | undefined {
@@ -23537,11 +23944,12 @@ function buildQueuedInputPreview(parts: string[]): string {
   return preview || "[attachment]";
 }
 
-function buildQueuedTurnNoticeBody(preview: string, canSteer: boolean): string {
+function buildQueuedTurnNoticeBody(preview: string, canSteer: boolean, manualRetryRequired = false): string {
   const quotedPreview = truncateText(preview, 500)
     .split("\n")
     .map((line) => `> ${line}`)
     .join("\n");
+  if (manualRetryRequired) return `${quotedPreview}\n\nThe message is still queued. Choose Retry to send it, or Cancel to discard it.`;
   const steeringSentence = canSteer
     ? " To submit it as a steering message, click Steer."
     : "";

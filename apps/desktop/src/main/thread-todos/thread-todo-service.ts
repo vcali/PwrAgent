@@ -21,15 +21,17 @@ import type {
 import {
   DEFAULT_THREAD_TODO_MERGE_METHOD,
   THREAD_TODO_MAX_OPEN_PER_THREAD,
+  THREAD_TODO_MERGE_METHODS,
   THREAD_TODO_RESOLUTION_RESULTS,
   mergeThreadTodoItems,
+  settleMergeMethod,
   threadTodoActionProject,
   threadTodoKindForAction,
   threadTodoBlockingItems,
   threadTodoItemNoun,
   threadTodoSteps,
 } from "@pwragent/shared";
-import type { ThreadTodoStore } from "./thread-todo-store.js";
+import type { ThreadTodoStorage } from "@pwragent/owner-core/thread-todo-storage";
 import {
   THREAD_TODO_PLAN_DETAIL,
   THREAD_TODO_PLAN_KEY,
@@ -54,6 +56,8 @@ export type ThreadTodoActionRunners = {
     todo: ThreadTodoDispatchCard;
   }) => Promise<{ summary: string }>;
   mergePullRequest: (params: {
+    sourceBackend: AppServerBackendKind;
+    sourceThreadId: string;
     cwd?: string;
     pullRequest: string;
     method: ThreadTodoMergeMethod;
@@ -185,7 +189,7 @@ export class ThreadTodoError extends Error {
 }
 
 export type ThreadTodoServiceOptions = {
-  store: ThreadTodoStore;
+  store: ThreadTodoStorage;
   runners?: ThreadTodoActionRunners;
   onChanged?: (event: ThreadTodosChangedEvent) => void;
   /** `[git] default_merge_method`, read when it is needed. */
@@ -195,7 +199,7 @@ export type ThreadTodoServiceOptions = {
 };
 
 export class ThreadTodoService {
-  private readonly store: ThreadTodoStore;
+  private readonly store: ThreadTodoStorage;
   private readonly now: () => number;
   private readonly newId: () => string;
   private readonly running = new Set<string>();
@@ -349,7 +353,9 @@ export class ThreadTodoService {
     key: string;
     title: string;
     detail?: string;
-    action?: StartThreadAction;
+    /** A dependency offers Start thread; a finished wait offers to send its steps. */
+    action?: StartThreadAction | Extract<ThreadTodoAction, { type: "send_message" }>;
+    items?: ThreadTodoItem[];
     cwd?: string;
     sourceProject?: ThreadTodoProject;
   }): { todo: ThreadTodo; created: boolean } {
@@ -366,6 +372,7 @@ export class ThreadTodoService {
       title: params.title,
       detail: params.detail,
       action: params.action,
+      ...(params.items?.length ? { items: params.items } : {}),
       cwd: params.cwd,
       sourceProject: params.sourceProject,
       dependencyId: params.dependencyId,
@@ -409,6 +416,19 @@ export class ThreadTodoService {
 
   list(request: ListThreadTodosRequest = {}): ThreadTodo[] {
     return this.store.list(request);
+  }
+
+  /** The operator's last merge-method pick for a project, if any. */
+  projectMergeMethod(projectKey: string): ThreadTodoMergeMethod | undefined {
+    return this.store.getProjectMergeMethod(projectKey);
+  }
+
+  /**
+   * Remember a merge-method pick for a project, as a pick from a card's menu
+   * is. An agent's merge approval offers the same menu and shares the pick.
+   */
+  rememberProjectMergeMethod(projectKey: string, method: ThreadTodoMergeMethod): boolean {
+    return this.store.setProjectMergeMethod({ directoryKey: projectKey, method, now: this.now() });
   }
 
   mergeMethodPreferences(): ThreadTodoMergeMethodPreferences {
@@ -715,9 +735,12 @@ export class ThreadTodoService {
         return this.finish(id, { result: sent.summary });
       }
       if (action.type === "merge_pull_request") {
-        const method = options.mergeMethod
-          ?? (project ? this.store.getProjectMergeMethod(project.key) : undefined)
-          ?? this.defaultMergeMethod();
+        const method = settleMergeMethod({
+          offered: THREAD_TODO_MERGE_METHODS,
+          requested: options.mergeMethod,
+          remembered: project ? this.store.getProjectMergeMethod(project.key) : undefined,
+          fallback: this.defaultMergeMethod(),
+        });
         // Remembered before the merge runs: the pick is the operator's
         // preference whether or not this particular merge succeeds.
         if (options.mergeMethod && options.rememberMergeMethod && project) {
@@ -728,6 +751,7 @@ export class ThreadTodoService {
           });
         }
         const merged = await runners.mergePullRequest({
+          sourceBackend: todo.backend, sourceThreadId: todo.threadId,
           cwd,
           pullRequest: action.pullRequest,
           method,

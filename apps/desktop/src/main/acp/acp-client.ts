@@ -39,10 +39,7 @@ import {
   readAcpToolContentCommand,
   readAcpToolText,
 } from "./acp-command-extraction.js";
-import type {
-  AcpSessionMetadata,
-  AcpSessionStore,
-} from "./acp-session-store.js";
+import type { AcpSessionMetadata, AcpSessionStorage } from "@pwragent/owner-core/acp-storage";
 import {
   isPwrAgentSyntheticAcpUpdate,
   type AcpRolloutRecord,
@@ -164,7 +161,7 @@ export type AcpPromptContentBlock =
   | { type: "image"; mimeType: string; data: string };
 
 type AcpSessionStoreLike = Pick<
-  AcpSessionStore,
+  AcpSessionStorage,
   "getSession" | "listSessions" | "upsertSession"
 >;
 
@@ -2420,6 +2417,9 @@ function normalizeAvailableCommandsUpdate(
     }
     const description = readNonEmptyString(command, "description");
     const aliases = readStringArray(command?.aliases);
+    // ACP's command `input` is `{ hint }` (v2 adds `type: "text"`). Qwen
+    // sends an empty hint for commands that take nothing.
+    const argumentHint = readNonEmptyString(asRecord(command?.input), "hint");
     commands.set(name, {
       name,
       backend,
@@ -2427,6 +2427,7 @@ function normalizeAvailableCommandsUpdate(
       source: "provider",
       ...(description ? { description } : {}),
       ...(aliases.length > 0 ? { aliases } : {}),
+      ...(argumentHint ? { argumentHint } : {}),
     });
   }
 

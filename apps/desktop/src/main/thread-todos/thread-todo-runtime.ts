@@ -1,4 +1,8 @@
+import { getDesktopOverlayStore } from "../storage/desktop-overlay-store";
+import { assertMergeNotHeld } from "../app-server/thread-dependency-merge-hold";
+import { createThreadDependencyStorage } from "../storage/desktop-runtime-storage";
 import type {
+  AgentEvent,
   AppServerBackendKind,
   AppServerThreadMessageOrigin,
   AppServerThreadReviewEntry,
@@ -6,6 +10,7 @@ import type {
   ListInstanceProjectsResult,
   PwrAgentFederationContext,
   RaiseThreadTodoPlanRequest,
+  ThreadReview,
   ThreadReviewIdentity,
   ThreadTodo,
   ThreadTodoMergeMethod,
@@ -20,7 +25,7 @@ import type { PwrAgentFederationHandler } from "../agent-tools/pwragent-federati
 import type { DesktopBackendRegistry } from "../app-server/backend-registry.js";
 import { getMainLogger } from "../log.js";
 import { GithubPrFetcher } from "../pr-status/github-pr-fetcher.js";
-import { getAppStateDb } from "../state/app-state.js";
+import { createThreadTodoStorage } from "../storage/desktop-runtime-storage.js";
 import {
   findPeerThreadTodoProject,
   threadTodoProjectIdentity,
@@ -42,7 +47,6 @@ import {
   type ThreadTodoActionPatch,
   type ThreadTodoActionRunners,
 } from "./thread-todo-service.js";
-import { ThreadTodoStore } from "./thread-todo-store.js";
 import { withThreadTodoPlanNote, type ThreadTodoPlan } from "./thread-todo-plan.js";
 import { ThreadTodoFeed, type ThreadTodoFeedOwner } from "./thread-todo-feed.js";
 import {
@@ -52,6 +56,12 @@ import {
 } from "../thread-reviews/thread-review-runtime";
 import { completedThreadReview, reportedThreadReviewOutcomes } from "../thread-reviews/thread-review-events";
 import { ThreadReviewError } from "../thread-reviews/thread-review-service";
+import {
+  getReviewAutoFixArming,
+  getReviewAutoFixRuns,
+  reviewAutoFixMessage,
+  setReviewAutoFixListener,
+} from "../thread-reviews/review-auto-fix";
 
 const threadTodoLog = getMainLogger("pwragent:thread-todos");
 
@@ -64,7 +74,7 @@ let listProjectCandidates: (() => Promise<ThreadTodoProjectCandidate[]>) | undef
 export function getThreadTodoService(): ThreadTodoService {
   if (!service) {
     service = new ThreadTodoService({
-      store: new ThreadTodoStore(getAppStateDb()),
+      store: createThreadTodoStorage(),
       defaultMergeMethod: () =>
         readDefaultMergeMethod?.() ?? DEFAULT_THREAD_TODO_MERGE_METHOD,
     });
@@ -149,6 +159,32 @@ export async function readThreadTodoPlacement(
 }
 
 /**
+ * The merge-method pick for the project a thread's merge belongs to, the one
+ * its to-do merge cards use, and how to keep a new pick. The project is the
+ * one add_todo files the thread's cards under. Empty when the thread has no
+ * project.
+ */
+export async function readProjectMergeMethodPreference(
+  registry: Pick<DesktopBackendRegistry, "resolveThreadPrimaryDirectory">,
+  thread: { backend: AppServerBackendKind; threadId: string },
+): Promise<{ remembered?: ThreadTodoMergeMethod; remember?: (method: ThreadTodoMergeMethod) => void }> {
+  const directory = await registry.resolveThreadPrimaryDirectory(thread.backend, thread.threadId)
+    .catch(() => undefined);
+  // The key comes from the directory alone; the project list adds labels.
+  const projectKey = threadTodoProjectForDirectory(directory, [])?.key;
+  if (!projectKey) return {};
+  const todos = getThreadTodoService();
+  const remembered = todos.projectMergeMethod(projectKey);
+  return {
+    ...(remembered ? { remembered } : {}),
+    remember: (method) => {
+      // Open merge cards relabel from a pick that changed no card.
+      if (todos.rememberProjectMergeMethod(projectKey, method)) feed?.mergeMethodsChanged();
+    },
+  };
+}
+
+/**
  * Raises a started thread's plan card on this owner, filed where add_todo
  * would file a card the thread raised itself.
  */
@@ -221,14 +257,42 @@ export function installThreadTodoRuntime(params: {
     identity: ThreadReviewIdentity,
     entry: AppServerThreadReviewEntry,
     source: "live" | "replay" = "replay",
-  ): void => {
+  ): ThreadReview | undefined => {
     try {
-      reviews.importEntry(identity, entry, source);
+      return reviews.importEntry(identity, entry, source);
     } catch (error) {
       threadTodoLog.warn("could not track a completed review", {
         error: error instanceof Error ? error.message : String(error),
       });
+      return undefined;
     }
+  };
+  // A review started with auto-fix hands its open findings to the thread's
+  // own agent as soon as it lands. Behind a running turn it queues, never
+  // steers, so it cannot interrupt work the operator started.
+  const reviewAutoFix = getReviewAutoFixArming();
+  const reviewAutoFixRuns = getReviewAutoFixRuns();
+  // Viewers read the armed reviews and each run from the owner; a change
+  // reaches them on the to-do change event they already reload on.
+  setReviewAutoFixListener((thread) => params.broadcast({ ...thread, at: Date.now() }));
+  // Someone settling a finding has taken the review on, so a failed send no
+  // longer needs saying.
+  reviews.setOnUpdated((review) => reviewAutoFixRuns.record(review, review.id, { kind: "reviewUpdated", at: Date.now() }));
+  const sendReviewAutoFix = (review: ThreadReview): void => {
+    const message = reviewAutoFixMessage(review);
+    if (!message) return;
+    void registry.submitTurn({
+      backend: review.backend,
+      threadId: review.threadId,
+      input: [{ type: "text", text: message.text }],
+      origin: "automation",
+      messageOrigin: message.messageOrigin,
+    }).catch((error: unknown) => {
+      const reason = error instanceof Error ? error.message : String(error);
+      threadTodoLog.warn("could not send a review's auto-fix", { error: reason, threadId: review.threadId });
+      // The arm is spent, so the card says so and offers Auto-fix by hand.
+      reviewAutoFixRuns.record(review, review.id, { kind: "sendFailed", reason, at: Date.now() });
+    });
   };
   readDefaultMergeMethod = params.readDefaultMergeMethod;
   todos.setOnChanged(changed);
@@ -266,7 +330,21 @@ export function installThreadTodoRuntime(params: {
       return;
     }
     const completed = completedThreadReview(event);
-    if (completed) importReview(completed.identity, completed.entry, "live");
+    if (completed) {
+      const review = importReview(completed.identity, completed.entry, "live");
+      if (reviewAutoFix.takeOnCompletion(completed.identity, completed.turnId) && review) sendReviewAutoFix(review);
+    }
+    if (event.notification.method === "turn/completed") {
+      const { threadId, turnId } = event.notification.params;
+      if (typeof turnId === "string") reviewAutoFix.turnEnded({ backend: event.backend, threadId }, turnId);
+    }
+    const autoFixQueue = reviewAutoFixQueueEvent(event);
+    if (autoFixQueue) {
+      reviewAutoFixRuns.record(autoFixQueue.thread, autoFixQueue.reviewId, {
+        kind: "queue", status: autoFixQueue.status, at: Date.now(),
+        ...(autoFixQueue.errorMessage ? { errorMessage: autoFixQueue.errorMessage } : {}),
+      });
+    }
     const reported = reportedThreadReviewOutcomes(event);
     if (reported) {
       try {
@@ -355,10 +433,14 @@ export function installThreadTodoRuntime(params: {
   ): Promise<AddThreadTodoInput> => {
     const action = input.action;
     if (action?.type === "send_message") {
-      // Raising the card must not fail on a lookup; the send discovers it too.
+      // Discovery failures stay best effort, but a known archived destination
+      // must not become a card the operator cannot send.
       const target = await Promise.resolve()
         .then(() => registry.locateThreadTodoMessageTarget(thread, action.target))
-        .catch(() => action.target);
+        .catch((error: unknown) => {
+          if (error instanceof ThreadTodoError) throw error;
+          return action.target;
+        });
       return target === action.target ? input : { ...input, action: { ...action, target } };
     }
     if (action?.type !== "start_thread") return input;
@@ -551,8 +633,14 @@ export function createThreadTodoRunners(params: {
       await registry.sendThreadTodoMessage(request);
       return { summary: `Sent to ${request.target.title ?? request.target.threadId}` };
     },
-    mergePullRequest: async (request) =>
-      await new GithubPrFetcher().mergePullRequest(request),
+    mergePullRequest: async (request) => {
+      const overlay = getDesktopOverlayStore();
+      const assertNotHeld = (pullRequest: string) => assertMergeNotHeld(createThreadDependencyStorage().active(), {
+        backend: request.sourceBackend, threadId: request.sourceThreadId, pullRequest,
+      }, (thread) => overlay.readThreadPullRequestUrls(thread));
+      assertNotHeld(request.pullRequest);
+      return await new GithubPrFetcher().mergePullRequest({ ...request, assertCanMerge: assertNotHeld });
+    },
     startThread: async ({
       sourceBackend, sourceThreadId, cwd, crossProject, action, todo, modelSettings, workMode: chosenWorkMode, environment, speed, plan,
     }) => {
@@ -815,4 +903,26 @@ function optional<K extends string, V>(
   value: V | undefined,
 ): Partial<Record<K, V>> {
   return value === undefined ? {} : ({ [key]: value } as Record<K, V>);
+}
+
+/** A queue step of a review's Auto-fix turn, found by its message origin. */
+function reviewAutoFixQueueEvent(event: AgentEvent): {
+  thread: { backend: AppServerBackendKind; threadId: string };
+  reviewId: string;
+  status: string;
+  errorMessage?: string;
+} | undefined {
+  if (event.notification.method !== "thread/turnQueue/updated") return undefined;
+  const params = event.notification.params as {
+    threadId?: unknown; status?: unknown; errorMessage?: unknown;
+    messageOrigin?: AppServerThreadMessageOrigin;
+  };
+  const reviewId = params.messageOrigin?.reviewAutoFix?.reviewId;
+  if (!reviewId || typeof params.threadId !== "string" || typeof params.status !== "string") return undefined;
+  return {
+    thread: { backend: event.backend, threadId: params.threadId },
+    reviewId,
+    status: params.status,
+    ...(typeof params.errorMessage === "string" ? { errorMessage: params.errorMessage } : {}),
+  };
 }

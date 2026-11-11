@@ -1,3 +1,4 @@
+import fc from "fast-check";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { stat } from "node:fs/promises";
 import path from "node:path";
@@ -6,6 +7,7 @@ import { ARCHIVE_CLEANUP_PAUSE_MS } from "../app-server/archive-cleanup-queue";
 import { ArchiveWorktreeReferences } from "../app-server/archive-worktree-references";
 import { ClaudeSessionStore } from "../claude/claude-session-store";
 import { DesktopBackendRegistry } from "../app-server/backend-registry";
+import * as gitHeadBranch from "../app-server/git-head-branch";
 import { deleteThreadAssets } from "../app-server/thread-assets";
 import { CountingBackendClient, codexThread, publishNotification } from "./fixtures/thread-read-harness";
 import budgets from "./fixtures/archive-cleanup-budgets.json";
@@ -125,6 +127,9 @@ function build(active: AppServerThreadSummary[], target = codexThread({ id: "tar
   // Keep this fake-timer harness independent of filesystem session discovery.
   const claudeStore = new ClaudeSessionStore("/contrived/claude");
   vi.spyOn(claudeStore, "list").mockResolvedValue([]);
+  // Reads and writes below are contrived, so no filesystem admission is needed.
+  // Real-store concurrency tests exercise the shared-profile mutation lock.
+  vi.spyOn(claudeStore, "withMutation").mockImplementation(async (_id, work) => await work());
   const registry = new DesktopBackendRegistry({ codexClient: client as never, overlayStore: store as never,
     claudeBackendOptions: { store: claudeStore },
     archiveCleanupCheckpointStore: checkpoint, runtimeInstanceId: "cleanup-fixture", resolveLiveProfileRuntimeInstanceIds: () => ["cleanup-fixture"],
@@ -214,8 +219,11 @@ describe("archive cleanup pipeline", () => {
         }
       });
       expect(fixture.archiveWorktree).toHaveBeenCalledOnce();
+      for (const event of fixture.events) {
+        if (event.notification.method === "thread/archiveCleanup/completed") expect(event.notification.params).toHaveProperty("reporting", "background");
+      }
       expectSqliteWriteBudget({ scenario: "archive-worktree-100-reference-wait-release",
-        note: "100 archived owners of one checkout: one queue-drain checkpoint, one non-final release, one final drain deletion; 3 commits, zero idle writes. At 10 batches/day and 128 KiB/commit, at most 3.75 MB/day.", writes });
+        note: "100 archived owners of one checkout: one queue-drain checkpoint writing one row per intent, a non-final release that only shrinks the backlog and writes nothing, and one final drain deletion; 2 commits, zero idle writes. At 10 batches/day and about 128 KB WAL per batch, about 1.3 MB/day.", writes });
     } finally {
       await fixture.registry.close();
       db.close();
@@ -460,12 +468,20 @@ describe("archive cleanup pipeline", () => {
       }
       return states;
     });
-    const completed = new Promise<AgentEvent>((resolve) => fixture.registry.onEvent((event) => {
-      if (event.notification.method !== "thread/archiveCleanup/completed") return;
-      const cleanup = event.notification.params.cleanup;
-      if (Array.isArray(cleanup) && cleanup.some((item: { removedWorktree?: boolean }) => item.removedWorktree)) resolve(event);
-    }));
-    await drivePacer(fixture.registry, Promise.all([fixture.registry.archiveThread({ backend: "codex", threadId: "target" }), completed]));
+    let removed!: () => void;
+    const completed = new Promise<void>((resolve) => {
+      removed = resolve;
+      fixture.registry.onEvent((event) => {
+        if (event.notification.method !== "thread/archiveCleanup/completed") return;
+        const cleanup = event.notification.params.cleanup;
+        if (Array.isArray(cleanup) && cleanup.some((item: { removedWorktree?: boolean }) => item.removedWorktree)) resolve();
+      });
+    });
+    const request = fixture.registry.archiveThread({ backend: "codex", threadId: "target" }).then((response) => {
+      if (response.cleanup.some((item) => item.removedWorktree)) removed();
+      return response;
+    });
+    await drivePacer(fixture.registry, Promise.all([request, completed]));
     expect(fixture.archiveWorktree).toHaveBeenCalledOnce();
     expect(fixture.client.archiveThread).toHaveBeenCalledOnce();
   });
@@ -537,6 +553,7 @@ describe("archive cleanup pipeline", () => {
     const response = await fixture.registry.archiveThread({ backend: "claude", threadId: session.thread.id, backgroundCleanup: true });
     expect(response).toMatchObject({ cleanup: [], cleanupPending: true });
     const event = await drivePacer(fixture.registry, fixture.completion);
+    expect(event.notification.params).not.toHaveProperty("reporting");
     expect(event.notification.params).toMatchObject({ cleanup: [{
       worktreePath: worktree.worktreePath, removedWorktree: true, deletedBranch: false,
     }] });
@@ -620,15 +637,17 @@ describe("archive cleanup pipeline", () => {
     expect(readSummary).toHaveBeenCalledTimes(1);
     expect(fixture.archiveWorktree).not.toHaveBeenCalled();
     expect(fixture.completions).toHaveLength(30);
-    expect(fixture.counts.providerPages).toBe(3);
-    expect(registryLog.info.mock.calls.filter(([message]) => message === "archive cleanup inventory reused")).toHaveLength(29);
+    // One identity read of 100-row pages builds the batch's fleet index; the
+    // other 29 jobs reuse it.
+    expect(fixture.counts.providerPages).toBe(2);
+    expect(registryLog.info.mock.calls.filter(([message]) => message === "archive cleanup fleet index built")).toHaveLength(1);
   });
 
   it("logs request, queue wait, stages, shared-worktree outcome and publication after a 30-minute backlog", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-10-20T17:32:23.599Z"));
     const directory = { id: "shared", kind: "worktree" as const, label: "repo", path: "/contrived/repo", worktreePath: "/contrived/shared" };
-    const targets = [codexThread({ id: "first", linkedDirectories: [directory] }), codexThread({ id: "second", linkedDirectories: [directory] })];
+    const targets = ["first", "blocking-2", "blocking-3", "blocking-4", "second"].map((id) => codexThread({ id, linkedDirectories: [directory] }));
     const fixture = buildArchiveBurst([codexThread({ id: "shared-user", linkedDirectories: [directory] })], targets);
     let release!: () => void;
     const blocked = new Promise<void>((resolve) => { release = resolve; });
@@ -641,7 +660,7 @@ describe("archive cleanup pipeline", () => {
     await Promise.all(targets.map((thread) => fixture.registry.archiveThread({ backend: "codex", threadId: thread.id, backgroundCleanup: true })));
     const fields = { backend: "codex", threadId: "second", runtimeInstanceId: "cleanup-fixture" };
     expect(registryLog.info).toHaveBeenCalledWith("thread archive requested", expect.objectContaining({ ...fields, requestedAt }));
-    expect(registryLog.info).toHaveBeenCalledWith("archive cleanup queued", expect.objectContaining({ ...fields, queuedAt: requestedAt, queueDepth: 2 }));
+    expect(registryLog.info).toHaveBeenCalledWith("archive cleanup queued", expect.objectContaining({ ...fields, queuedAt: requestedAt, queueDepth: 5 }));
     await vi.advanceTimersByTimeAsync(30 * 60_000);
     expect(registryLog.info).toHaveBeenCalledWith("archive cleanup stage started", expect.objectContaining({ threadId: "first", stage: "metadata" }));
     release();
@@ -721,19 +740,53 @@ describe("archive cleanup pipeline", () => {
       const threads = targets.slice(offset, offset + params.limit);
       return { threads, nextCursor: offset + threads.length < targets.length ? String(offset + threads.length) : undefined };
     });
+    // Queue drain and asynchronous event publication have separate owners.
+    // Wait for the publication boundary before counting renderer-bound results.
+    const published = new Promise<void>((resolve) => {
+      let received = 0;
+      fixture.registry.onEvent((event) => {
+        if (event.notification.method === "thread/archiveCleanup/completed" && ++received === targets.length) resolve();
+      });
+    });
     const resumption = fixture.registry.resumeArchiveCleanupsAtStartup();
     expect(fixture.registry.getArchiveCleanupCountForQuit()).toBe(130);
     await drivePacer(fixture.registry, resumption);
+    await published;
     expect(fixture.client.archiveThread).not.toHaveBeenCalled();
     expect(fixture.archiveWorktree).not.toHaveBeenCalled();
-    expect(fixture.counts.providerPages).toBe(7);
+    // One identity read of 100-row pages for the whole resumed batch.
+    expect(fixture.counts.providerPages).toBe(3);
     expect(fixture.registry.getArchiveCleanupCountForQuit()).toBe(0);
+    const completions = fixture.events.map((event) => event.notification).filter((notification) => notification.method === "thread/archiveCleanup/completed");
+    expect(completions).toHaveLength(130);
+    for (const notification of completions) expect(notification.params).toHaveProperty("reporting", "background");
+    expect(fixture.events.filter((event) => event.notification.method === "archiveCleanup/progress")).toEqual([]);
     await fixture.registry.resumeArchiveCleanupsAtStartup();
     expect(checkpoint.recover).toHaveBeenCalledOnce();
     await fixture.registry.close();
     expect(checkpoint.save).toHaveBeenLastCalledWith("cleanup-fixture", expect.arrayContaining([
       expect.objectContaining({ threadId: "resumed-0", deferredWorktrees: [expect.objectContaining({ blockers: ["codex:shared-user"] })] }),
     ]));
+  });
+
+  it("keeps dry-run audit progress and results out of archive activity for every ownership mix", async () => {
+    await fc.assert(fc.asyncProperty(fc.boolean(), async (shared) => {
+      vi.useFakeTimers();
+      const fixture = buildRepair();
+      if (shared) fixture.active.push(codexThread({ id: "active-owner", linkedDirectories: fixture.archived[0]!.linkedDirectories }));
+      try {
+        await drivePacer(fixture.registry, fixture.registry.repairArchivedThreadWorktrees({ dryRun: true }));
+        expect(fixture.client.archiveThread).not.toHaveBeenCalled();
+        expect(fixture.archiveWorktree).not.toHaveBeenCalled();
+        expect(fixture.store.setThreadArchiveTombstone).not.toHaveBeenCalled();
+        expect(fixture.events.filter((event) => event.notification.method === "thread/archiveCleanup/completed")).toEqual([]);
+        const progress = fixture.events.map((event) => event.notification).filter((notification) => notification.method === "archiveCleanup/progress");
+        expect(progress).toEqual([]);
+      } finally {
+        await fixture.registry.close();
+        vi.useRealTimers();
+      }
+    }), { numRuns: 10 });
   });
 
   it.each([false, true])("does not resume removal for a restored active thread (previously missing: %s)", async (codexRolloutMissing) => {
@@ -799,12 +852,12 @@ describe("archive cleanup pipeline", () => {
       expect(event.notification.params).toMatchObject({ cleanup: [expect.objectContaining({ skippedReason: expect.stringContaining("shared-user") })] });
     }
     expect(fixture.archiveWorktree).not.toHaveBeenCalled();
-    // One inventory: 40 active pages and 26 archived pages, rather than
-    // rebuilding those 66 pages for each of the 130 queued threads.
-    expect(fixture.counts.providerPages).toBe(66);
+    // One inventory of 100-row pages: 10 active and 7 archived, rather than
+    // rebuilding them for each of the 130 queued threads.
+    expect(fixture.counts.providerPages).toBe(17);
   });
 
-  it.each(["during discovery", "between jobs"])("refreshes batch discovery after a workspace change %s", async (timing) => {
+  it.each(["during discovery", "before the next batch"])("refreshes batch discovery after a workspace change %s", async (timing) => {
     vi.useFakeTimers();
     const firstDirectory = { id: "first", kind: "worktree" as const, label: "repo", path: "/contrived/repo", worktreePath: "/contrived/first" };
     const secondDirectory = { ...firstDirectory, id: "second", worktreePath: "/contrived/second" };
@@ -826,17 +879,20 @@ describe("archive cleanup pipeline", () => {
         return await read(params);
       });
     } else {
-      fixture.registry.onEvent((event) => {
-        if (event.notification.method === "thread/archiveCleanup/completed" && event.notification.params.threadId === "first") {
-          void changeWorkspace();
-        }
-      });
+      const first = new Promise<void>((resolve) => fixture.registry.onEvent((event) => {
+        if (event.notification.method === "thread/archiveCleanup/completed" && event.notification.params.threadId === "first") resolve();
+      }));
+      await fixture.registry.archiveThread({ backend: "codex", threadId: "first", backgroundCleanup: true });
+      await drivePacer(fixture.registry, first);
+      await changeWorkspace();
     }
-    await Promise.all(targets.map((thread) => fixture.registry.archiveThread({ backend: "codex", threadId: thread.id, backgroundCleanup: true })));
+    await Promise.all((timing === "during discovery" ? targets : targets.slice(1)).map((thread) => fixture.registry.archiveThread({ backend: "codex", threadId: thread.id, backgroundCleanup: true })));
     await drivePacer(fixture.registry, fixture.finished);
     expect(fixture.completions[1]?.notification.params).toMatchObject({ cleanup: [expect.objectContaining({ skippedReason: expect.stringContaining("new-user") })] });
     expect(fixture.archiveWorktree).not.toHaveBeenCalled();
-    expect(fixture.counts.providerPages).toBe(4);
+    // The batch reads the fleet once; the workspace change rereads only the
+    // identity it names.
+    expect(fixture.counts.providerPages).toBe(timing === "during discovery" ? 2 : 4);
     expect(readSummary).toHaveBeenCalledTimes(2);
   });
 
@@ -873,21 +929,23 @@ describe("archive cleanup pipeline", () => {
     expect(fixture.counts.providerPages).toBe(2);
   });
 
-  it("refreshes cached children when a thread is regrouped between cleanup jobs", async () => {
+  it("refreshes children when a thread is regrouped before the next batch", async () => {
     vi.useFakeTimers();
     const targets = [codexThread({ id: "first" }), codexThread({ id: "second" })];
     const fixture = buildArchiveBurst([codexThread({ id: "child" })], targets);
     fixture.overlays.set("child", { backend: "codex", threadId: "child", extraLinkedDirectories: [], parentThreadId: "first", parentThreadBackend: "codex" });
-    fixture.registry.onEvent((event) => {
-      if (event.notification.method === "thread/archiveCleanup/completed" && event.notification.params.threadId === "first") {
-        fixture.overlays.set("child", { backend: "codex", threadId: "child", extraLinkedDirectories: [], parentThreadId: "second", parentThreadBackend: "codex" });
-        void publishNotification(fixture.registry, { method: "thread/parent/set",
-          params: { threadId: "child", parentThreadId: "second", parentThreadBackend: "codex" } });
-      }
-    });
-    await Promise.all(targets.map((thread) => fixture.registry.archiveThread({ backend: "codex", threadId: thread.id, backgroundCleanup: true })));
+    const first = new Promise<void>((resolve) => fixture.registry.onEvent((event) => {
+      if (event.notification.method === "thread/archiveCleanup/completed" && event.notification.params.threadId === "first") resolve();
+    }));
+    await fixture.registry.archiveThread({ backend: "codex", threadId: "first", backgroundCleanup: true });
+    await drivePacer(fixture.registry, first);
+    fixture.overlays.set("child", { backend: "codex", threadId: "child", extraLinkedDirectories: [], parentThreadId: "second", parentThreadBackend: "codex" });
+    await publishNotification(fixture.registry, { method: "thread/parent/set",
+      params: { threadId: "child", parentThreadId: "second", parentThreadBackend: "codex" } });
+    await fixture.registry.archiveThread({ backend: "codex", threadId: "second", backgroundCleanup: true });
     await drivePacer(fixture.registry, fixture.finished);
     expect(fixture.store.setThreadParent).toHaveBeenCalledTimes(2);
+    // A fully drained batch obtains fresh membership and child overlays.
     expect(fixture.counts.providerPages).toBe(4);
   });
 
@@ -1131,7 +1189,8 @@ describe("archive cleanup pipeline", () => {
     }]);
     // The resolver is otherwise a real Git subprocess that fake time cannot
     // finish. Give the fixture its canonical directory without host I/O.
-    Object.assign(fixture.registry, { acpWorktreeRepositoryResolver: async () => archived[2]!.linkedDirectories[0] });
+    Object.assign(fixture.registry, { acpWorktreeRepositoryResolver: async (cwd: string) =>
+      archived.find((thread) => thread.linkedDirectories[0]?.worktreePath === cwd)?.linkedDirectories[0] });
     vi.mocked(stat).mockImplementation(async () => ({ isDirectory: () => true }) as Awaited<ReturnType<typeof stat>>);
     const scan = fixture.registry.repairArchivedThreadWorktrees({ dryRun: true });
     await vi.advanceTimersByTimeAsync(100_000);
@@ -1142,8 +1201,8 @@ describe("archive cleanup pipeline", () => {
     for (let index = 0; index < 3; index++) {
       expect(result.candidates.map((item) => item.worktreePath)).not.toContain(path.normalize(`/contrived/worktree-${index}`));
     }
-    expect(pages).toHaveLength(22);
-    expect(Math.max(...pages)).toBe(25);
+    expect(pages).toHaveLength(7);
+    expect(Math.max(...pages)).toBe(100);
     expect(fixture.archiveWorktree).not.toHaveBeenCalled();
     expect(fixture.client.archiveThread).not.toHaveBeenCalled();
   });
@@ -1156,10 +1215,12 @@ describe("archive cleanup pipeline", () => {
     expect(fixture.counts.archiveMutations).toBe(1);
     expect(await request).toMatchObject({ cleanupPending: true, cleanup: [] });
     expect(fixture.counts.providerPages).toBe(0);
-    await vi.advanceTimersToNextTimerAsync();
+    await fixture.registry.whenArchiveCleanupCheckpointPendingForTests();
+    await vi.advanceTimersByTimeAsync(ARCHIVE_CLEANUP_PAUSE_MS);
     // Admission itself yields, then the provider page gets its own slice.
     expect(fixture.counts.providerPages).toBe(0);
-    await vi.advanceTimersToNextTimerAsync();
+    await fixture.registry.whenArchiveCleanupCheckpointPendingForTests();
+    await vi.advanceTimersByTimeAsync(ARCHIVE_CLEANUP_PAUSE_MS);
     expect(fixture.counts.providerPages).toBe(1);
     expect(fixture.counts.overlayReads).toBe(0);
     await drivePacer(fixture.registry, fixture.completion);
@@ -1347,7 +1408,8 @@ describe("archive cleanup pipeline", () => {
     } finally { release(); }
     const responses = await drivePacer(fixture.registry, results);
     expect(responses[0].cleanup[0]?.removedWorktree).toBe(true);
-    expect(fixture.counts.providerPages).toBe(6);
+    // The second job reuses the batch's fleet index and removes nothing.
+    expect(fixture.counts.providerPages).toBe(4);
   });
 
   it("keeps rejecting active target metadata without confirmed missing-rollout recovery", async () => {
@@ -1466,12 +1528,23 @@ describe("archive cleanup pipeline", () => {
     try {
       const result = await drivePacer(fixture.registry, fixture.registry.archiveThread({ backend: "codex", threadId: "target" }));
       expect(result.cleanup).toEqual([expect.objectContaining({ removedWorktree: true })]);
-      expect(fixture.counts.providerPages).toBe(backend === "codex" ? 5 : 4);
+      // Activity on unrelated threads rereads those identities, not the fleet.
+      expect(fixture.counts.providerPages).toBe(4);
       expect(fixture.counts.archiveMutations).toBe(1);
     } finally {
-      for (const thread of others) {
-        await publishNotification(fixture.registry, { method: "turn/completed", params: { threadId: thread.id, turnId: `turn-${thread.id}`, turn: { id: `turn-${thread.id}`, status: "completed", output: [] } } }, backend);
-        await publishNotification(fixture.registry, { method: "thread/status/changed", params: { threadId: thread.id, status: { type: "idle" } } }, backend);
+      // These workspaces are contrived. Terminal branch adoption must use
+      // fixture evidence too: a missing host directory makes the real probe
+      // fall back to owned Git (one PowerShell launch per Claude turn on
+      // Windows), unrelated to the archive admission this test drives.
+      const branchProbe = vi.spyOn(gitHeadBranch, "probeCurrentGitBranch")
+        .mockResolvedValue(gitHeadBranch.NOT_A_GIT_REPOSITORY);
+      try {
+        for (const thread of others) {
+          await publishNotification(fixture.registry, { method: "turn/completed", params: { threadId: thread.id, turnId: `turn-${thread.id}`, turn: { id: `turn-${thread.id}`, status: "completed", output: [] } } }, backend);
+          await publishNotification(fixture.registry, { method: "thread/status/changed", params: { threadId: thread.id, status: { type: "idle" } } }, backend);
+        }
+      } finally {
+        branchProbe.mockRestore();
       }
     }
   });
@@ -1958,25 +2031,51 @@ describe("archive cleanup pipeline", () => {
 
   it("removes a shared worktree after the preceding missing-rollout owner is tombstoned", async () => {
     vi.useFakeTimers();
-    const directory = { id: "directory", kind: "worktree" as const, label: "repo", path: "/contrived/repo", worktreePath: "/contrived/worktree" };
-    const targets = ["first", "second"].map((id) => codexThread({ id, linkedDirectories: [directory] }));
-    const fixture = build(targets, targets[0]!);
-    fixture.client.archiveThread.mockImplementation(async ({ threadId }) => {
-      throw new Error(`json-rpc error (-32600): no rollout found for thread id ${threadId}`);
-    });
-    fixture.store.setThreadArchiveTombstone.mockImplementation(async ({ threadId, archivedAt }) => {
-      fixture.overlays.set(threadId, { backend: "codex", threadId, extraLinkedDirectories: [], archiveTombstonedAt: archivedAt });
-    });
-    const requests = Promise.all(targets.map((thread) => fixture.registry.archiveThread({ backend: "codex", threadId: thread.id })));
-    const results = await drivePacer(fixture.registry, requests);
-
-    expect(results[0]?.cleanup[0]?.skippedReason).toContain("another active thread: second");
-    expect(results[1]?.cleanup[0]).toMatchObject({ removedWorktree: true });
-    expect(fixture.archiveWorktree).toHaveBeenCalledOnce();
-    expect(fixture.archiveWorktree).toHaveBeenCalledWith(expect.objectContaining({ threadId: "second" }));
-    expect(fixture.store.setThreadArchiveTombstone).toHaveBeenCalledTimes(2);
-    // Rebuild discovery after the first tombstone, then scan again at removal.
-    expect(fixture.counts.providerPages).toBe(6);
+    await fc.assert(fc.asyncProperty(fc.boolean(), async (secondCompletesFirst) => {
+      const directory = { id: "directory", kind: "worktree" as const, label: "repo", path: "/contrived/repo", worktreePath: "/contrived/worktree" };
+      const targets = ["first", "second"].map((id) => codexThread({ id, linkedDirectories: [directory] }));
+      const earlyIndex = Number(secondCompletesFirst);
+      const lateIndex = 1 - earlyIndex;
+      const earlyId = targets[earlyIndex]!.id;
+      const lateId = targets[lateIndex]!.id;
+      const fixture = build(targets, targets[0]!);
+      let releaseProvider!: () => void;
+      const providerReply = new Promise<void>((resolve) => { releaseProvider = resolve; });
+      fixture.client.archiveThread.mockImplementation(async ({ threadId }) => {
+        if (threadId === lateId) await providerReply;
+        throw new Error(`json-rpc error (-32600): no rollout found for thread id ${threadId}`);
+      });
+      fixture.store.setThreadArchiveTombstone.mockImplementation(async ({ threadId, archivedAt }) => {
+        fixture.overlays.set(threadId, { backend: "codex", threadId, extraLinkedDirectories: [], archiveTombstonedAt: archivedAt });
+      });
+      // Both requests start together. Provider replies can settle in either
+      // order; the four cleanup workers do not promise request-order results.
+      const requests = targets.map((thread) => fixture.registry.archiveThread({ backend: "codex", threadId: thread.id }));
+      const results = Promise.all(requests);
+      try {
+        const early = await drivePacer(fixture.registry, requests[earlyIndex]!);
+        expect(early.cleanup[0]?.skippedReason).toContain(`another active thread: ${lateId}`);
+        expect(fixture.archiveWorktree).not.toHaveBeenCalled();
+        expect(fixture.overlays.get(earlyId)?.archiveTombstonedAt).toBeDefined();
+        expect(fixture.overlays.get(lateId)?.archiveTombstonedAt).toBeUndefined();
+        expect(fixture.counts.providerPages).toBe(2);
+        releaseProvider();
+        const completed = await drivePacer(fixture.registry, results);
+        expect(completed[lateIndex]?.cleanup[0]).toMatchObject({ removedWorktree: true });
+        expect(fixture.archiveWorktree).toHaveBeenCalledOnce();
+        expect(fixture.archiveWorktree).toHaveBeenCalledWith(expect.objectContaining({ threadId: lateId }));
+        expect(fixture.store.setThreadArchiveTombstone).toHaveBeenCalledTimes(2);
+        // The controlled replies make two batches, each reading both provider
+        // pages. Removal admission reads both afresh because this provider
+        // cannot order by updated_at. Tombstones reread only their own overlay.
+        expect(fixture.counts.providerPages).toBe(6);
+      } finally {
+        releaseProvider();
+        await drivePacer(fixture.registry, results).catch(() => {});
+        await fixture.registry.close();
+        registries.splice(registries.indexOf(fixture.registry), 1);
+      }
+    }), { numRuns: 25, examples: [[false], [true]] });
   });
 
   it("cancels missing-rollout recovery on genuine restore intent before removal", async () => {
@@ -2030,7 +2129,9 @@ describe("archive cleanup pipeline", () => {
     await drivePacer(fixture.registry, result);
     expect((await result).cleanup).toEqual([]);
     expect(read).toHaveBeenCalledOnce();
-    expect(fixture.client.listArchiveCleanupThreadsPage.mock.calls.map(([params]) => params.archived)).toEqual([false]);
+    // The batch's fleet index reads active and archived identities once, and
+    // every later job in the batch reuses it instead of rereading either list.
+    expect(fixture.client.listArchiveCleanupThreadsPage.mock.calls.map(([params]) => params.archived)).toEqual([false, true]);
   });
 
   it("exposes delayed metadata failure on the background completion event", async () => {

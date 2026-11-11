@@ -11,6 +11,7 @@ import type {
   HandoffTaskWorkspaceMode,
   DetachThreadDirectoryToolArgs,
   MoveThreadWorkspaceToolArgs,
+  RegisterThreadWorktreeToolArgs,
   PwrAgentThreadOrchestrationOperationName,
   PwrAgentThreadOrchestrationRequest,
   PwrAgentThreadOrchestrationResponse,
@@ -189,6 +190,8 @@ function descriptionForOperation(
   operation: PwrAgentThreadOrchestrationOperationName,
 ): string {
   switch (operation) {
+    case "register_thread_worktree":
+      return "Register a known current-profile thread's existing linked checkout for snapshot and cleanup, including outside PwrAgent roots. Use only when the operator explicitly requests ownership registration. Pass the target backend, threadId and exact canonical worktreePath. Find them with search_threads/get_thread_status. Register and unregister always show an operator approval card, including in Full Access. Registration changes no files and grants no immediate removal: idle, activity, shared-owner and snapshot protections still apply. Tracked edits and non-ignored untracked files are saved before removal. Ignored files are deleted without recovery. Main checkouts, aliases and unrelated paths are refused. Use action=inspect to read the receipt and validity without writes, or action=unregister to revoke authorization. Provider cwd, PR links, directory trust and to-project moves never authorize registration.";
     case "handoff_task":
       return "Create a PwrAgent-managed thread for delegated work. Prefer this to backend spawning unless the user requests it or needs an unsupported feature. Agent settings inherit from the current turn. Same-project handoffs create grouped subthreads in new worktrees by default. Assigned worktrees remain authoritative for child threads. Children must not edit, build, or run Git in another worktree because a branch is checked out there. When the user names another local project, pass its path as cwd. Also pass cwd when the user links or references a local directory. Never put the target path only in task or context. For an isolated worktree in that project, set workspaceMode=new_worktree. Set branchName only to an existing base ref. Omit cwd only to inherit the current project. Cross-project handoffs are not grouped. Use fork or same_workspace only when the user requests them. Use project_local for the project checkout. workspaceMode=none creates an unscoped scratch workspace. Do not use none as a fallback for work in a named project. Provider overrides need a registered backend and exact model ID. Set environment to an environment id or name from the project's .codex/environments, or environment=none for no environment. Omit it to give a same-project child this thread's environment. Report a failed setup from the result's environment field. Do not retry while startup is pending. Inspect pendingHandoffs and return threadLink verbatim.";
     case "attach_thread_directory":
@@ -198,9 +201,9 @@ function descriptionForOperation(
     case "move_thread_workspace":
       return "Move the current thread workspace after this turn ends. Use direction=to-project with targetPath to adopt an existing Git checkout or worktree, including one managed by another agent. Files and branches stay in place, and adopted worktrees are preserved on thread archive. Default Access requires confirmation for an untrusted destination. Omit direction to create an isolated new worktree from the current checkout or worktree. Dirty non-ignored changes move with the thread. A previous worktree this thread owns is archived with a checkpoint. Pass baseRef, such as origin/main, to start fresh instead. A fresh move takes no changes and leaves the old workspace untouched. Archiving a Codex thread later removes an old worktree it owns. Pass sourcePath if that source is unclear. Do not create a child thread. After success, stop work and end the turn. PwrAgent updates cwd, reconnects ACP when necessary, and starts a continuation. Check pendingWorkspaceMoves only after the turn.";
     case "send_message_to_thread":
-      return "Send guidance to another PwrAgent thread. Prefer steer_thread for cross-thread communication. Default delivery groups pending messages from all senders into one queued steer. Each message retains its sender and time context. Supported active turns receive steering. Idle targets receive one grouped follow-up. A batch already dispatching is immutable. Later messages form the next batch. Set delivery=new_turn only when a distinct new turn is required. To replace your pending contribution, pass its queueEntryId as replaceQueueEntryId. Supply your complete consolidated prompt. Other senders' messages and queue position are preserved. A replacement fails if already dispatched. Use stop_thread for urgent interruption. Find unknown targets with search_threads or read_thread. Pass instanceId for remote targets when known. Set includeRemote=false for local resolution. Reply normally to the current thread. Return threadLink verbatim.";
+      return "Message another unarchived PwrAgent thread. Prefer steer_thread for cross-thread communication. Default delivery groups pending messages from all senders into one queued steer. Each message retains its sender and time context. Supported active turns receive steering. Idle targets receive one grouped follow-up. A batch already dispatching is immutable. Later messages form the next batch. Set delivery=new_turn only when a distinct new turn is required. To replace your pending contribution, pass its queueEntryId as replaceQueueEntryId. Supply your complete consolidated prompt. Other senders' messages and queue position are preserved. A replacement fails if already dispatched. Use stop_thread for urgent interruption. Find unknown targets with search_threads or read_thread. Pass instanceId for remote targets when known. Set includeRemote=false for local resolution. Reply normally to the current thread. Return threadLink verbatim.";
     case "steer_thread":
-      return "Preferred tool for cross-thread communication. PwrAgent groups pending guidance from all senders into one queued steer with sender and time context. Once a batch is dispatching, later messages accumulate in the next batch. Guidance steers a matching active turn at the next tool boundary, or starts one grouped follow-up if idle. The result disposition is steered, started, or queued. Use send_message_to_thread with delivery=new_turn for a distinct new turn and stop_thread for urgent interruption. Pass instanceId when known. Set includeRemote=false for local resolution. Reuse requestId only to retry the same steer. This thread cannot steer itself.";
+      return "Message another unarchived thread. Prefer this tool. PwrAgent groups pending guidance from all senders into one queued steer with sender and time context. Once a batch is dispatching, later messages accumulate in the next batch. Guidance steers a matching active turn at the next tool boundary, or starts one grouped follow-up if idle. The result disposition is steered, started, or queued. Use send_message_to_thread with delivery=new_turn for a distinct new turn and stop_thread for urgent interruption. Pass instanceId when known. Set includeRemote=false for local resolution. Reuse requestId only to retry the same steer. This thread cannot steer itself.";
     case "stop_thread":
       return "Stop the active turn on another PwrAgent thread immediately. Use this only for an urgent interruption. This tool interrupts the backend and does not queue text. The owner rejects a stale expectedTurnId. Pass instanceId when known. Set includeRemote=false for local resolution. Reuse requestId only to retry the same stop. This thread cannot stop itself.";
     case "start_review":
@@ -212,6 +215,17 @@ function inputSchemaForOperation(
   operation: PwrAgentThreadOrchestrationOperationName,
 ): Record<string, unknown> {
   switch (operation) {
+    case "register_thread_worktree":
+      return {
+        type: "object", additionalProperties: false,
+        required: ["backend", "threadId", "worktreePath"],
+        properties: {
+          backend: { type: "string" },
+          threadId: { type: "string" },
+          worktreePath: { type: "string", description: "Exact canonical root of the thread's existing linked checkout." },
+          action: { type: "string", enum: ["register", "unregister", "inspect"], description: "Defaults to register. Inspect reads the authorization receipt without writes. Unregister revokes it." },
+        },
+      };
     case "attach_thread_directory":
       return {
         type: "object",
@@ -509,12 +523,23 @@ function normalizeArgsForOperation(
   | DetachThreadDirectoryToolArgs
   | HandoffTaskToolArgs
   | MoveThreadWorkspaceToolArgs
+  | RegisterThreadWorktreeToolArgs
   | SendMessageToThreadToolArgs
   | SteerThreadToolArgs
   | StartReviewToolArgs
   | StopThreadToolArgs
   | undefined {
   switch (operation) {
+    case "register_thread_worktree": {
+      if (Object.keys(args).some((key) => !["backend", "threadId", "worktreePath", "action"].includes(key))) return undefined;
+      const backend = readTrimmedString(args.backend);
+      const threadId = readTrimmedString(args.threadId);
+      const worktreePath = readTrimmedString(args.worktreePath);
+      if (!backend || !threadId || !worktreePath
+        || (args.action !== undefined && args.action !== "register" && args.action !== "unregister" && args.action !== "inspect")) return undefined;
+      return { backend: backend as RegisterThreadWorktreeToolArgs["backend"], threadId, worktreePath,
+        ...(args.action ? { action: args.action as RegisterThreadWorktreeToolArgs["action"] } : {}) };
+    }
     case "attach_thread_directory":
       return normalizeAttachThreadDirectoryArgs(args);
     case "detach_thread_directory":
@@ -538,6 +563,8 @@ function invalidArgumentsMessageForOperation(
   operation: PwrAgentThreadOrchestrationOperationName,
 ): string {
   switch (operation) {
+    case "register_thread_worktree":
+      return "register_thread_worktree requires backend, threadId and worktreePath, and accepts action=register, unregister or inspect.";
     case "attach_thread_directory":
       return "attach_thread_directory requires a non-empty path and accepts only known workspaceMode/worktreeBranchMode values.";
     case "detach_thread_directory":

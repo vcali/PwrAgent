@@ -991,6 +991,11 @@ function SettingsSectionBody(props: {
             general: { attentionPromoteOnTurnEnd },
           });
         }}
+        onAutoFixReviewsChange={async (autoFixReviews: boolean) => {
+          await props.settings.writeConfig({
+            general: { autoFixReviews },
+          });
+        }}
         onPinnedThreadsOnTopChange={async (pinnedThreadsOnTop: boolean) => {
           await props.settings.writeConfig({
             general: { pinnedThreadsOnTop },
@@ -1588,6 +1593,8 @@ function SettingsSectionBody(props: {
             worktrees: { storage },
           });
         }}
+        onWriteConfig={props.settings.writeConfig}
+        desktopApi={props.desktopApi}
       />
     );
   }

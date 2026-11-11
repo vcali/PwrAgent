@@ -1718,12 +1718,37 @@
   list-style: none;
 }
 
-.pr-rollup-popover__row {
+/* A row is the open-in-browser button plus, when the thread can detach,
+   its ✕. The highlight covers both, so the ✕ reads as part of the row. */
+.pr-rollup-popover__list > li {
   display: flex;
-  width: 100%;
   align-items: flex-start;
   gap: 8px;
-  padding: 6px 8px;
+  padding-right: 8px;
+  border-radius: 4px;
+}
+
+/* The rows' chips sit on the side nearest the chip that opened the list,
+   so the ✕ is a short move from where the pointer came in. */
+.pr-rollup-popover--chips-left .pr-rollup-popover__list > li {
+  flex-direction: row-reverse;
+  padding-right: 0;
+  padding-left: 8px;
+}
+
+.pr-rollup-popover__list > li:hover,
+.pr-rollup-popover__list > li:has(.pr-rollup-popover__row:focus-visible) {
+  background: var(--accent-soft);
+}
+
+/* The title and status take the row's full width; the chip sits beside. */
+.pr-rollup-popover__row {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 1px;
+  padding: 6px 0 6px 8px;
   border: 0;
   border-radius: 4px;
   background: transparent;
@@ -1733,9 +1758,8 @@
   cursor: pointer;
 }
 
-.pr-rollup-popover__row:hover,
-.pr-rollup-popover__row:focus-visible {
-  background: var(--accent-soft);
+.pr-rollup-popover--chips-left .pr-rollup-popover__row {
+  padding: 6px 8px 6px 0;
 }
 
 .pr-rollup-popover__row:focus-visible {
@@ -1743,21 +1767,16 @@
   outline-offset: -2px;
 }
 
-.pr-rollup-popover__row .pr-chip {
+/* The rows' chips, centered on the title line. */
+.pr-rollup-popover__list .pr-chip {
   height: 20px;
   flex: none;
-  pointer-events: none;
-}
-
-.pr-rollup-popover__text {
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-  gap: 1px;
+  margin-top: 5px;
 }
 
 .pr-rollup-popover__title {
   overflow: hidden;
+  max-width: 100%;
   font-size: 12px;
   font-weight: 500;
   line-height: 18px;
@@ -1766,9 +1785,46 @@
 }
 
 .pr-rollup-popover__status {
+  overflow: hidden;
+  max-width: 100%;
   color: var(--text-muted);
   font-size: 11px;
   line-height: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Detach all sits apart from the rows, so a stray click on the list
+   never reaches it. */
+.pr-rollup-popover__foot {
+  display: flex;
+  flex: none;
+  justify-content: flex-end;
+  padding: 4px 6px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.pr-rollup-popover__detach-all {
+  padding: 4px 8px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.pr-rollup-popover__detach-all:hover,
+.pr-rollup-popover__detach-all:focus-visible {
+  background: var(--danger-soft);
+  color: var(--danger-text);
+}
+
+.pr-rollup-popover__detach-all:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
 }
 
 /* (No compact-specific list gap anymore: the base `.sidebar-list` /
@@ -6534,6 +6590,17 @@ a.button {
   opacity: 0.62;
 }
 
+/* A Claude sub-agent row names a task in the parent's session; nothing opens. */
+.native-subagents__agent--static {
+  cursor: default;
+}
+
+.native-subagents__agent--static:hover {
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-secondary);
+}
+
 .native-subagents__status {
   width: 7px;
   height: 7px;
@@ -7889,6 +7956,20 @@ a.button {
   color: var(--accent-bright);
 }
 
+/* A hibernated checkout. The row stays as it was, so this shows only on the
+   lifted X-ray card, never on a row in any density or in a preview. */
+.thread-row__chip--xray-only {
+  display: none;
+}
+
+.thread-row-shell[data-xray-target] .thread-row__chip--xray-only {
+  display: inline-flex;
+}
+
+.thread-row__chip--hibernated {
+  color: var(--text-secondary);
+}
+
 /* Pending outbound-message chips. "Scheduled" is the solid-accent CTA —
    a future send time is the highest-priority signal, so it mirrors the
    approval/input pill weight. "Queued" (waiting on the active turn) is
@@ -8715,6 +8796,18 @@ a.button {
   color: var(--text-secondary);
   font-size: 13px;
   line-height: 1.45;
+}
+
+/* Detach all: one PR per line, scrolling past about eight. */
+.pr-detach-warning-dialog__list {
+  max-height: 160px;
+  margin: 6px 0 8px;
+  padding-left: 18px;
+  overflow-y: auto;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
 }
 
 .pr-detach-warning-dialog__checkbox {
@@ -9685,48 +9778,44 @@ a.button {
 }
 
 /* The rail's one paging affordance: directory, pinned, lens and sub-thread
-   all reach it through `SidebarShowMore`. A button the width of the rows
-   above it, in the start actions' family (6px radius, 30px, centred label
-   and glyph), but on a filled panel with the strong border, because it has
-   to be found at the end of a list of borderless rows.
+   all reach it through `SidebarShowMore`. A pill in the PR chip family:
+   11px label, shrink-wrapped and left-aligned under the rows it pages, on a
+   filled panel with the strong border, because it has to be found at the end
+   of a list of borderless rows.
 
-   It was a transparent, borderless 12px label. Its text passed contrast in
-   every theme (6.4:1 at the lowest, Solarized dark) and its box passed
-   WCAG 2.5.8, yet operators could not find it: nothing about it said
-   "button", and in the flat lenses it also sat below the start actions'
-   hairline at the rail's bottom edge (see `lensPager` in Sidebar.tsx).
-
-   It was `directory-row__show-more`, a name that reads as private to one
-   parent — and the seven call sites that did not sit beside the rule (five
-   outside DirectoriesList, two inside it) styled nothing at all rather than
-   reach for it, so they shipped as native Chromium buttons. */
+   It was a transparent, borderless 12px label: its text passed contrast in
+   every theme and its box passed WCAG 2.5.8, yet operators could not find
+   it. The fix for that went to a 30px button the full width of the list,
+   which was found and then read as the heaviest box in a sub-thread tray,
+   taller than the 20px PR chips beside it. The fill and strong border are
+   what make it findable; the size never was. 24px is the 2.5.8 floor. */
 .sidebar-show-more {
   overflow-anchor: none;
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  justify-content: center;
-  gap: 6px;
-  /* The row width, in every container. `.subthread-list` is a grid, and
-     `SubthreadPagination` wraps the control in the `role="listitem"` its
-     list requires; that wrapper is the grid item and this fills it. */
-  width: 100%;
+  gap: 4px;
+  /* Shrink-wrap in every container. Inline-flex does it in the block
+     `role="listitem"` wrappers of the sub-thread and pinned pagers; the
+     flex columns (scroll region, list lanes, a directory's details) would
+     stretch it to their width without `align-self`. */
+  align-self: flex-start;
+  max-width: 100%;
   min-width: 0;
-  margin-top: 6px;
-  /* WCAG 2.5.8 asks for 24px. 30px matches the start actions below it, so
-     the two read as one family of list-end controls. */
-  min-height: 30px;
-  padding: 0 10px;
+  margin-top: 4px;
+  min-height: 24px;
+  padding: 2px 10px 2px 7px;
   border: 1px solid var(--border-strong);
-  border-radius: 6px;
+  /* Half the height: a full pill on one line, and a rounded box rather than
+     a lozenge when "Load more sub-threads on this machine" wraps in an
+     indented tray at the 240px minimum rail. */
+  border-radius: 12px;
   background: var(--bg-panel-elevated);
   color: var(--text-secondary);
   font: inherit;
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
-  /* Wraps rather than overflowing: the button is pinned to the row width,
-     and "Load more sub-threads on this machine" in an indented tray at the
-     240px minimum rail is wider than the box. */
-  text-align: center;
+  line-height: 1.3;
+  text-align: left;
   cursor: pointer;
   transition:
     background-color 120ms ease,
@@ -9734,18 +9823,10 @@ a.button {
     color 120ms ease;
 }
 
-/* Inset by the rule with `.sidebar-empty` when a lens shows a status line in
-   place of its list; the flex column stretches it to the inset width, which
-   `width: 100%` plus that margin would overflow. */
-.sidebar__scroll-region > .sidebar-show-more {
-  width: auto;
-}
-
 /* A directory's own pager is a sibling of its `.directory-row__threads`
    list, not a child, so it takes that list's 8px inset to line up with the
    row cards. The details column's 8px gap already spaces it from the rows. */
 .directory-row__details > .sidebar-show-more {
-  width: auto;
   margin: 0 8px;
 }
 
@@ -10626,7 +10707,7 @@ a.button {
 .continue-after-dialog {
   display: flex;
   flex-direction: column;
-  width: min(600px, 100%);
+  width: min(680px, 100%);
   max-height: min(720px, calc(100vh - 48px));
 }
 
@@ -10659,7 +10740,7 @@ a.button {
 
 .continue-after-dialog__columns {
   display: grid;
-  grid-template-columns: minmax(0, 220px) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 260px) minmax(0, 1fr);
   gap: 12px;
   align-items: start;
 }
@@ -10673,10 +10754,6 @@ a.button {
   grid-template-columns: minmax(0, 1fr);
   gap: 8px;
   min-width: 0;
-}
-
-.continue-after-dialog__pick .thread-dependencies__results {
-  max-height: 240px;
 }
 
 @media (max-width: 560px) {
@@ -12309,10 +12386,6 @@ a.button {
 }
 
 /* Overflow menu for the rarer, destructive row actions. */
-.automations-table__menu {
-  position: relative;
-}
-
 .automations-table__menu-button {
   display: inline-flex;
   align-items: center;
@@ -12321,10 +12394,9 @@ a.button {
 }
 
 .automations-table__menu-list {
-  position: absolute;
-  top: calc(100% + 4px);
-  right: 0;
-  z-index: 30;
+  /* Escape the table's rounded clipping and the pane's scrollport. */
+  position: fixed;
+  z-index: 150;
   display: flex;
   min-width: 132px;
   flex-direction: column;
@@ -16505,6 +16577,19 @@ a.button {
   line-height: 1.45;
 }
 
+/* Settings → Git → Updates: the build line or the progress strip, then a
+   quieter note. Uses the Grok build line and the shared strip as they are. */
+.managed-git-updates {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.managed-git-updates__note {
+  margin: 0;
+}
+
 /* ------------------------------------------------------------------
    Managed build progress strip (Codex + Grok). One layout for every phase:
    state line, track, byte meter, four-step rail. The track copies
@@ -19356,6 +19441,17 @@ a.button {
 
 .settings-archive-sweep__run {
   margin-left: auto;
+}
+
+.settings-archive-sweep__buttons {
+  display: inline-flex;
+  flex: none;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.settings-archive-sweep__buttons .settings-archive-sweep__run {
+  margin-left: 0;
 }
 
 .settings-archive-sweep__run[aria-disabled="true"] {
@@ -25093,6 +25189,15 @@ a.button {
   color: var(--text-primary);
 }
 
+/* A hibernated checkout's restore, step by step. */
+.missing-worktree-card__step.is-active {
+  color: var(--text-primary);
+}
+
+.missing-worktree-card__step.is-active .missing-worktree-card__step-mark {
+  color: var(--accent);
+}
+
 .missing-worktree-card__step-mark {
   display: inline-flex;
   width: 16px;
@@ -25251,7 +25356,7 @@ a.button {
 .thread-todo-stack {
   position: absolute;
   z-index: 29;
-  top: 10px;
+  top: calc(10px + var(--continue-after-status-height, 0px));
   right: 18px;
   display: flex;
   width: min(340px, calc(100% - 36px));
@@ -25266,7 +25371,7 @@ a.button {
 }
 
 .thread-todo-stack.is-below-find {
-  top: 56px;
+  top: calc(56px + var(--continue-after-status-height, 0px));
 }
 
 /* The shadow is on the deck, not the card, so the slivers of the cards
@@ -25675,16 +25780,17 @@ a.button {
   overflow-wrap: anywhere;
 }
 
-/* The jump palette's search inside the to-do card: the field, the palette's
-   rows, and a footer. The card is ~340px wide, so each row stacks: the title,
-   then its metadata on one line (`.jump-palette__row-meta`). */
-.todo-destination-picker {
+/* The jump palette's search inline (ThreadSearchPicker), in the to-do card
+   and the Continue After dialog: the field, the palette's rows, and a footer.
+   The card is ~340px wide, so each row stacks: the title, then its metadata
+   on one line (`.jump-palette__row-meta`). */
+.thread-search-picker {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: 6px;
 }
 
-.todo-destination-picker__field {
+.thread-search-picker__field {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -25696,12 +25802,12 @@ a.button {
   color: var(--text-muted);
 }
 
-.todo-destination-picker__field:focus-within {
+.thread-search-picker__field:focus-within {
   border-color: var(--focus-ring);
   box-shadow: 0 0 0 1px var(--accent-border);
 }
 
-.todo-destination-picker__field input {
+.thread-search-picker__field input {
   flex: 1;
   min-width: 0;
   padding: 6px 0;
@@ -25712,7 +25818,7 @@ a.button {
   outline: none;
 }
 
-.todo-destination-picker__results {
+.thread-search-picker__results {
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -25727,7 +25833,7 @@ a.button {
   list-style: none;
 }
 
-.todo-destination-picker .jump-palette__row {
+.thread-search-picker .jump-palette__row {
   flex-direction: column;
   align-items: stretch;
   gap: 3px;
@@ -25735,11 +25841,11 @@ a.button {
   padding: 6px 8px;
 }
 
-.todo-destination-picker .jump-palette__row-title {
+.thread-search-picker .jump-palette__row-title {
   font-size: 12.5px;
 }
 
-.todo-destination-picker .jump-palette__row-meta {
+.thread-search-picker .jump-palette__row-meta {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -25750,18 +25856,18 @@ a.button {
    and the age never shrinks. The machine chip, branch, and project end in an
    ellipsis instead of running past the row. The branch gives way first; it no
    longer competes with the title, which has its own line. */
-.todo-destination-picker .jump-palette__row-branch {
+.thread-search-picker .jump-palette__row-branch {
   flex: 1 2 auto;
   max-width: none;
   text-align: left;
 }
 
-.todo-destination-picker .jump-palette__row .chip--instance {
+.thread-search-picker .jump-palette__row .chip--instance {
   flex: 0 1 auto;
 }
 
 /* A block, not a flex box, so `text-overflow` reaches its text. */
-.todo-destination-picker .jump-palette__row-repo {
+.thread-search-picker .jump-palette__row-repo {
   display: inline-block;
   flex: 0 1 auto;
   min-width: 0;
@@ -25772,18 +25878,18 @@ a.button {
   white-space: nowrap;
 }
 
-.todo-destination-picker .jump-palette__section-divider {
+.thread-search-picker .jump-palette__section-divider {
   padding: 8px 8px 4px;
 }
 
-.todo-destination-picker__empty {
+.thread-search-picker__empty {
   margin: 0;
   padding: 14px 0;
   color: var(--text-muted);
   text-align: center;
 }
 
-.todo-destination-picker__foot {
+.thread-search-picker__foot {
   display: flex;
   gap: 10px;
   min-width: 0;
@@ -25793,11 +25899,11 @@ a.button {
   white-space: nowrap;
 }
 
-.todo-destination-picker__foot-spacer {
+.thread-search-picker__foot-spacer {
   flex: 1;
 }
 
-.todo-destination-picker__status {
+.thread-search-picker__status {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -26924,7 +27030,7 @@ button.thread-todos-panel__row-main:is(:hover, :focus-visible)
 .thread-find {
   position: absolute;
   z-index: 30;
-  top: 10px;
+  top: calc(10px + var(--continue-after-status-height, 0px));
   right: 18px;
   display: flex;
   align-items: center;
@@ -33985,6 +34091,21 @@ div.composer-error-row__toggle {
   line-height: 1.35;
 }
 
+/* A merge method menu marks the method the main button runs, as the to-do
+   card's merge menu does. */
+.transcript-mcp__split-item--radio {
+  position: relative;
+  padding-left: 28px;
+}
+
+.transcript-mcp__split-item-check {
+  position: absolute;
+  top: 8px;
+  left: 9px;
+  display: inline-flex;
+  color: var(--accent);
+}
+
 .transcript-request__actions .button {
   max-width: 100%;
   white-space: normal;
@@ -35998,75 +36119,6 @@ div.composer-error-row__toggle {
 .thread-dependencies__form textarea:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
-}
-
-/* Search results: toggle buttons, so a picked thread reads as pressed and a
-   second click removes its prerequisite row. */
-.thread-dependencies__results {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  max-height: 176px;
-  margin: 0;
-  padding: 3px;
-  overflow-y: auto;
-  border: 1px solid var(--border-subtle);
-  border-radius: 8px;
-  background: var(--bg-input);
-  list-style: none;
-}
-
-.thread-dependencies__results:empty {
-  display: none;
-}
-
-.thread-dependencies__result {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  min-height: 28px;
-  padding: 4px 8px;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--text-primary);
-  font: inherit;
-  font-size: 12px;
-  text-align: left;
-  cursor: pointer;
-}
-
-.thread-dependencies__result:hover:not([aria-disabled="true"]) {
-  background: var(--accent-soft);
-}
-
-.thread-dependencies__result[aria-pressed="true"] {
-  color: var(--accent-bright);
-  font-weight: 600;
-}
-
-.thread-dependencies__result[aria-pressed="true"]::after {
-  content: "✓";
-  margin-left: auto;
-}
-
-.thread-dependencies__result[aria-disabled="true"] {
-  color: var(--text-muted);
-  cursor: default;
-}
-
-.thread-dependencies__result-title {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.thread-dependencies__result-note {
-  flex: 0 0 auto;
-  color: var(--text-muted);
-  font-size: 11px;
 }
 
 .thread-dependencies__row {
@@ -40751,7 +40803,7 @@ button.pricing-token-miser__folded:focus-visible {
 
 .linked-project__facts {
   display: grid;
-  grid-template-columns: auto 1fr;
+  grid-template-columns: auto minmax(0, 1fr);
   gap: 4px 12px;
   margin: 0;
 }
@@ -41347,6 +41399,20 @@ button.pricing-token-miser__folded:focus-visible {
   height: 1.35em;
 }
 
+/* A leading provider command, such as Claude's `/code-review`. It is draft
+   text wrapped in a decoration that the caret walks through, so it stays a
+   plain inline box: an inline-flex box inside contenteditable traps the caret
+   at its edges. Vertical padding paints without growing the line. */
+.composer-tiptap-input__editor .composer-tiptap-input__command {
+  display: inline;
+  vertical-align: baseline;
+  height: auto;
+  padding: 0.1em 0.45em;
+  font-size: inherit;
+  line-height: inherit;
+  box-decoration-break: clone;
+}
+
 /* Zero-width baseline strut — load-bearing, not decoration. An inline-flex box
    takes its baseline from its FIRST flex item, and the kinds disagree on what
    that is: label text for `$`/`@`, a 1em SVG icon for `#thread`, an 8px dot for
@@ -41504,6 +41570,11 @@ button.pricing-token-miser__folded:focus-visible {
 
 .composer__queued--paused .composer__queued-text {
   color: var(--text-secondary);
+}
+
+/* The send waits while a hibernated checkout comes back. */
+.composer__queued--waiting-checkout .composer__queued-label {
+  color: var(--status-warning-text);
 }
 
 .composer__queued-pause-glyph {
@@ -45825,6 +45896,315 @@ button.composer__subthread-source-parent:hover {
   overflow-wrap: anywhere;
 }
 
+/* The dialog takes focus itself when a send starts or settles and swaps
+   its contents, so focus never falls behind the scrim. */
+.thread-handoff-dialog:focus {
+  outline: none;
+}
+
+/* While sending: the title names the operation and the machine, and the
+   minimise button sits at its end, as PwrGit's Bulk Sync dialog does. */
+.thread-handoff-dialog__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.thread-handoff-dialog__head h2 {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.thread-handoff-dialog__minimise {
+  display: inline-grid;
+  width: 26px;
+  height: 22px;
+  flex: none;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.thread-handoff-dialog__minimise:hover,
+.thread-handoff-dialog__minimise:focus-visible {
+  background: var(--accent-soft);
+  color: var(--accent-bright);
+}
+
+.thread-handoff-dialog__minimise:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+/* Cancel keeps the last slot, as the update card's way out does. */
+.thread-handoff-dialog__actions {
+  justify-content: flex-end;
+}
+
+/* One row per step. Only Send has a percent, so only Send has a track: a
+   bar on a step with no extent would only stand still. */
+.thread-handoff-steps {
+  display: grid;
+  margin: 14px 0 0;
+  padding: 4px 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  background: var(--bg-input);
+  list-style: none;
+}
+
+.thread-handoff-steps__step {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 10px;
+  min-height: 32px;
+  padding: 4px 10px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.thread-handoff-steps__step--done {
+  color: var(--text-secondary);
+}
+
+.thread-handoff-steps__step--now,
+.thread-handoff-steps__step--held {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.thread-handoff-steps__body {
+  display: grid;
+  min-width: 0;
+}
+
+.thread-handoff-steps__body .app-update-banner__track {
+  margin-top: 6px;
+}
+
+.thread-handoff-steps__mark {
+  display: inline-grid;
+  width: 14px;
+  height: 14px;
+  box-sizing: border-box;
+  place-items: center;
+  border: 1.5px solid var(--border-strong);
+  border-radius: 50%;
+}
+
+.thread-handoff-steps__step--done .thread-handoff-steps__mark {
+  border: 0;
+  background: color-mix(in srgb, var(--status-ok) 18%, transparent);
+  color: var(--status-ok);
+}
+
+.thread-handoff-steps__step--now .thread-handoff-steps__mark {
+  border: 2px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  border-top-color: var(--accent);
+  animation: thread-handoff-step-spin 0.7s linear infinite;
+}
+
+.thread-handoff-steps__step--held .thread-handoff-steps__mark {
+  border-color: var(--status-suspended);
+}
+
+.thread-handoff-steps__value {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.thread-handoff-meter {
+  margin: 8px 0 0;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+@keyframes thread-handoff-step-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Held: the link dropped and the transfer waits to resume. The fill keeps
+   the bytes the receiver confirmed, in still stripes of the suspended tone,
+   as PwrGit's halted bar does. Red is kept for a send that has ended. */
+.thread-handoff-track--held i {
+  background: repeating-linear-gradient(
+    135deg,
+    var(--status-suspended) 0 6px,
+    color-mix(in srgb, var(--status-suspended) 60%, transparent) 6px 12px
+  );
+}
+
+/* Resumed: what the receiver already held stays a lighter accent, so a
+   resume is visibly not a restart. */
+.thread-handoff-track--resumed {
+  display: flex;
+}
+
+.thread-handoff-track--resumed i {
+  border-radius: 0;
+}
+
+.thread-handoff-track--resumed .thread-handoff-track__resumed {
+  background: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+/* A minimised handoff in the toast stack: the update banner's card. */
+.thread-handoff-card {
+  gap: 10px;
+  padding: 12px 10px 12px 14px;
+}
+
+.thread-handoff-card--held {
+  border-color: color-mix(in srgb, var(--status-suspended) 45%, transparent);
+  background: var(--bg-panel-elevated);
+}
+
+.thread-handoff-card--held .app-update-banner__eyebrow {
+  color: var(--text-muted);
+}
+
+.thread-handoff-card__head {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.thread-handoff-card__head .app-update-banner__content {
+  flex: 1 1 auto;
+}
+
+.thread-handoff-card__icons {
+  display: flex;
+  flex: none;
+  margin: -4px 0 0;
+}
+
+/* The title expands the card back into the dialog. */
+.thread-handoff-card__title {
+  display: block;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.35;
+  text-align: left;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.thread-handoff-card__title:hover {
+  text-decoration: underline;
+}
+
+.thread-handoff-card__title:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.thread-handoff-card__note {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+/* The composer band row of a thread being sent: why its turns are paused. */
+.thread-handoff-band {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 32px;
+  padding: 4px 6px 4px 12px;
+  border: 1px solid var(--accent-border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 6%, var(--bg-input));
+  color: var(--text-secondary);
+  font-size: 12.5px;
+}
+
+.thread-handoff-band__text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.thread-handoff-band__text b {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.thread-handoff-band .app-update-banner__track {
+  width: 90px;
+  flex: none;
+  margin-top: 0;
+}
+
+.thread-handoff-band__value {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.thread-handoff-band__action {
+  margin-left: auto;
+  min-height: 24px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--accent-bright);
+  font: inherit;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.thread-handoff-band__action:hover,
+.thread-handoff-band__action:focus-visible {
+  background: var(--accent-soft);
+}
+
+.thread-handoff-band__action:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+/* The empty card that flies between a dialog and its toast (lib/fly-between). */
+.fly-ghost {
+  position: fixed;
+  z-index: 145;
+  border: 1px solid var(--accent-border);
+  border-radius: 8px;
+  background: var(--bg-panel-elevated);
+  box-shadow: var(--shadow-popover);
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .thread-handoff-steps__step--now .thread-handoff-steps__mark {
+    animation: none;
+    border-color: var(--accent);
+  }
+}
+
 .workspace-handoff-dialog__actions {
   display: flex;
   flex-wrap: wrap;
@@ -46249,6 +46629,21 @@ button.composer__subthread-source-parent:hover {
 .composer__autocomplete-match {
   color: var(--accent-bright);
   font-weight: 700;
+}
+
+/* The arguments a provider command takes, after its name. Regular-weight
+   mono sets it apart from the name; the ink is `--text-secondary`, because
+   `--text-muted` falls under the text floor on the active row's tint. */
+.composer__autocomplete-argument-hint {
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .composer__autocomplete-source {
@@ -46787,6 +47182,64 @@ button.composer__subthread-source-parent:hover {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+}
+
+/* What follows the review, at the start of the actions row so the panel
+   grows no taller. A 26px pill like the reviewer chips, with the send
+   menu's schedule check box. */
+.composer__review-after {
+  display: inline-flex;
+  min-height: 26px;
+  align-items: center;
+  gap: 7px;
+  margin-right: auto;
+  padding: 0 11px 0 7px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  background: var(--bg-input);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+.composer__review-after[aria-checked="true"] {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent-bright);
+}
+
+.composer__review-after:hover {
+  color: var(--text-primary);
+}
+
+.composer__review-after[aria-checked="true"]:hover {
+  color: var(--accent-bright);
+}
+
+.composer__review-after:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.composer__review-after-box {
+  display: inline-flex;
+  width: 14px;
+  height: 14px;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--text-muted);
+  border-radius: 4px;
+  color: var(--button-text);
+}
+
+.composer__review-after[aria-checked="true"] .composer__review-after-box {
+  border-color: var(--accent-fill);
+  background: var(--accent-fill);
 }
 
 /* Same chip language as the footer's Stop/Send/Queue pills
@@ -47816,6 +48269,12 @@ button.composer__subthread-source-parent:hover {
     animation:
       pending-spinner-spin 0.8s linear 2,
       calm-motion-spinner-rest 0s 1.6s forwards;
+  }
+
+  :root[data-motion="calm"] .thread-handoff-steps__step--now .thread-handoff-steps__mark {
+    animation:
+      thread-handoff-step-spin 0.7s linear 2,
+      calm-motion-spinner-rest 0s 1.4s forwards;
   }
 
   :root[data-motion="calm"] .missing-worktree-card--busy::before,
@@ -52219,6 +52678,28 @@ button.usage-timeline__legend-item[aria-pressed="true"] { background: var(--bg-r
   font-weight: 600;
 }
 
+/* What the review's Auto-fix turn is doing, under the card head. The words
+   carry the state; the glyph only marks the line. */
+.review-todo__auto {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 0 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.review-todo__auto svg {
+  flex: none;
+  color: var(--text-muted);
+}
+
+.review-todo__auto strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
 .review-todo__findings {
   display: flex;
   flex-direction: column;
@@ -52773,4 +53254,1184 @@ button.usage-timeline__legend-item[aria-pressed="true"] { background: var(--bg-r
 .todo-model-picker__reset:focus-visible {
   outline: 1px solid var(--focus-ring);
   outline-offset: 2px;
+}
+
+
+/* Continue After's thread banner: a held merge, or waits to mark done.
+   Replies and the composer stay available below it. */
+.continue-after-status {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.continue-after-status p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.continue-after-status strong { color: var(--accent); }
+.continue-after-status .button { flex-shrink: 0; }
+
+/* A reminder's steps on its Continue After card. */
+.thread-dependencies__steps {
+  margin: 0;
+  padding-left: 20px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.thread-dependencies__steps li { overflow-wrap: anywhere; }
+
+/* Mark Done's note, above the cards it marks. */
+.continue-after-dialog__mark {
+  display: grid;
+  gap: 8px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.continue-after-dialog__something-else { justify-self: start; }
+
+/* A held merge card says why in place of its merge button, at the card's
+   detail size rather than the inherited body size. */
+.thread-todo-card__hint {
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 17px;
+  overflow-wrap: anywhere;
+}
+
+/* Thread maintenance dialog. Geometry follows .workspace-handoff-dialog;
+   it sits above Settings (120) and below portalled Select lists (150). */
+/* The dialog keeps one size and one place from open to close, as PwrGit's
+   Repository maintenance does: it hangs from a fixed top and has a fixed
+   height, so a tab, a scan, a review or a run never moves it. Only the body
+   scrolls. */
+.thread-maintenance-modal {
+  position: fixed;
+  z-index: 130;
+  inset: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 8vh 24px 24px;
+  background: var(--scrim-medium);
+}
+
+.thread-maintenance {
+  display: flex;
+  flex-direction: column;
+  width: min(860px, 100%);
+  height: min(760px, 100%);
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: var(--bg-panel-elevated);
+  box-shadow: var(--shadow-popover);
+  color: var(--text-primary);
+}
+
+.thread-maintenance:focus {
+  outline: none;
+}
+
+.thread-maintenance__head {
+  display: flex;
+  flex: none;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 16px 14px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.thread-maintenance__head h2 {
+  margin: 0;
+  font-size: 16px;
+  line-height: 1.25;
+}
+
+.thread-maintenance__head p {
+  margin: 6px 0 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.thread-maintenance__head-side {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+}
+
+.thread-maintenance__body {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  padding: 12px 16px 16px;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+
+.thread-maintenance__body > * {
+  flex-shrink: 0;
+}
+
+.thread-maintenance__foot {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border-subtle);
+  background: var(--bg-panel);
+}
+
+.thread-maintenance__footnote {
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.thread-maintenance__footnote b {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.thread-maintenance__actions {
+  display: inline-flex;
+  flex: none;
+  gap: 8px;
+}
+
+.thread-maintenance__button {
+  height: 28px;
+  padding: 0 11px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.thread-maintenance__button[aria-disabled="true"] {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.thread-maintenance__button:focus-visible,
+.thread-maintenance__tab:focus-visible,
+.thread-maintenance__choice:focus-visible,
+.thread-maintenance__more:focus-visible,
+.thread-maintenance__kept-toggle:focus-visible,
+.thread-maintenance__problem-rows:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.thread-maintenance__tabs {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 14px 16px 0;
+}
+
+.thread-maintenance__tab {
+  padding: 5px 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.thread-maintenance__tab.is-active {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent-bright);
+}
+
+.thread-maintenance__tab:disabled {
+  cursor: default;
+}
+
+.thread-maintenance__tab:disabled:not(.is-active) {
+  color: var(--text-subtle);
+}
+
+.thread-maintenance__lead {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 12.5px;
+}
+
+.thread-maintenance__plan,
+.thread-maintenance__never,
+.thread-maintenance__summary,
+.thread-maintenance__rules-strip,
+.thread-maintenance__group,
+.thread-maintenance__receipt {
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  background: var(--bg-panel);
+}
+
+.thread-maintenance__plan {
+  padding: 12px 14px;
+}
+
+.thread-maintenance__plan.is-off {
+  border-style: dashed;
+  background: transparent;
+}
+
+.thread-maintenance__plan.is-off h3 {
+  color: var(--text-secondary);
+}
+
+.thread-maintenance__plan-top {
+  display: grid;
+  grid-template-columns: 22px 1fr auto;
+  align-items: start;
+  gap: 10px;
+}
+
+/* Combined's steps lead with a checkbox, as PwrGit's plan does. */
+.thread-maintenance__plan-top.has-check {
+  grid-template-columns: 16px 22px 1fr auto;
+}
+
+.thread-maintenance__plan-top.has-check > .thread-maintenance__check {
+  margin-top: 2px;
+}
+
+.thread-maintenance__plan-top.has-check + .thread-maintenance__rules {
+  margin-left: 58px;
+}
+
+.thread-maintenance__plan h3 {
+  margin: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.thread-maintenance__plan p {
+  margin: 3px 0 0;
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.thread-maintenance__rules {
+  display: grid;
+  gap: 10px;
+  margin: 12px 0 0 32px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.thread-maintenance__rule {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.thread-maintenance__select {
+  width: 220px;
+}
+
+.thread-maintenance__number {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+}
+
+.thread-maintenance__number .settings-input {
+  width: 72px;
+  height: 28px;
+}
+
+.thread-maintenance__check {
+  display: grid;
+  grid-template-columns: 16px 1fr;
+  align-items: start;
+  column-gap: 8px;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.thread-maintenance__check-text {
+  grid-column: 2;
+  grid-row: 1;
+  line-height: 18px;
+}
+
+.thread-maintenance .settings-thread-management__checkbox.is-mixed {
+  border-color: var(--accent-border);
+  background: var(--accent);
+  box-shadow: none;
+}
+
+.thread-maintenance .settings-thread-management__checkbox.is-mixed::after {
+  width: 8px;
+  height: 2px;
+  background: var(--bg-panel);
+  content: "";
+}
+
+.thread-maintenance__hint {
+  display: block;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.thread-maintenance__check-text .thread-maintenance__hint {
+  display: inline;
+  margin-left: 6px;
+}
+
+.thread-maintenance__num {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+.thread-maintenance__num.is-done {
+  border-color: var(--success-border);
+  background: var(--success-soft);
+  color: var(--success-text);
+}
+
+.thread-maintenance__num.is-failed {
+  border-color: var(--danger-border);
+  background: var(--danger-soft);
+  color: var(--danger-text);
+}
+
+.thread-maintenance__never {
+  padding: 10px 14px;
+}
+
+.thread-maintenance__eyebrow {
+  margin: 0;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.thread-maintenance__never dl {
+  display: grid;
+  grid-template-columns: 90px 1fr;
+  gap: 3px 10px;
+  margin: 6px 0 0;
+  font-size: 12px;
+}
+
+.thread-maintenance__never dt {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.thread-maintenance__never dd {
+  margin: 0;
+}
+
+.thread-maintenance__rail {
+  display: grid;
+  grid-auto-columns: 1fr;
+  grid-auto-flow: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.thread-maintenance__rail-step {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 11px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  background: var(--bg-panel);
+}
+
+.thread-maintenance__rail-step.is-active {
+  border-color: var(--accent-border);
+  background: var(--bg-row-active);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+.thread-maintenance__rail-step.is-active .thread-maintenance__num {
+  border-color: var(--accent-fill);
+  background: var(--accent-fill);
+  color: var(--accent-on);
+}
+
+.thread-maintenance__rail-title {
+  display: block;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.thread-maintenance__rail-sub,
+.thread-maintenance__mono {
+  display: block;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+
+.thread-maintenance__rail-step.is-active .thread-maintenance__rail-sub {
+  color: var(--accent-bright);
+}
+
+.thread-maintenance__summary {
+  padding: 10px 14px;
+}
+
+/* Where every checked thread went, one count per disposition. The count
+   reads first; the label names it. */
+.thread-maintenance__dispositions {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+  margin: 10px 0 0;
+}
+
+.thread-maintenance__dispositions > div {
+  display: flex;
+  flex-direction: column;
+  padding: 8px 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  background: var(--bg-panel-elevated);
+}
+
+.thread-maintenance__dispositions > div.is-candidates {
+  border-color: var(--accent-border);
+}
+
+.thread-maintenance__dispositions > div.is-aside {
+  border-style: dashed;
+  background: transparent;
+}
+
+.thread-maintenance__dispositions dt {
+  color: var(--text-secondary);
+  font-size: 11.5px;
+}
+
+.thread-maintenance__dispositions dd {
+  order: -1;
+  margin: 0;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.thread-maintenance__dispositions dd.thread-maintenance__disposition-note {
+  order: 0;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.thread-maintenance__summary.is-failed {
+  border-color: var(--danger-border);
+  background: var(--danger-surface-faint);
+}
+
+.thread-maintenance__summary-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.thread-maintenance__summary-sub {
+  margin: 2px 0 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.thread-maintenance__rules-strip {
+  display: grid;
+  grid-template-columns: 56px 1fr;
+  gap: 4px 10px;
+  padding: 9px 14px;
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.thread-maintenance__rules-strip .thread-maintenance__eyebrow {
+  line-height: 18px;
+}
+
+.thread-maintenance__never-inline {
+  color: var(--danger-text);
+}
+
+.thread-maintenance__groups {
+  display: grid;
+  gap: 12px;
+}
+
+.thread-maintenance__group {
+  overflow: hidden;
+}
+
+.thread-maintenance__group-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.thread-maintenance__group-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.thread-maintenance__group-side {
+  margin-left: auto;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.thread-maintenance__path {
+  min-width: 0;
+  margin: 1px 0 0;
+  overflow: hidden;
+  /* --text-subtle fails AA contrast on the panel and the tinted cards. */
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.thread-maintenance__rows {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.thread-maintenance__row {
+  display: grid;
+  grid-template-columns: 16px 1fr auto;
+  align-items: start;
+  gap: 10px;
+  padding: 8px 12px;
+}
+
+.thread-maintenance__row + .thread-maintenance__row {
+  border-top: 1px solid var(--border-subtle);
+}
+
+.thread-maintenance__row.needs-decision {
+  background: var(--warning-surface);
+}
+
+.thread-maintenance__row > .thread-maintenance__check {
+  grid-template-columns: 16px;
+}
+
+.thread-maintenance__row-body {
+  min-width: 0;
+}
+
+.thread-maintenance__row-title {
+  margin: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.thread-maintenance__row-title.is-path {
+  font-family: var(--font-mono);
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.thread-maintenance__branch {
+  margin-left: 6px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 500;
+}
+
+.thread-maintenance__row-meta {
+  margin: 2px 0 0;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.thread-maintenance__lead-text {
+  font-weight: 500;
+}
+
+.thread-maintenance__lead-text.is-ok {
+  color: var(--success-text);
+}
+
+.thread-maintenance__lead-text.is-warn {
+  color: var(--status-warning-text);
+}
+
+.thread-maintenance__lead-text.is-info {
+  color: var(--info-text);
+}
+
+.thread-maintenance__size {
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.thread-maintenance__choices {
+  display: inline-flex;
+  margin-top: 7px;
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+}
+
+.thread-maintenance__choice {
+  padding: 4px 9px;
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.thread-maintenance__choice + .thread-maintenance__choice {
+  border-left: 1px solid var(--border-subtle);
+}
+
+.thread-maintenance__choice.is-active {
+  background: var(--accent-soft);
+  color: var(--accent-bright);
+}
+
+.thread-maintenance__more {
+  display: block;
+  width: 100%;
+  padding: 7px 12px;
+  border: 0;
+  border-top: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--accent-bright);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.thread-maintenance__kept {
+  padding: 8px 12px 10px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+/* "Show" beside an eyebrow: same accent as Show all, in the eyebrow's type. */
+.thread-maintenance__kept-toggle {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent-bright);
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  cursor: pointer;
+}
+
+.thread-maintenance__group-head + .thread-maintenance__kept {
+  border-top: 0;
+}
+
+.thread-maintenance__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.thread-maintenance__chip {
+  max-width: none;
+}
+
+.thread-maintenance__progress-card {
+  padding: 10px 14px;
+  border: 1px solid var(--accent-border);
+  border-radius: 6px;
+  background: var(--bg-row-active);
+}
+
+.thread-maintenance__progress-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.thread-maintenance__bar {
+  height: 4px;
+  margin: 9px 0 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--bg-panel-hover);
+}
+
+.thread-maintenance__bar > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+
+/* The scan's live status. It keeps one height whatever it says. */
+.thread-maintenance__scan-card {
+  padding: 10px 14px;
+  border: 1px solid var(--accent-border);
+  border-radius: 6px;
+  background: var(--bg-row-active);
+}
+
+.thread-maintenance__scan-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.thread-maintenance__scan-now {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+
+.thread-maintenance__problem {
+  overflow: hidden;
+  border: 1px solid var(--danger-border);
+  border-radius: 6px;
+  background: var(--danger-surface-faint);
+}
+
+.thread-maintenance__problem.is-kept {
+  border-color: var(--info-border);
+  background: var(--info-soft);
+}
+
+.thread-maintenance__problem-head {
+  display: grid;
+  grid-template-columns: 20px 1fr;
+  align-items: start;
+  gap: 10px;
+  padding: 10px 14px;
+}
+
+.thread-maintenance__mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  background: var(--danger-soft);
+  color: var(--danger-text);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.thread-maintenance__problem.is-kept .thread-maintenance__mark {
+  background: var(--info-soft);
+  color: var(--info-text);
+}
+
+.thread-maintenance__problem-rows {
+  max-height: 320px;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.thread-maintenance__problem-rows li {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 8px 14px 8px 44px;
+  border-top: 1px solid var(--danger-border);
+}
+
+.thread-maintenance__problem-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.thread-maintenance__open-thread {
+  flex: none;
+  /* Grouped rows sit close together; this keeps each target 24px tall. */
+  min-height: 24px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent-bright);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.thread-maintenance__open-thread:hover {
+  text-decoration: underline;
+}
+
+.thread-maintenance__open-thread:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.thread-maintenance__problem.is-kept .thread-maintenance__problem-rows li {
+  border-top-color: var(--info-border);
+}
+
+.thread-maintenance__problem-object {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.thread-maintenance__problem-why {
+  margin: 2px 0 0;
+  color: var(--text-secondary);
+  font-size: 11.5px;
+}
+
+.thread-maintenance__problem-why b {
+  color: var(--danger-text);
+  font-weight: 600;
+}
+
+.thread-maintenance__problem.is-kept .thread-maintenance__problem-why b {
+  color: var(--info-text);
+}
+
+.thread-maintenance__problem-rows li.thread-maintenance__problem-group {
+  display: block;
+  padding: 8px 14px 8px 44px;
+}
+
+.thread-maintenance__problem-group > .thread-maintenance__problem-why {
+  margin: 0 0 2px;
+}
+
+.thread-maintenance__problem-group > ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* Rows inside a reason group sit under its heading, without their own rule. */
+.thread-maintenance__problem-rows .thread-maintenance__problem-group li {
+  align-items: center;
+  padding: 1px 0;
+  border-top: 0;
+}
+
+.thread-maintenance__problem-group > .thread-maintenance__kept-toggle {
+  margin-top: 2px;
+  font-size: 11.5px;
+}
+
+.thread-maintenance__group-note {
+  margin: 0;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.thread-maintenance__group-note code {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+.thread-maintenance__group-select {
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.thread-maintenance__group-select > .thread-maintenance__kept-toggle {
+  min-height: 24px;
+  font-size: 12px;
+}
+
+.thread-maintenance__rows + .thread-maintenance__group-select {
+  border-top: 1px solid var(--border-subtle);
+  border-bottom: 0;
+}
+
+.thread-maintenance__group-aside {
+  margin-left: auto;
+}
+
+.thread-maintenance__elapsed {
+  color: var(--text-muted);
+}
+
+.thread-maintenance__coverage {
+  display: grid;
+  gap: 6px;
+  padding: 9px 14px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.thread-maintenance__coverage-rows {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  gap: 2px 14px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.thread-maintenance__coverage-rows li {
+  display: contents;
+}
+
+.thread-maintenance__coverage-rows .thread-maintenance__path {
+  margin: 0;
+  font-size: 11.5px;
+}
+
+.thread-maintenance__coverage-rows .thread-maintenance__mono {
+  text-align: right;
+}
+
+.thread-maintenance__coverage-owner {
+  color: var(--text-secondary);
+}
+
+.thread-maintenance__coverage > .thread-maintenance__kept-toggle {
+  justify-self: start;
+  min-height: 24px;
+  font-size: 11.5px;
+}
+
+/* Kept checkouts: one group per reason, its guidance once, then each
+   checkout with the threads that own it. Titles lead; paths are secondary. */
+.thread-maintenance__kept {
+  display: grid;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.thread-maintenance__kept-note,
+.thread-maintenance__kept-guidance {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.thread-maintenance__kept-group {
+  display: grid;
+  gap: 4px;
+}
+
+.thread-maintenance__kept-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0;
+}
+
+.thread-maintenance__kept-reason {
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.thread-maintenance__kept-rows {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.thread-maintenance__kept-rows > li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 14px;
+  padding: 6px 0;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.thread-maintenance__kept-main {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.thread-maintenance__kept-owner {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.thread-maintenance__kept-owner-text {
+  min-width: 0;
+}
+
+.thread-maintenance__kept-owner .thread-maintenance__row-title {
+  overflow-wrap: anywhere;
+}
+
+/* "Cargo output · 9 GB": describes an owned checkout; never a control. */
+.thread-maintenance__output-class {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 8px;
+  margin: 0;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+.thread-maintenance__kept-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0 8px;
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 11.5px;
+}
+
+.thread-maintenance__pr-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  color: var(--accent-bright);
+  text-decoration: none;
+}
+
+.thread-maintenance__pr-link:hover {
+  text-decoration: underline;
+}
+
+.thread-maintenance__pr-link:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.thread-maintenance__kept-shared {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  font-style: italic;
+}
+
+/* A path names a checkout the operator may need to find on disk, so it
+   wraps rather than losing its distinguishing tail. */
+.thread-maintenance__kept-rows .thread-maintenance__path {
+  margin: 0;
+  font-size: 11px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.thread-maintenance__kept-group > .thread-maintenance__kept-toggle {
+  justify-self: start;
+  min-height: 24px;
+  font-size: 11.5px;
+}
+
+/* A minimized session stays mounted; nothing of it may show or take input. */
+.thread-maintenance-modal[hidden] {
+  display: none;
+}
+
+.thread-maintenance__coverage-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  margin: 0;
+  color: var(--text-secondary);
+}
+
+.thread-maintenance__receipt {
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  list-style: none;
+}
+
+.thread-maintenance__receipt li {
+  display: grid;
+  grid-template-columns: 22px 1fr auto;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+}
+
+.thread-maintenance__receipt li + li {
+  border-top: 1px solid var(--border-subtle);
+}
+
+.thread-maintenance__error {
+  margin: 0;
+  color: var(--danger-text);
+  font-size: 12px;
 }

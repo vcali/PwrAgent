@@ -1,3 +1,6 @@
+import { mergeHoldingDependencies, useThreadDependencyList } from "../thread-dependencies/useThreadDependencyList";
+import { conditionName } from "../thread-dependencies/dependency-labels";
+import { getDesktopApi } from "../../lib/desktop-api";
 import { TodoDispatchFacts, useTodoDispatchTarget } from "./TodoDispatchFacts";
 import { TodoPullRequestChip } from "./TodoPullRequestChip";
 import { todoDispatchPickKey, useTodoDispatchContext, type TodoDispatchChoices } from "./TodoDispatchProvider";
@@ -24,6 +27,7 @@ import type {
 import {
   THREAD_TODO_MERGE_METHODS,
   resolveThreadTodoMergeMethod,
+  THREAD_TODO_MERGE_METHOD_LABELS,
   resolveThreadTodoModelSettings,
   threadTodoBlockingItems,
   threadTodoItemNoun,
@@ -66,11 +70,16 @@ import type {
   ThreadTodoRunOptions,
 } from "./thread-todos-view";
 import {
+  ReviewAutoFixLine,
   SettledFindingLabel,
-  fixReviewFindingsPrompt,
   orderReviewItems,
+  useReviewAutoFix,
   useTrackedReview,
 } from "./review-tracking";
+import {
+  autoFixReviewFindingsPrompt,
+  fixReviewFindingsPrompt,
+} from "../../../../shared/review-fix-prompts";
 import {
   copyTodoMarkdown,
   threadTodoMarkdown,
@@ -86,15 +95,6 @@ const KIND_ICONS: Record<ThreadTodoKind, ComponentType<IconProps> | undefined> =
   handoff: HandoffIcon,
 };
 
-/** The button says what it will do; the menu says it as GitHub does. */
-const MERGE_METHOD_LABELS: Record<
-  ThreadTodoMergeMethod,
-  { button: string; menu: string; verb: string }
-> = {
-  squash: { button: "Squash merge", menu: "Squash and merge", verb: "Squash merge" },
-  rebase: { button: "Rebase merge", menu: "Rebase and merge", verb: "Rebase and merge" },
-  merge: { button: "Merge", menu: "Create a merge commit", verb: "Merge" },
-};
 
 const COPIED_MS = 1_500;
 
@@ -219,12 +219,19 @@ function ReviewTodoFindingLabel(props: { item: ThreadReviewItem; ranked: boolean
 /**
  * A completed review still waiting on its findings, one row per finding.
  * A row carries no mark at rest, so nothing on it reads as a step's
- * checkbox; its chips appear on hover or focus. Fix sends every open
- * finding, or only the selected ones, to the agent in this thread.
+ * checkbox; its chips appear on hover or focus. Auto-fix sends every open
+ * finding to the agent in this thread, which decides what to fix; the menu's
+ * Fix all asks for every one. A selection sends only the selected findings.
  */
 function TrackedReviewCard(props: ThreadTodoCardProps) {
   const { todo } = props;
   const tracking = useTrackedReview(todo, { id: todo.reviewId });
+  const autoFix = useReviewAutoFix(todo);
+  const autoFixRun = todo.reviewId ? autoFix.status?.runs[todo.reviewId] : undefined;
+  // A fix sent from this card answers the failure it was showing. The owner
+  // drops the failure once a finding is settled; until then it stays hidden
+  // here. Matched by the failure's own time, so no clocks are compared.
+  const [answeredFailureAt, setAnsweredFailureAt] = useState<number>();
   const [expanded, setExpanded] = useState(false);
   // One hand-off per click: a second click before the send settles would
   // queue the same reply again.
@@ -245,7 +252,6 @@ function TrackedReviewCard(props: ThreadTodoCardProps) {
   const openItems = items.filter((item) => item.status === "open");
   // A selection that has since settled no longer counts.
   const selectedItems = openItems.filter((item) => selected.has(item.id));
-  const toSend = selectedItems.length > 0 ? selectedItems : openItems;
   const toggleSelected = (id: string) => setSelected((current) => {
     const next = new Set(current);
     if (!next.delete(id)) next.add(id);
@@ -259,19 +265,26 @@ function TrackedReviewCard(props: ThreadTodoCardProps) {
   const busy = tracking.busy || sending;
   const working = props.running || props.threadRunning === true;
   const fixDisabled = busy || working;
+  // Auto-fix lets this thread's agent decide each finding; Fix asks for all
+  // of them to be fixed.
   const fix = onDoHere
-    ? (findings: ThreadReviewItem[]) => {
+    ? (findings: ThreadReviewItem[], mode: "auto-fix" | "fix" = "fix") => {
         if (sendingRef.current || fixDisabled) return;
         sendingRef.current = true;
         setSending(true);
         setSendError(undefined);
         void (async () => {
           try {
-            const sent = await onDoHere(todo, { prompt: fixReviewFindingsPrompt(todo.title, findings) });
+            const prompt = mode === "auto-fix"
+              ? autoFixReviewFindingsPrompt(todo.title, findings)
+              : fixReviewFindingsPrompt(todo.title, findings);
+            const failureAt = autoFixRun?.phase === "failed" ? autoFixRun.at : undefined;
+            const sent = await onDoHere(todo, { prompt });
             if (sent === false) {
               setSendError("The thread did not accept the repair request. Try again.");
               return;
             }
+            if (failureAt !== undefined) setAnsweredFailureAt(failureAt);
             // Only what was sent leaves the selection; Fix now on one row
             // keeps the others the operator picked.
             setSelected((current) => {
@@ -315,21 +328,50 @@ function TrackedReviewCard(props: ThreadTodoCardProps) {
         </button>
       );
     }
-    return fix ? (
-      <button
-        type="button"
-        className="button button--primary thread-todo-card__button"
+    if (!fix) return null;
+    if (sending || working) {
+      return (
+        <button
+          type="button"
+          className="button button--primary thread-todo-card__button"
+          disabled
+          aria-busy
+        >
+          <PendingSpinner pairing="paired" size="sm" />
+          {sending ? "Sending…" : "Working…"}
+        </button>
+      );
+    }
+    // The label runs Auto-fix, unless the operator picked findings: a pick is
+    // an explicit choice to fix those. The menu holds the other sends.
+    const picked = selectedItems.length;
+    const fixAll: TodoSplitMenuEntry = {
+      kind: "item", id: "fix-all", label: `Fix all ${openItems.length}`,
+      disabled: fixDisabled, onSelect: () => fix(openItems),
+    };
+    const entries: TodoSplitMenuEntry[] = picked > 0
+      ? [
+          { kind: "item", id: "fix-selected", label: `Fix ${picked} selected`, checked: true,
+            disabled: fixDisabled, onSelect: () => fix(selectedItems) },
+          { kind: "item", id: "auto-fix-selected", label: `Auto-fix ${picked} selected`,
+            disabled: fixDisabled, onSelect: () => fix(selectedItems, "auto-fix") },
+          fixAll,
+        ]
+      : [
+          { kind: "item", id: "auto-fix", label: "Auto-fix", checked: true,
+            disabled: fixDisabled, onSelect: () => fix(openItems, "auto-fix") },
+          fixAll,
+        ];
+    return (
+      <TodoSplitButton
+        label={picked > 0 ? `Fix ${picked} selected` : "Auto-fix"}
+        Icon={ArrowUpIcon}
         disabled={fixDisabled}
-        aria-busy={sending || working}
-        onClick={() => fix(toSend)}
-      >
-        {sending || working
-          ? <PendingSpinner pairing="paired" size="sm" />
-          : <ArrowUpIcon size={12} />}
-        {sending ? "Sending…" : working ? "Working…"
-          : selectedItems.length > 0 ? `Fix ${selectedItems.length} selected` : "Fix all"}
-      </button>
-    ) : null;
+        menuLabel="Review fix options"
+        entries={entries}
+        onClick={() => (picked > 0 ? fix(selectedItems) : fix(openItems, "auto-fix"))}
+      />
+    );
   };
 
   return (
@@ -351,6 +393,12 @@ function TrackedReviewCard(props: ThreadTodoCardProps) {
       />
       <ThreadTodoCardMeta todo={todo} now={props.now} progress={progress} />
       <div className="thread-todo-card__body">
+        {review ? (
+          <ReviewAutoFixLine
+            run={autoFixRun?.phase === "failed" && autoFixRun.at === answeredFailureAt ? undefined : autoFixRun}
+            openCount={review.status === "open" ? openItems.length : 0}
+          />
+        ) : null}
         {review && items.length === 0 ? (
           <p className="review-todo__summary">
             <span className="review-todo__count">No findings to settle</span>
@@ -627,6 +675,16 @@ function ActionThreadTodoCard(props: ThreadTodoCardProps) {
     && (!messageTarget.instanceId || messageTarget.instanceId === todo.federationTarget?.instanceId);
   const canSendMessage = !todo.federationTarget
     || props.instances?.some((instance) => instance.instanceId === todo.federationTarget?.instanceId && instance.messageTarget);
+  // Continue After waits that hold this merge, from the owner's own merge
+  // check: this thread's, and those on other threads with the PR attached.
+  // Main refuses the merge either way; the card says why before it is tried.
+  const mergeHolds = useThreadDependencyList(
+    todo.backend, todo.threadId, todo.federationTarget, getDesktopApi(),
+    action?.type === "merge_pull_request" && todo.status === "open",
+    action?.type === "merge_pull_request" ? action.pullRequest : undefined,
+  );
+  const blockingMergeHolds = mergeHoldingDependencies(mergeHolds.data);
+  const mergeHeld = blockingMergeHolds.length > 0;
   const titleId = `thread-todo-title-${todo.id}`;
   const prompt = action?.type === "start_thread" || action?.type === "send_message" ? action.prompt : undefined;
   const hasFacts = action?.type === "merge_pull_request";
@@ -789,6 +847,10 @@ function ActionThreadTodoCard(props: ThreadTodoCardProps) {
           </>
         );
       case "merge_pull_request": {
+        // An owner that cannot answer still refuses a held merge itself.
+        if (mergeHeld || (!mergeHolds.ready && !mergeHolds.error)) return <span role="status" className="thread-todo-card__hint">{mergeHeld
+          ? `Merge waits for ${blockingMergeHolds.flatMap((dependency) => dependency.conditions.map(conditionName)).join("; ")}`
+          : "Checking what merging waits for…"}</span>;
         if (confirmingMerge) {
           return (
             <>
@@ -815,7 +877,7 @@ function ActionThreadTodoCard(props: ThreadTodoCardProps) {
                 }}
               >
                 <MergeIcon size={12} />
-                {MERGE_METHOD_LABELS[confirmingMerge.method].verb}
+                {THREAD_TODO_MERGE_METHOD_LABELS[confirmingMerge.method].verb}
               </button>
             </>
           );
@@ -825,14 +887,14 @@ function ActionThreadTodoCard(props: ThreadTodoCardProps) {
           <>
             {done}
             <TodoSplitButton
-              label={todo.error ? "Retry merge" : MERGE_METHOD_LABELS[method].button}
+              label={todo.error ? "Retry merge" : THREAD_TODO_MERGE_METHOD_LABELS[method].button}
               Icon={MergeIcon}
               menuLabel="Merge options"
               onClick={() => setConfirmingMerge({ method, remember: false })}
               entries={THREAD_TODO_MERGE_METHODS.map((option) => ({
                 kind: "item",
                 id: option,
-                label: MERGE_METHOD_LABELS[option].menu,
+                label: THREAD_TODO_MERGE_METHOD_LABELS[option].menu,
                 checked: option === method,
                 onSelect: () => setConfirmingMerge({ method: option, remember: true }),
               }))}
@@ -1059,8 +1121,10 @@ function ActionThreadTodoCard(props: ThreadTodoCardProps) {
               </button>
             </div>
           ) : null}
-          {todo.error ? (
-            <p className="thread-todo-card__error" role="alert">{todo.error}</p>
+          {todo.error && !(mergeHeld && todo.error.startsWith("Merge held:")) ? (
+            <p className="thread-todo-card__error" role="alert">{todo.error.startsWith("Merge held:")
+              ? "The previous merge attempt was held. You can retry once the wait is marked done."
+              : todo.error}</p>
           ) : null}
         </div>
       ) : null}
@@ -1381,7 +1445,7 @@ function confirmMergeText(
 ): string {
   const target = /^\d+$/.test(pullRequest) ? `#${pullRequest}` : "this pull request";
   const where = projectLabel ? ` in ${projectLabel}` : "";
-  return `${MERGE_METHOD_LABELS[method].verb} ${target}${where}? This cannot be undone here.`;
+  return `${THREAD_TODO_MERGE_METHOD_LABELS[method].verb} ${target}${where}? This cannot be undone here.`;
 }
 
 export function formatTodoAge(createdAt: number, now = Date.now()): string {

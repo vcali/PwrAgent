@@ -1,7 +1,12 @@
+import { formatArchiveCleanupNotice, formatArchiveCleanupProgress, type ArchiveThreadNotice } from "./archive-cleanup-notice";
+import { BackgroundArchiveCleanupReport, BACKGROUND_CLEANUP_REPORT_INTERVAL_MS } from "./background-archive-cleanup-report";
+import type { AppNoticeToastNotice } from "../features/notifications/AppNoticeToast";
+export type { ArchiveThreadNotice } from "./archive-cleanup-notice";
 import type { NavigationDiagnosticCause } from "../../../shared/navigation-diagnostic-cause";
 import type { LaunchpadCreationStatus } from "@pwragent/shared";
 import { materializeObservableLaunchpad, LaunchpadStartupCancelledError } from "./launchpad-creation-client";
 import { readNavigationQueryRange } from "./read-navigation-query-range";
+import { applyCheckoutHibernationUpdate } from "./navigation-thread-event";
 import { readBridgedNavigationResumeState } from "./navigation-resume-state";
 import { findPeerCounterpartDirectory, type ProjectIdentity } from "./federation-project-match";
 import { FederatedDirectoryIndexCache } from "./federated-directory-index-cache";
@@ -30,6 +35,7 @@ import type {
   AppServerThreadStatus,
   AppServerTurnInputItem,
   ArchiveThreadCleanupResult,
+  ArchiveCleanupProgress,
   CodexThreadEnvironmentRuntime,
   DesktopProviderModelDefaults,
   FederationInstanceId,
@@ -59,6 +65,7 @@ import type {
   ThreadAgentMetadata,
   ThreadExecutionMode,
   ThreadLock,
+  SetThreadCheckoutHibernationResponse,
   ThreadSubAgentSummary,
 } from "@pwragent/shared";
 import {
@@ -124,13 +131,6 @@ import {
 
 export type BrowseMode = NavigationBrowseMode;
 export type { ThreadWorkspaceMode } from "./subthread-launchpads";
-
-export type ArchiveThreadNotice = {
-  id: string;
-  title: string;
-  message: string;
-  detail?: string;
-};
 
 export type ArchiveThreadOptions = {
   includeSubthreads?: boolean;
@@ -674,33 +674,6 @@ function resolveCreateThreadTargetDirectory(args: {
     directoryLabel: workspaceDirectory?.label ?? ROOT_NEW_THREAD_WORKSPACE_LABEL,
     directoryPath: workspaceDirectory?.path,
     gitStatus: workspaceDirectory?.gitStatus,
-  };
-}
-
-function formatArchiveCleanupNotice(
-  cleanup: ArchiveThreadCleanupResult[]
-): ArchiveThreadNotice | undefined {
-  const failures = cleanup.filter(
-    (item) => (item.error || !item.skippedReason?.startsWith("Worktree is still used by"))
-      && (!item.removedWorktree || item.error || item.skippedReason)
-  );
-  const firstFailure = failures[0];
-  if (!firstFailure) {
-    return undefined;
-  }
-
-  const reason = firstFailure.error ?? firstFailure.skippedReason ?? "cleanup was skipped";
-  const title = "Worktree cleanup skipped";
-  const message = "Thread archived. The worktree cleanup did not complete.";
-  const detail = firstFailure.worktreePath
-    ? `${firstFailure.worktreePath}: ${reason}`
-    : reason;
-
-  return {
-    id: [firstFailure.worktreePath ?? "no-worktree", reason, Date.now().toString()].join("\n"),
-    title,
-    message,
-    detail,
   };
 }
 
@@ -1258,6 +1231,38 @@ function updateThreadLockInLoadedRows(
     return params.lock ? { ...rest, lock: params.lock } : rest;
   });
 
+  return changed ? { ...snapshot, threadRows: indexLoadedThreadRows(threads) } : snapshot;
+}
+
+function updateThreadCheckoutHibernationInLoadedRows(
+  snapshot: NavigationLoadedRows | undefined,
+  update: {
+    backend: AppServerBackendKind;
+    federationTarget?: FederationTarget;
+    params: Parameters<typeof applyCheckoutHibernationUpdate>[1];
+  },
+): NavigationLoadedRows | undefined {
+  if (!snapshot) {
+    return snapshot;
+  }
+  const threadKey = buildThreadIdentityKey(update.backend, update.params.threadId);
+  let changed = false;
+  const threads = loadedThreadRows(snapshot).map((thread) => {
+    if (
+      buildThreadIdentityKey(thread.source, thread.id) !== threadKey
+      || !federationTargetsEqual(thread.federation?.ref.target, update.federationTarget)
+    ) {
+      return thread;
+    }
+    const next = applyCheckoutHibernationUpdate(thread, update.params);
+    if (next.checkoutHibernated === thread.checkoutHibernated && next.keepCheckoutAwake === thread.keepCheckoutAwake) {
+      return thread;
+    }
+    changed = true;
+    // Rows carry only the marks; the card's checkout is selected detail.
+    const { workspaceHibernated: _detail, ...row } = next;
+    return { ...row, ...(thread.workspaceHibernated ? { workspaceHibernated: thread.workspaceHibernated } : {}) };
+  });
   return changed ? { ...snapshot, threadRows: indexLoadedThreadRows(threads) } : snapshot;
 }
 
@@ -2969,8 +2974,15 @@ function buildLaunchpadRelativeThreadKey(
     : buildThreadIdentityKey(backend, threadId);
 }
 
+function scheduleNavigationRefreshTask(callback: () => void): () => void {
+  const timer = setTimeout(callback, 0);
+  return () => clearTimeout(timer);
+}
+
 type UseThreadNavigationOptions = {
   enabled?: boolean;
+  /** Event-triggered reads use a timer task by default; tests inject a task queue. */
+  scheduleNavigationRefresh?: (callback: () => void) => () => void;
   providerModelDefaults?: Record<string, DesktopProviderModelDefaults>;
   /**
    * This machine's federation instance id. A sub-thread started on a peer
@@ -3055,6 +3067,10 @@ export function useThreadNavigation(
   archivedThreadKeys: ReadonlySet<string>;
   archiveThreadNotice?: ArchiveThreadNotice;
   dismissArchiveThreadNotice: () => void;
+  archiveCleanupProgressNotice?: AppNoticeToastNotice;
+  archiveCleanupSummaryNotice?: AppNoticeToastNotice;
+  dismissArchiveCleanupSummaryNotice: () => void;
+  dismissArchiveCleanupProgressNotice: () => void;
   worktreeArchiveError?: string;
   loading: boolean;
   loaded: boolean;
@@ -3250,6 +3266,10 @@ export function useThreadNavigation(
     thread: NavigationThreadSummary,
     options?: ArchiveThreadOptions,
   ) => Promise<ArchivedThreadRef[]>;
+  archiveThreads: (
+    threads: NavigationThreadSummary[],
+    options?: ArchiveThreadOptions,
+  ) => Promise<ArchivedThreadRef[]>;
   restoreArchivedThreads: (
     threads: readonly ArchivedThreadRef[],
     reopenKey?: string,
@@ -3292,6 +3312,16 @@ export function useThreadNavigation(
     locked: boolean,
     note?: string,
   ) => Promise<void>;
+  /**
+   * Restore a hibernated checkout now, or set Keep it awake (which also
+   * restores). Runs on the thread's owner. Resolves the owner's answer; a
+   * refused restore resolves with `restoreError`, and the missing-worktree
+   * card takes over from the next detail read.
+   */
+  setThreadCheckoutHibernation?: (
+    thread: NavigationThreadSummary,
+    change: { restore?: boolean; keepAwake?: boolean },
+  ) => Promise<SetThreadCheckoutHibernationResponse>;
   setThreadPin: (
     thread: NavigationThreadSummary,
     pinned: boolean,
@@ -3511,6 +3541,12 @@ export function useThreadNavigation(
   }), [desktopApi]);
   const [archiveThreadError, setArchiveThreadError] = useState<string>();
   const [archiveThreadNotice, setArchiveThreadNotice] = useState<ArchiveThreadNotice>();
+  const [archiveCleanupProgressNotice, setArchiveCleanupProgressNotice] = useState<AppNoticeToastNotice>();
+  const [archiveCleanupSummaryNotice, setArchiveCleanupSummaryNotice] = useState<AppNoticeToastNotice>();
+  const [backgroundCleanupReport] = useState(() => new BackgroundArchiveCleanupReport());
+  const backgroundCleanupReportTimer = useRef<number | undefined>(undefined);
+  useEffect(() => () => { window.clearTimeout(backgroundCleanupReportTimer.current); }, []);
+  const dismissedArchiveCleanupBatch = useRef<string | undefined>(undefined);
   const [worktreeArchiveError, setWorktreeArchiveError] = useState<string>();
   const [renameThreadError, setRenameThreadError] = useState<string>();
   // Held in a ref so a caller that rebuilds the callback every render cannot
@@ -3643,6 +3679,8 @@ export function useThreadNavigation(
   const manuallySelectedThreadKeysRef = useRecoverableRef("navigation.manualSelections", () => new Set<string>());
   const submittedSeenUpdatedAtByThreadKeyRef = useRecoverableRef("navigation.submittedSeenUpdates", () => new Map<string, number | undefined>());
   const refreshInFlightRef = useRef(false);
+  const archiveRefreshBatchesRef = useRef(0);
+  const archiveEventRefreshOwnersRef = useRef(new Map<string, FederationTarget>());
   const mountedRef = useRef(true);
   const actionAbortControllerRef = useRef(new AbortController());
   const queuedRefreshRef = useRef<
@@ -3679,9 +3717,8 @@ export function useThreadNavigation(
     else next.delete(key);
     removedDirectoryKeysRef.current = next;
   }, []);
-  const scheduledRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(
-    undefined
-  );
+  const scheduledRefreshTaskRef = useRef<(() => void) | undefined>(undefined);
+  const scheduleNavigationRefresh = options.scheduleNavigationRefresh ?? scheduleNavigationRefreshTask;
   const remotePeerDisconnectedRef = useRef(false);
   const lastNavigationActivityAtRef = useRef(Date.now());
   const backgroundRefreshIdleRef = useRef(false);
@@ -3828,6 +3865,9 @@ export function useThreadNavigation(
   // Each resource's read when a command or event last patched a directory
   // row. A page from a read that began no later predates that patch.
   const directoryPatchReadsRef = useRef(new Map<string, ReadonlyMap<string, { request: unknown; sequence: number }>>());
+  // A read started after an optimistic patch can still precede the owner's
+  // write. Keep that field until every in-flight pin command has answered.
+  const pendingDirectoryPinsRef = useRef(new Map<string, number>());
   const navigationResourcesRef = useRef(boundedNavigation.resources);
   navigationResourcesRef.current = boundedNavigation.resources;
   const deferNestedArchiveRemoval = useCallback((thread: NavigationThreadSummary): boolean => {
@@ -3896,6 +3936,7 @@ export function useThreadNavigation(
           })
           .map((directory) => directory.key);
       }));
+      const pendingDirectoryPins = new Set(pendingDirectoryPinsRef.current.keys());
       const retainedKeys = new Set([...pages.values()].flatMap((page) => page.entries.map(({ row }) => threadSummaryIdentityKey(row))));
       // Acceptance must publish even when reconciliation retains every row
       // and the loading flags are unchanged after a batched refresh.
@@ -3980,10 +4021,13 @@ export function useThreadNavigation(
         if (previousOwner === currentOwner) {
           for (const [key, directory] of nextDirectoryRows) {
             const previous = current.rows?.directoryRows.get(key);
-            if (!previous || changedDirectoryKeys.has(key)) continue;
-            nextDirectoryRows.set(key, { ...directory, pinnedRank: previous.pinnedRank,
-              directoryThreadsCollapsed: previous.directoryThreadsCollapsed,
-              forgeAutomation: previous.forgeAutomation });
+            if (!previous) continue;
+            const retainFields = !changedDirectoryKeys.has(key);
+            if (!retainFields && !pendingDirectoryPins.has(key)) continue;
+            nextDirectoryRows.set(key, { ...directory,
+              pinnedRank: previous.pinnedRank,
+              ...(retainFields ? { directoryThreadsCollapsed: previous.directoryThreadsCollapsed,
+                forgeAutomation: previous.forgeAutomation } : {}) });
           }
         }
         const next: NavigationLoadedRows = { threadRows, directoryRows: nextDirectoryRows,
@@ -4106,12 +4150,12 @@ export function useThreadNavigation(
         preferredSelectionKey,
       };
 
-      if (scheduledRefreshTimerRef.current !== undefined) {
+      if (scheduledRefreshTaskRef.current !== undefined) {
         return;
       }
 
-      scheduledRefreshTimerRef.current = setTimeout(() => {
-        scheduledRefreshTimerRef.current = undefined;
+      scheduledRefreshTaskRef.current = scheduleNavigationRefresh(() => {
+        scheduledRefreshTaskRef.current = undefined;
         const nextRequest = queuedRefreshRef.current;
         queuedRefreshRef.current = undefined;
         if (!nextRequest) {
@@ -4129,9 +4173,9 @@ export function useThreadNavigation(
             invalidatedOnly: nextRequest.invalidatedOnly,
           }
         );
-      }, 0);
+      });
     },
-    [refresh]
+    [refresh, scheduleNavigationRefresh]
   );
 
   const markNavigationActivity = useCallback(
@@ -4165,8 +4209,8 @@ export function useThreadNavigation(
 
   useEffect(() => {
     return () => {
-      if (scheduledRefreshTimerRef.current !== undefined) {
-        clearTimeout(scheduledRefreshTimerRef.current);
+      if (scheduledRefreshTaskRef.current !== undefined) {
+        scheduledRefreshTaskRef.current();
       }
     };
   }, []);
@@ -4272,9 +4316,18 @@ export function useThreadNavigation(
       const method = event.notification.method as string;
       const owners: FederationTarget[] = [event.federationTarget ?? { scope: "local" }];
       if (event.federationTarget?.scope === "remote" && windowTarget?.scope !== "remote") owners.push({ scope: "local" });
-      const scheduleEventRefresh: typeof scheduleRefresh = (selection, optimistic, forceSelection, options) =>
+      const scheduleEventRefresh: typeof scheduleRefresh = (selection, optimistic, forceSelection, options) => {
+        if (archiveRefreshBatchesRef.current > 0
+          && (method === "thread/archived" || method === "navigation/remoteThreadPins/changed")) {
+          // Archive replies and their notifications are one sidebar action.
+          // Keep invalidation and row patches immediate; read these owners
+          // with the action's final refresh, including any concurrent archive.
+          for (const owner of owners) archiveEventRefreshOwnersRef.current.set(JSON.stringify(owner), owner);
+          return;
+        }
         scheduleRefresh(selection, optimistic, forceSelection, { ...options, owners,
           invalidatedOnly: navigationQueryEventRequiresRefresh(method, event.notification.params) });
+      };
       if (federationTargetsEqual(event.federationTarget, windowTarget) && navigationQueryEventRequiresRefresh(method, event.notification.params)) {
         invalidateNavigation(owners, event);
         // These notifications contain the complete replacement for every
@@ -4329,6 +4382,7 @@ export function useThreadNavigation(
           || method === "thread/pullRequests/updated"
           || method === "thread/reactions/updated"
           || method === "thread/lock/updated"
+          || method === "thread/checkoutHibernation/updated"
           || method === "thread/prAutoDispatch/pendingUpdated"
           || method === "thread/prAutoDispatch/updated"
           || method === "thread/status/changed"
@@ -4519,6 +4573,19 @@ export function useThreadNavigation(
         return;
       }
 
+      if (method === "thread/checkoutHibernation/updated") {
+        const params = event.notification.params as Parameters<typeof applyCheckoutHibernationUpdate>[1];
+        setState((current) => ({
+          ...current,
+          rows: updateThreadCheckoutHibernationInLoadedRows(current.rows, {
+            backend: event.backend,
+            federationTarget: event.federationTarget,
+            params,
+          }),
+        }));
+        return;
+      }
+
       if (method === "thread/reactions/updated") {
         const { threadId, reactions } = event.notification.params as {
           threadId: string;
@@ -4671,17 +4738,33 @@ export function useThreadNavigation(
         return;
       }
 
+      if (method === "archiveCleanup/progress") {
+        const progress = event.notification.params as ArchiveCleanupProgress;
+        if (dismissedArchiveCleanupBatch.current !== progress.batchId) setArchiveCleanupProgressNotice(formatArchiveCleanupProgress(progress));
+        return;
+      }
+
       if (method === "thread/archiveCleanup/completed") {
         const completion = event.notification.params as {
-          threadId: string; archivedAt: number; cleanup: ArchiveThreadCleanupResult[]; error?: string;
+          threadId: string; archivedAt: number; cleanup: ArchiveThreadCleanupResult[]; error?: string; reporting?: "background";
         };
-        if (completion.error) setArchiveThreadError(completion.error);
-        const notice = formatArchiveCleanupNotice(completion.cleanup);
+        const background = completion.reporting === "background";
+        if (background && backgroundCleanupReport.record(event.backend, completion) && backgroundCleanupReportTimer.current === undefined) {
+          // A fixed window cannot be postponed indefinitely by a busy queue.
+          // Stable identity also keeps the report out of transient toast history.
+          backgroundCleanupReportTimer.current = window.setTimeout(() => {
+            backgroundCleanupReportTimer.current = undefined;
+            setArchiveCleanupSummaryNotice(backgroundCleanupReport.notice());
+          }, BACKGROUND_CLEANUP_REPORT_INTERVAL_MS);
+        }
+        if (!background && completion.error) setArchiveThreadError(completion.error);
+        const notice = background ? undefined : formatArchiveCleanupNotice(completion.cleanup);
         if (notice) setArchiveThreadNotice(notice);
         const receivedAt = Date.now();
         void desktopApi.logRendererDiagnostic?.({
           level: "info", message: "archive cleanup completion received",
           details: { backend: event.backend, threadId: completion.threadId, archivedAt: completion.archivedAt,
+            reporting: background ? "background-summary" : "archive-action",
             receivedAt, archiveAgeMs: receivedAt - completion.archivedAt, noticeRaised: Boolean(notice), failed: Boolean(completion.error) },
         }).catch(() => {});
         return;
@@ -5259,6 +5342,7 @@ export function useThreadNavigation(
     updateArchivedThreadKey,
     noteDirectoryPatch,
     setSelectedItemKey,
+    backgroundCleanupReport,
   ]);
 
   // Binding chips are projected in row pages but can be mutated outside
@@ -8640,6 +8724,7 @@ export function useThreadNavigation(
     async (
       thread: NavigationThreadSummary,
       options?: ArchiveThreadOptions,
+      refreshAfterArchive = refresh,
     ): Promise<ArchivedThreadRef[]> => {
       if (!archiveThreadRequest) {
         setArchiveThreadError("Desktop bridge is missing archiveThread().");
@@ -8764,7 +8849,7 @@ export function useThreadNavigation(
             });
           }
         }
-        await refresh(undefined, undefined, false, refreshOptions);
+        await refreshAfterArchive(undefined, undefined, false, refreshOptions);
       } catch (error) {
         for (const targetKey of targetThreadKeys) {
           if (!archivedKeys.has(targetKey)) {
@@ -8774,7 +8859,7 @@ export function useThreadNavigation(
           }
         }
         setArchiveThreadError(error instanceof Error ? error.message : String(error));
-        await refresh(archivedKeys.has(threadKey) ? undefined : threadKey, undefined, !archivedKeys.has(threadKey), refreshOptions);
+        await refreshAfterArchive(archivedKeys.has(threadKey) ? undefined : threadKey, undefined, !archivedKeys.has(threadKey), refreshOptions);
       }
       return archived;
     },
@@ -8790,6 +8875,45 @@ export function useThreadNavigation(
       setSelectedItemKey,
     ]
   );
+
+  const archiveThreads = useCallback(async (
+    threads: NavigationThreadSummary[],
+    options?: ArchiveThreadOptions,
+  ): Promise<ArchivedThreadRef[]> => {
+    let refreshOptions: NavigationRefreshOptions | undefined;
+    // Each archive still owns its optimistic removal, rollback and viewer
+    // pin cleanup. Only its final read waits for the whole sidebar action.
+    const collectRefresh: typeof refresh = async (selectionKey, _thread, forceSelection, requestOptions) => {
+      // Roll back selection when the failure arrives, so a later user
+      // selection survives batch completion. Only the reads are deferred.
+      if (selectionKey) setSelectedItemKey((current) => forceSelection || !current ? selectionKey : current);
+      refreshOptions = refreshOptions
+        ? { owners: mergeNavigationRefreshOwners(refreshOptions.owners, requestOptions?.owners) }
+        : requestOptions;
+    };
+    archiveRefreshBatchesRef.current++;
+    let results: ArchivedThreadRef[][];
+    try {
+      results = await Promise.all(threads.map((thread) => archiveThread(thread, options, collectRefresh)));
+    } finally {
+      archiveRefreshBatchesRef.current--;
+      const eventOwners = [...archiveEventRefreshOwnersRef.current.values()];
+      archiveEventRefreshOwnersRef.current.clear();
+      if (eventOwners.length > 0) {
+        refreshOptions = { owners: refreshOptions
+          ? mergeNavigationRefreshOwners(refreshOptions.owners, eventOwners) : eventOwners };
+      }
+      if (refreshOptions) {
+        try {
+          await refresh(undefined, undefined, false, refreshOptions);
+        } catch (error) {
+          setArchiveThreadError(error instanceof Error ? error.message : String(error));
+          await refresh(undefined, undefined, false, refreshOptions);
+        }
+      }
+    }
+    return results.flat();
+  }, [archiveThread, refresh, setSelectedItemKey]);
 
   /**
    * Undo an archive: restore each thread this window owns (its worktrees come
@@ -9065,6 +9189,7 @@ export function useThreadNavigation(
 
   const setThreadReactionRequest = desktopApi?.setThreadReaction;
   const setThreadLockRequest = desktopApi?.setThreadLock;
+  const setThreadCheckoutHibernationRequest = desktopApi?.setThreadCheckoutHibernation;
   const setThreadPinRequest = desktopApi?.setThreadPin;
   const setRemoteThreadLocalPinRequest = desktopApi?.setRemoteThreadLocalPin;
   const setThreadAgentRequest = desktopApi?.setThreadAgent;
@@ -9163,6 +9288,36 @@ export function useThreadNavigation(
       }));
     },
     [setThreadLockRequest],
+  );
+
+  const setThreadCheckoutHibernation = useCallback(
+    async (
+      thread: NavigationThreadSummary,
+      change: { restore?: boolean; keepAwake?: boolean },
+    ): Promise<SetThreadCheckoutHibernationResponse> => {
+      if (!setThreadCheckoutHibernationRequest) {
+        throw new Error("Hibernated checkouts cannot be changed in this window.");
+      }
+      const federationTarget = thread.federation?.ref.target
+        ?? readRendererFederationTarget();
+      const result = await setThreadCheckoutHibernationRequest({
+        backend: thread.source,
+        federationTarget,
+        threadId: thread.id,
+        ...change,
+      });
+      // The owner's notification may arrive first; the answer settles the row.
+      setState((current) => ({
+        ...current,
+        rows: updateThreadCheckoutHibernationInLoadedRows(current.rows, {
+          backend: thread.source,
+          federationTarget,
+          params: { threadId: thread.id, keepAwake: result.keepAwake },
+        }),
+      }));
+      return result;
+    },
+    [setThreadCheckoutHibernationRequest],
   );
 
   const setThreadPin = useCallback(
@@ -9532,6 +9687,7 @@ export function useThreadNavigation(
 
       const pinnedRank = pinned ? directory.pinnedRank : undefined;
 
+      pendingDirectoryPinsRef.current.set(directory.key, (pendingDirectoryPinsRef.current.get(directory.key) ?? 0) + 1);
       noteDirectoryPatch([directory.key]);
       setState((current) => ({
         ...current,
@@ -9545,6 +9701,7 @@ export function useThreadNavigation(
         const result = await setDirectoryPinRequest({
           directoryKey: directory.key,
           pinned,
+          federationTarget: readRendererFederationTarget(),
         });
         noteDirectoryPatch([result.directoryKey]);
         setState((current) => ({
@@ -9556,8 +9713,15 @@ export function useThreadNavigation(
         }));
       } catch (error) {
         publishThreadActionError("update-pin", error);
+        const pending = pendingDirectoryPinsRef.current.get(directory.key) ?? 1;
+        if (pending === 1) pendingDirectoryPinsRef.current.delete(directory.key);
+        else pendingDirectoryPinsRef.current.set(directory.key, pending - 1);
         await refresh();
+        return;
       }
+      const pending = pendingDirectoryPinsRef.current.get(directory.key) ?? 1;
+      if (pending === 1) pendingDirectoryPinsRef.current.delete(directory.key);
+      else pendingDirectoryPinsRef.current.set(directory.key, pending - 1);
     },
     [refresh, publishThreadActionError, setDirectoryPinRequest, noteDirectoryPatch],
   );
@@ -9575,7 +9739,7 @@ export function useThreadNavigation(
       }
 
       try {
-        const result = await reorderDirectoryPinsRequest({ move });
+        const result = await reorderDirectoryPinsRequest({ move, federationTarget: readRendererFederationTarget() });
         invalidateNavigation();
         noteDirectoryPatch(Object.keys(result.pinnedRanks));
         setState((current) => ({
@@ -10035,6 +10199,18 @@ export function useThreadNavigation(
     setArchiveThreadNotice(undefined);
   }, []);
 
+  const dismissArchiveCleanupProgressNotice = useCallback((): void => {
+    if (archiveCleanupProgressNotice) dismissedArchiveCleanupBatch.current = archiveCleanupProgressNotice.id.slice("archive-cleanup:".length);
+    setArchiveCleanupProgressNotice(undefined);
+  }, [archiveCleanupProgressNotice]);
+
+  const dismissArchiveCleanupSummaryNotice = useCallback((): void => {
+    backgroundCleanupReport.dismiss();
+    window.clearTimeout(backgroundCleanupReportTimer.current);
+    backgroundCleanupReportTimer.current = undefined;
+    setArchiveCleanupSummaryNotice(undefined);
+  }, [backgroundCleanupReport]);
+
   return {
     browseMode: shownBrowseMode,
     pinnedThreadsOnTop,
@@ -10063,6 +10239,10 @@ export function useThreadNavigation(
     archivedThreadKeys,
     archiveThreadNotice,
     dismissArchiveThreadNotice,
+    archiveCleanupProgressNotice,
+    archiveCleanupSummaryNotice,
+    dismissArchiveCleanupSummaryNotice,
+    dismissArchiveCleanupProgressNotice,
     worktreeArchiveError,
     loading: state.loading,
     loaded: Boolean(state.rows),
@@ -10126,6 +10306,7 @@ export function useThreadNavigation(
     markThreadUnread,
     showThread,
     archiveThread,
+    archiveThreads,
     restoreArchivedThreads,
     archiveWorktree,
     restoreWorktree,
@@ -10135,6 +10316,7 @@ export function useThreadNavigation(
     renameThread,
     setThreadReaction,
     setThreadLock,
+    ...(setThreadCheckoutHibernationRequest ? { setThreadCheckoutHibernation } : {}),
     setThreadPin,
     setThreadAgent,
     reorderThreadPins,

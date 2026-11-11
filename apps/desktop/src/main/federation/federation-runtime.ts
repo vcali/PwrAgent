@@ -1,3 +1,5 @@
+import { invalidatePeerActiveDependencies, readFederationThreadDependenciesRequest } from "../app-server/thread-dependencies-federation";
+import { pushResumableBlob, type ResumableBlobTransport } from "@pwragent/federation/federation-blob-sender";
 import { detachOwnedThreadDirectory } from "../app-server/thread-directory-detach";
 import type { ThreadTodoFeedDelta, ThreadTodosChangedEvent } from "@pwragent/shared";
 import { FEDERATION_OPERATOR_QUESTION_CAPABILITIES, FEDERATION_OPERATOR_QUESTION_METHODS,
@@ -24,7 +26,7 @@ import type { ReadUsageActivityRequest, ReadUsageActivityResponse, AnalyzeUsageA
 import { FederationFilePullReader, FILE_PULL_MARKDOWN_METHOD, FILE_RESOLVE_TRANSCRIPT_METHOD, resolveFilePullThread } from "./federation-file-pull";
 import type { HandoffInstanceThreadRequest, HandoffInstanceThreadResult } from "@pwragent/shared";
 import { resolveActiveProfileDir } from "../profile";
-import { ThreadInstanceHandoffService, THREAD_HANDOFF_METHODS, type ImportInstanceThreadRequest } from "./thread-instance-handoff-service";
+import { ThreadInstanceHandoffService, THREAD_HANDOFF_METHODS, type ImportInstanceThreadRequest, type ThreadHandoffSendOptions } from "./thread-instance-handoff-service";
 import { app } from "electron";
 import { FEDERATION_MESSAGING_DESTINATION_METHOD, handleFederationMessagingDestination,
   type FederationMessagingDestinationOperation, type FederationMessagingDestinationResult } from "./federation-messaging-tools";
@@ -32,6 +34,7 @@ import {
   FederationFilePushReceiver,
   FederationFilePushReceipts,
   FILE_PUSH_MAX_BYTES,
+  FILE_PUSH_METHODS,
   type FilePushResult,
   FILE_PUSH_METHOD_CAPABILITIES,
   registerFilePushHandlers,
@@ -57,6 +60,7 @@ import { markLocalNavigationDirectorySeen, removeLocalNavigationDirectory } from
 import { loadViewerNavigationPins } from "../app-server/navigation-viewer-pins";
 import {
   isPeerChildOfLocalThread,
+  peerSubthreadChildren,
   type PeerChildSource,
   updateLocalSubthreadOrder,
 } from "../app-server/subthread-order-actions";
@@ -243,6 +247,8 @@ import {
   type AcknowledgeThreadEnvironmentFailureResponse,
   type SetThreadReactionRequest,
   type SetThreadLockRequest,
+  type SetThreadCheckoutHibernationRequest,
+  type SetThreadCheckoutHibernationResponse,
   type SetThreadLockResponse,
   type SetThreadReactionResponse,
   type SetThreadPrAutoDispatchRequest,
@@ -305,8 +311,9 @@ import {
 } from "@pwragent/shared";
 import { getDesktopBackendRegistry } from "../app-server/backend-registry";
 import { markLocalThreadSeen } from "../app-server/mark-local-thread-seen";
+import { setLocalDirectoryPin, reorderLocalDirectoryPins } from "../app-server/local-directory-pins";
 import { registerDirectoryFromDisk } from "../app-server/directory-registration-service";
-import { getDesktopOverlayStore } from "../app-server/desktop-overlay-store";
+import { getDesktopOverlayStore } from "../storage/desktop-overlay-store";
 import { threadFamilyPricingForPeer } from "../app-server/thread-family-pricing";
 import { createLocalThreadFamilyPricingReader } from "../app-server/thread-family-pricing-source";
 import { createScratchProjectDirectory, resolveScratchProjectsRoots } from "../app-server/scratch-projects";
@@ -330,8 +337,9 @@ import {
 } from "../settings/application-discovery";
 import { getMcpConnectionGatewayService } from "../mcp-connections/mcp-connection-gateway-service";
 import { getDesktopSettingsService } from "../settings/desktop-settings-singleton";
-import { getAppStateDb, isAppStateInitialized } from "../state/app-state";
-import { DurableTurnRequestService, DurableTurnRequestError } from "./durable-turn-request-service";
+import { isAppStateInitialized } from "../storage/desktop-runtime-storage";
+import { desktopFederationState, createFederationStorage, createDurableTurnRequestStorage, type FederationStorage } from "../storage/desktop-federation-storage";
+import { DurableTurnRequestService, DurableTurnRequestError } from "@pwragent/owner-core/durable-turn-request-service";
 import { durableFederationCallerScope, authenticateMessageOrigin } from "./federation-backend-bridge";
 import type { SubmitDurableTurnRequest, GetDurableTurnRequest, DurableTurnReceipt, SubmitDurableSteerRequest, DurableSteerReceipt } from "@pwragent/shared";
 import {
@@ -341,11 +349,11 @@ import {
 import {
   listModelSettingsRecents,
   recordModelSettingsRecent,
-} from "../state/model-settings-recents-store";
+} from "../storage/desktop-recents-service";
 import {
   listRecentFileReferencePaths,
   recordRecentFileReferencePaths,
-} from "../state/recent-file-references-store";
+} from "../storage/desktop-recents-service";
 import { DesktopMessagingBackendBridge } from "../messaging/desktop-backend-bridge";
 import { getDesktopNavigationQueryStore } from "../app-server/navigation-query-store";
 import { getDesktopNavigationQueryPool } from "../app-server/navigation-query-pool";
@@ -376,7 +384,6 @@ import {
 } from "./federation-host-info";
 import { defaultInstanceLabel } from "./federation-instance-label";
 import {
-  FEDERATION_SHORT_NAMES_META_KEY,
   FederationShortNameCoordinator,
   type FederationShortNameInstance,
 } from "./federation-short-names";
@@ -442,7 +449,6 @@ import { navigationRequestForOwner, stampRemoteNavigationQueryPage } from "./fed
 import {
   FederationPeerUnavailableError,
 } from "./federation-peer-unavailable-error";
-import { FederationStore } from "./federation-store";
 import {
   classifyFederationClientFailure,
   redactFederationDiagnostic,
@@ -511,14 +517,6 @@ export function navigationWireResponseThreadCount(
   }
 }
 
-const INSTANCE_ID_META_KEY = "federation_instance_id";
-const GATEWAY_INSTANCE_ID_META_KEY = "federation_gateway_instance_id";
-const GATEWAY_PUBLIC_KEY_META_KEY = "federation_gateway_public_key_pem";
-const GATEWAY_NOISE_PUBLIC_KEY_META_KEY = "federation_gateway_noise_public_key";
-// Legacy preference: only cleared when changing pairings; never used for ordering.
-const GATEWAY_LAST_ENDPOINT_META_KEY = "federation_gateway_last_endpoint";
-const PENDING_INVITE_TOKEN_META_KEY = "federation_pending_invite_token";
-const GATEWAY_ENROLLED_AT_META_KEY = "federation_gateway_enrolled_at";
 /** @deprecated Alpha single-frame replacement; negotiated atomic pages replace it. */
 const FEDERATION_PEER_DIRECTORY_METHOD = "federation.peerDirectory";
 const FEDERATION_PEER_DIRECTORY_PAGE_METHOD = "federation.peerDirectoryPage";
@@ -532,8 +530,6 @@ const FEDERATION_SHORT_NAMES_METHOD = "federation.instanceShortNames";
 const FEDERATION_STAR_MAP_ARRANGEMENT_METHOD = "federation.starMapArrangement";
 const FEDERATION_EVENT_SUBSCRIPTION_METHOD = "federation.eventSubscription";
 const FEDERATION_EVENT_RELAY_MAX_HOPS = 4;
-const CELESTIAL_ICON_ASSIGNMENTS_META_KEY =
-  "federation_celestial_icon_assignments";
 /**
  * How long a celestial tombstone stays in the map after the removal. Long
  * enough for every enrolled peer to reconnect at least once and merge the
@@ -651,6 +647,7 @@ export const DEFAULT_CAPABILITIES: FederationCapability[] = [
   "file_pull",
   "event_subscriptions",
   "turn_input_blobs",
+  "resumable_blobs",
   // Signed transport negotiation; not a user-authorized remote action.
   "transport_brotli",
   "shutdown_notice",
@@ -669,6 +666,7 @@ export const DEFAULT_CAPABILITIES: FederationCapability[] = [
   "operator_requests",
   "thread_display_bulk_reads",
   "thread_pr_watch_control_v1",
+  "thread_dependencies_v1",
 ];
 
 const REMOTE_THREAD_SUMMARY_EVENT_CONSUMER_ID =
@@ -766,6 +764,7 @@ const NAVIGATION_EVENT_METHODS = new Set<string>([
   "thread/archived",
   "thread/automations/updated",
   "thread/backgroundTasks/updated",
+  "thread/checkoutHibernation/updated",
   "thread/codexEnvironment/updated",
   "thread/codexInvalidIdRecovery/updated",
   "thread/executionMode/queueCleared",
@@ -846,6 +845,7 @@ export function unsequencedFederationEventPayload(event: AgentEvent): AgentEvent
   return {
     backend: event.backend,
     notification: event.notification,
+    ...(event.navigationDirectoryScope ? { navigationDirectoryScope: event.navigationDirectoryScope } : {}),
     ...(event.rendererImageParts ? { rendererImageParts: event.rendererImageParts } : {}),
     ...(event.errorNoticeContext
       ? { errorNoticeContext: event.errorNoticeContext }
@@ -872,6 +872,7 @@ export function navigationInvalidationForLocalEvent(event: AgentEvent): AgentEve
     typeof value === "string" && value.length <= 1_024 ? value : undefined;
   return {
     backend: event.backend,
+    ...(event.navigationDirectoryScope ? { navigationDirectoryScope: event.navigationDirectoryScope } : {}),
     notification: {
       method: "navigation/invalidated",
       params: {
@@ -1209,7 +1210,7 @@ export class DesktopFederationRuntime {
     if (!this.durableTurnRequests) {
       const backend = localBackendOperations();
       this.durableTurnRequests = new DurableTurnRequestService({
-        stateDb: getAppStateDb(),
+        storage: createDurableTurnRequestStorage(),
         ownerInstanceId: this.ensureLocalInstanceId(),
         authorize: async (_scope, request) => {
           const resolved = await backend.resolveThread({ backend: request.backend, threadId: request.threadId });
@@ -1292,11 +1293,11 @@ export class DesktopFederationRuntime {
   /** Short names for every instance; the root gateway generates them. */
   private readonly shortNames = new FederationShortNameCoordinator({
     readMeta: () => isAppStateInitialized()
-      ? getAppStateDb().getMeta(FEDERATION_SHORT_NAMES_META_KEY) ?? ""
+      ? desktopFederationState.read("shortNames") ?? ""
       : undefined,
     writeMeta: (value) => {
       if (isAppStateInitialized()) {
-        getAppStateDb().setMeta(FEDERATION_SHORT_NAMES_META_KEY, value);
+        desktopFederationState.write("shortNames", value);
       }
     },
     isCoordinator: () => this.actsAsCelestialCoordinator(),
@@ -1410,6 +1411,7 @@ export class DesktopFederationRuntime {
   private walkEpoch = 0;
   private lastConnectedAt?: number;
   private stopping = true;
+  private blobLifetime = new AbortController();
   private lastConnectionError?: string;
   private lastConnectionFailureKind?: "auth" | "replaced" | "transport";
   private cloudflareSignInRequiredEndpoint?: string;
@@ -1763,6 +1765,7 @@ export class DesktopFederationRuntime {
 
   async stop(): Promise<void> {
     this.stopping = true;
+    this.blobLifetime.abort(new Error("Federation stopped."));
     this.parked = false;
     this.shortNames.dispose();
     await this.cloudflareGateway.stop();
@@ -1828,6 +1831,7 @@ export class DesktopFederationRuntime {
     this.endpointStatuses.clear();
     this.rpcByPeer.clear();
     this.remotePeerDirectory.clear();
+    invalidatePeerActiveDependencies(this);
     this.publishedPeerStatuses.clear();
     this.incomingEventSubscriptions.clear();
     this.syncDirectorySetWatchers();
@@ -2043,7 +2047,7 @@ export class DesktopFederationRuntime {
     health.localShortLabel = localShort?.shortLabel;
     health.localShortLabelSource = localShort?.source;
     health.localProfileName = isAppStateInitialized()
-      ? getAppStateDb().getMeta("profile_name") || undefined
+      ? desktopFederationState.read("profileName") || undefined
       : undefined;
     // A live holder elsewhere keeps this instance's federation runtime
     // stopped; surface that (with the holder's identity while it is still
@@ -2063,16 +2067,16 @@ export class DesktopFederationRuntime {
     configuredGatewayUrl: string,
   ): FederationHealthStatus["clientEnrollment"] {
     if (!isAppStateInitialized()) return undefined;
-    const stateDb = getAppStateDb();
-    const gatewayInstanceId = stateDb.getMeta(GATEWAY_INSTANCE_ID_META_KEY);
+    const state = desktopFederationState;
+    const gatewayInstanceId = state.read("gatewayInstanceId");
     if (!gatewayInstanceId) return undefined;
-    const enrolledAtRaw = stateDb.getMeta(GATEWAY_ENROLLED_AT_META_KEY);
+    const enrolledAtRaw = state.read("gatewayEnrolledAt");
     const enrolledAt = enrolledAtRaw ? Number(enrolledAtRaw) : Number.NaN;
     return {
       gatewayInstanceId,
       gatewayUrl: configuredGatewayUrl || undefined,
       enrolledAt: Number.isFinite(enrolledAt) ? enrolledAt : undefined,
-      pendingInvite: Boolean(stateDb.getMeta(PENDING_INVITE_TOKEN_META_KEY)),
+      pendingInvite: Boolean(state.read("pendingInviteToken")),
     };
   }
 
@@ -2085,19 +2089,19 @@ export class DesktopFederationRuntime {
   async resetEnrollment(
     request?: ResetFederationEnrollmentRequest,
   ): Promise<{ cleared: boolean }> {
-    const stateDb = getAppStateDb();
+    const state = desktopFederationState;
     const hadEnrollment = Boolean(
-      stateDb.getMeta(GATEWAY_INSTANCE_ID_META_KEY),
+      state.read("gatewayInstanceId"),
     );
-    stateDb.setMeta(GATEWAY_INSTANCE_ID_META_KEY, "");
-    stateDb.setMeta(GATEWAY_PUBLIC_KEY_META_KEY, "");
-    stateDb.setMeta(GATEWAY_NOISE_PUBLIC_KEY_META_KEY, "");
-    stateDb.setMeta(PENDING_INVITE_TOKEN_META_KEY, "");
-    stateDb.setMeta(GATEWAY_ENROLLED_AT_META_KEY, "");
+    state.write("gatewayInstanceId", "");
+    state.write("gatewayPublicKey", "");
+    state.write("gatewayNoisePublicKey", "");
+    state.write("pendingInviteToken", "");
+    state.write("gatewayEnrolledAt", "");
     // The endpoint list and its last-good memory belong to the pairing being
     // forgotten. Leaving them behind would keep a dual-mode instance dialing
     // the forgotten gateway with no pins left to satisfy it.
-    stateDb.setMeta(GATEWAY_LAST_ENDPOINT_META_KEY, "");
+    state.write("gatewayLastEndpoint", "");
     const settingsService = getDesktopSettingsService();
     const mode = this.readRuntimeConfig().mode;
     if (mode === "client" || mode === "disabled") {
@@ -2481,17 +2485,17 @@ export class DesktopFederationRuntime {
     gatewayEndpoints: string[];
   }> {
     const payload = decodeFederationInvite(invite);
-    const stateDb = getAppStateDb();
-    stateDb.setMeta(GATEWAY_INSTANCE_ID_META_KEY, payload.gatewayInstanceId);
-    stateDb.setMeta(GATEWAY_PUBLIC_KEY_META_KEY, payload.gatewayPublicKeyPem);
-    stateDb.setMeta(
-      GATEWAY_NOISE_PUBLIC_KEY_META_KEY,
+    const state = desktopFederationState;
+    state.write("gatewayInstanceId", payload.gatewayInstanceId);
+    state.write("gatewayPublicKey", payload.gatewayPublicKeyPem);
+    state.write(
+      "gatewayNoisePublicKey",
       payload.gatewayNoisePublicKey,
     );
     // A new gateway identity invalidates any endpoint memory from before.
-    stateDb.setMeta(GATEWAY_LAST_ENDPOINT_META_KEY, "");
-    stateDb.setMeta(PENDING_INVITE_TOKEN_META_KEY, payload.token);
-    stateDb.setMeta(GATEWAY_ENROLLED_AT_META_KEY, String(Date.now()));
+    state.write("gatewayLastEndpoint", "");
+    state.write("pendingInviteToken", payload.token);
+    state.write("gatewayEnrolledAt", String(Date.now()));
     // Importing on a listening instance must not silently kill its
     // listener: gateway/dual become dual, everything else becomes client.
     const currentMode = this.readRuntimeConfig().mode;
@@ -3001,13 +3005,84 @@ export class DesktopFederationRuntime {
     const peer = this.visiblePeers().find((candidate) => candidate.id === target.instanceId);
     if (!peer?.capabilities.includes("file_push")) throw new Error("The target does not support file push.");
     if (peer.receiverPermissions?.filePush !== true) throw new Error("The target does not allow incoming files.");
+    if (this.supportsResumableBlobs(target.instanceId)) {
+      const signal = options?.signal ? AbortSignal.any([options.signal, this.blobLifetime.signal]) : this.blobLifetime.signal;
+      return await pushResumableBlob(this.resumableBlobTransport(target), sourcePath, name, { ...options, signal });
+    }
     return await pushFederationFile(this.rpcFor(target), sourcePath, name, options);
   }
 
-  async handoffInstanceThread(request: HandoffInstanceThreadRequest, sourceInstanceId?: string): Promise<HandoffInstanceThreadResult> {
+  /** Wake only the upstream link that routes this handoff's target. */
+  retryHandoffNow(targetInstanceId: string): void {
+    if (!this.reconnectTimer || this.stopping || this.router?.getConnection(targetInstanceId)) return;
+    const gateway = this.gatewayInstanceId ?? desktopFederationState.read("gatewayInstanceId");
+    if (!gateway || (targetInstanceId !== gateway && !this.remotePeerDirectory.has(targetInstanceId))) return;
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
+    void this.connectToGateway().catch((error) => this.handleClientConnectionFailure(error));
+  }
+
+  private supportsResumableBlobs(instanceId: string): boolean {
+    if (!this.remotePeerAdvertisesCapability(instanceId, "resumable_blobs")) return false;
+    const gateway = this.gatewayInstanceId ?? desktopFederationState.read("gatewayInstanceId");
+    const route = this.router?.getConnection(instanceId) ?? (gateway ? this.router?.getConnection(gateway) : undefined);
+    if (route) return route.capabilities.includes("resumable_blobs");
+    // Preserve the negotiated route feature during a drop between packaging
+    // and push. Health still gates begin; a missing live socket is not a reason
+    // to turn a held resumable handoff into a legacy single-shot send.
+    return !gateway || gateway === instanceId
+      || this.visiblePeers().some((peer) => peer.id === gateway && peer.capabilities.includes("resumable_blobs"));
+  }
+
+  private resumableBlobTransport(target: FederationRemoteTarget): ResumableBlobTransport {
+    const waitForReconnect = async (signal?: AbortSignal): Promise<void> => {
+      while (true) {
+        signal?.throwIfAborted();
+        if (this.stopping) throw new Error("Federation stopped.");
+        const peer = this.visiblePeers().find((candidate) => candidate.id === target.instanceId);
+        if (peer?.status === "revoked") throw new Error("The receiving peer was revoked.");
+        if (peer?.status === "connected" && this.supportsResumableBlobs(target.instanceId)) return;
+        await new Promise<void>((resolve, reject) => {
+          const cleanup = (): void => {
+            this.peerStatusListeners.delete(done);
+            signal?.removeEventListener("abort", abort);
+          };
+          const done = (): void => { cleanup(); resolve(); };
+          const abort = (): void => { cleanup(); reject(signal?.reason); };
+          this.peerStatusListeners.add(done);
+          signal?.addEventListener("abort", abort, { once: true });
+          if (signal?.aborted) abort();
+        });
+      }
+    };
+    return {
+      localInstanceId: this.ensureLocalInstanceId(), targetInstanceId: target.instanceId,
+      isConnected: () => this.supportsResumableBlobs(target.instanceId)
+        && this.visiblePeers().some((peer) => peer.id === target.instanceId && peer.status === "connected"),
+      connection: () => {
+        const rpc = this.rpcFor(target);
+        const didDisconnect = (): boolean => this.rpcByPeer.get(target.instanceId) !== rpc;
+        return { rpc, didDisconnect, send: async (envelope) => {
+          if (didDisconnect()) throw new FederationPeerUnavailableError(target.instanceId);
+          await this.sendEnvelopeToTargetWithBackpressure(target.instanceId, envelope);
+        } };
+      },
+      waitForReconnect,
+      cancel: (identity) => {
+        // A disconnected peer cannot receive cancellation. Deliver the tombstone
+        // when health reports it connected; its 24-hour expiry also survives us.
+        void waitForReconnect(this.blobLifetime.signal).then(async () => {
+          await this.rpcFor(target).request({ method: FILE_PUSH_METHODS.cancel, params: identity, timeoutMs: null,
+            signal: this.blobLifetime.signal });
+        }).catch(() => undefined);
+      },
+    };
+  }
+
+  async handoffInstanceThread(request: HandoffInstanceThreadRequest, sourceInstanceId?: string, sendOptions?: ThreadHandoffSendOptions): Promise<HandoffInstanceThreadResult> {
     if (!sourceInstanceId || sourceInstanceId === this.localFederationInstanceId()) {
       if (!this.threadHandoffService) throw new Error("Federation is not running on the source instance.");
-      return await this.threadHandoffService.send(request);
+      return await this.threadHandoffService.send(request, sendOptions);
     }
     const peer = this.visiblePeers().find((candidate) => candidate.id === sourceInstanceId);
     if (!peer?.capabilities.includes("thread_handoff")) throw new Error("Update PwrAgent on the source machine to enable thread handoff.");
@@ -3248,7 +3323,7 @@ export class DesktopFederationRuntime {
       }
       const label = this.readRuntimeConfig().instanceLabel || defaultInstanceLabel();
       const instanceId = this.localInstanceId
-        ?? (isAppStateInitialized() ? getAppStateDb().getMeta(INSTANCE_ID_META_KEY) : undefined);
+        ?? (isAppStateInitialized() ? desktopFederationState.read("instanceId") : undefined);
       return instanceId ? `${label} (${instanceId}, local)` : `${label} (local)`;
     } catch {
       if (target?.scope === "remote") return target.instanceId;
@@ -3607,6 +3682,16 @@ export class DesktopFederationRuntime {
     return this.remoteThreadSummaryCache;
   }
 
+  /** This machine's threads' sub-threads on peers, by parent identity key,
+   * from saved pins. Reads local state only, so an offline peer's children
+   * still count. */
+  async peerSubthreadsOfLocalThreads(): Promise<Map<string, string[]>> {
+    const pins = await getDesktopOverlayStore().listRemoteThreadPins();
+    // No pins, no peer sub-threads. Only the identity is needed, not the
+    // peer and config reads health() does, which could fail the sweep.
+    return pins.length ? peerSubthreadChildren(pins, this.ensureLocalInstanceId()) : new Map();
+  }
+
   /** Promote cross-instance children before the archive removes their row. */
   async ungroupRemoteChildrenOfArchivedThread(params: {
     backend: AppServerBackendKind;
@@ -3884,6 +3969,7 @@ export class DesktopFederationRuntime {
     config: FederationRuntimeConfig,
   ): Promise<void> {
     this.stopping = false;
+    this.blobLifetime = new AbortController();
     // Startup fence: a concurrent stop flips `stopping` and bumps `walkEpoch`.
     // A stale startup continuation must not create or publish sockets
     // afterwards (the same guard connectToGateway uses per attempt).
@@ -3898,7 +3984,7 @@ export class DesktopFederationRuntime {
       trustedRelayPeerId: () =>
         this.gatewayInstanceId
         ?? (isAppStateInitialized()
-          ? getAppStateDb().getMeta(GATEWAY_INSTANCE_ID_META_KEY) || undefined
+          ? desktopFederationState.read("gatewayInstanceId") || undefined
           : undefined),
       methodCapabilities: {
         ...FEDERATION_BACKEND_METHOD_CAPABILITIES,
@@ -3929,6 +4015,11 @@ export class DesktopFederationRuntime {
               : additionalFederationBackendCapabilities(envelope),
     });
     router.registerBlobChunkHandler(async (envelope) => {
+      if (envelope.purpose === "file_push") {
+        if (!this.filePushReceiver) throw new Error("File receiver is unavailable.");
+        await this.filePushReceiver.receiveBlob(envelope);
+        return;
+      }
       await this.turnInputAttachmentReceiver.receive(
         envelope,
         envelope.sourceInstanceId,
@@ -3969,7 +4060,9 @@ export class DesktopFederationRuntime {
       // A history-only thread lands where a new Workspaces thread would.
       createHistoryWorkspace: () => createScratchProjectDirectory(),
       localInstanceId: () => this.ensureLocalInstanceId(),
-      push: (instanceId, source) => this.pushFile({ scope: "remote", instanceId }, source),
+      push: (instanceId, source, options) => this.pushFile({ scope: "remote", instanceId }, source, undefined, options),
+      supportsResumable: (instanceId) => this.supportsResumableBlobs(instanceId),
+      retryNow: (instanceId) => this.retryHandoffNow(instanceId),
       remoteImport: (instanceId, request) => this.rpcFor({ scope: "remote", instanceId }).request({
         method: THREAD_HANDOFF_METHODS.import, params: request, timeoutMs: null,
       }),
@@ -4273,24 +4366,24 @@ export class DesktopFederationRuntime {
       state: "connecting",
       lastAttemptAt: Date.now(),
     });
-    const gatewayInstanceId = getAppStateDb().getMeta(GATEWAY_INSTANCE_ID_META_KEY);
+    const gatewayInstanceId = desktopFederationState.read("gatewayInstanceId");
     if (!gatewayInstanceId) {
       throw new Error("Federation client mode is missing its gateway identity.");
     }
-    const gatewayPublicKeyPem = getAppStateDb().getMeta(GATEWAY_PUBLIC_KEY_META_KEY);
+    const gatewayPublicKeyPem = desktopFederationState.read("gatewayPublicKey");
     if (!gatewayPublicKeyPem) {
       throw new Error("Federation client mode is missing its pinned gateway key.");
     }
     this.gatewayInstanceId = gatewayInstanceId;
-    const gatewayNoisePublicKeyBase64 = getAppStateDb().getMeta(
-      GATEWAY_NOISE_PUBLIC_KEY_META_KEY,
+    const gatewayNoisePublicKeyBase64 = desktopFederationState.read(
+      "gatewayNoisePublicKey",
     );
     if (!gatewayNoisePublicKeyBase64) {
       throw new Error(
         "Federation client mode is missing its pinned gateway encryption key. Re-import the federation invite.",
       );
     }
-    const pendingInviteToken = getAppStateDb().getMeta(PENDING_INVITE_TOKEN_META_KEY);
+    const pendingInviteToken = desktopFederationState.read("pendingInviteToken");
     const noticeEpoch = this.walkEpoch;
     await federationLocalNetworkNotice.beforeConnect(
       gatewayUrl, () => !this.stopping && this.walkEpoch === noticeEpoch,
@@ -4406,7 +4499,7 @@ export class DesktopFederationRuntime {
         defaultInstanceLabel(),
       // Advertise which profile this instance runs so peers can tell
       // several enrollments of the same machine apart in their UI.
-      profileName: getAppStateDb().getMeta("profile_name") || undefined,
+      profileName: desktopFederationState.read("profileName") || undefined,
       // Always a string: present-but-empty clears the gateway's stored
       // notes when the operator erases theirs (absent means "old client").
       notes: this.instanceNotes ?? config.instanceNotes,
@@ -4591,7 +4684,7 @@ export class DesktopFederationRuntime {
     this.syncDesiredEventSubscriptions();
     this.replayRelayedEventSubscriptions();
     if (pendingInviteToken) {
-      getAppStateDb().setMeta(PENDING_INVITE_TOKEN_META_KEY, "");
+      desktopFederationState.write("pendingInviteToken", "");
     }
     this.markEndpointConnected(gatewayUrl);
     // Backoff is reset by session *durability*, not by the mere fact that a
@@ -4866,6 +4959,8 @@ export class DesktopFederationRuntime {
     // Transport revisions are scoped to the remote process lifetime, so a
     // replacement must not reuse any selection state from the prior session.
 
+    this.rpcByPeer.get(connection.peerId)?.rejectAll(new FederationPeerUnavailableError(connection.peerId));
+    this.rpcByPeer.delete(connection.peerId);
     this.router?.registerConnection({
       peerId: connection.peerId,
       capabilities: connection.capabilities,
@@ -4906,6 +5001,7 @@ export class DesktopFederationRuntime {
   }
 
   private unregisterPeer(peerId: FederationInstanceId): void {
+    void this.filePushReceiver?.disconnect(peerId).catch((error) => log.warn("Unable to suspend incoming blobs", { error }));
     this.services?.disconnect(peerId);
     this.serviceForwarder.disconnectPeer(peerId);
     this.shutdown.disconnected(peerId);
@@ -4933,6 +5029,7 @@ export class DesktopFederationRuntime {
       if (this.router?.getConnection(peerId)) {
         continue;
       }
+      void this.filePushReceiver?.disconnect(peerId).catch((error) => log.warn("Unable to suspend incoming blobs", { error }));
       this.remotePeerDirectory.set(peerId, {
         ...peer,
         status: peer.status === "revoked" ? "revoked" : "disconnected",
@@ -4949,9 +5046,11 @@ export class DesktopFederationRuntime {
       );
     }
     for (const [peerId, rpc] of this.rpcByPeer) {
+      if (this.router?.getConnection(peerId)) continue;
       rpc.rejectAll(new FederationPeerUnavailableError(peerId, reason));
+      this.rpcByPeer.delete(peerId);
+      void this.filePushReceiver?.disconnect(peerId).catch((error) => log.warn("Unable to suspend incoming blobs", { error }));
     }
-    this.rpcByPeer.clear();
   }
 
   private async receiveEnvelope(
@@ -5138,20 +5237,20 @@ export class DesktopFederationRuntime {
 
   private ensureLocalInstanceId(): FederationInstanceId {
     if (this.localInstanceId) return this.localInstanceId;
-    const stateDb = getAppStateDb();
-    const existing = stateDb.getMeta(INSTANCE_ID_META_KEY);
+    const state = desktopFederationState;
+    const existing = state.read("instanceId");
     if (existing) {
       this.localInstanceId = existing;
       return existing;
     }
     const next = `pwr_${randomUUID()}`;
-    stateDb.setMeta(INSTANCE_ID_META_KEY, next);
+    state.write("instanceId", next);
     this.localInstanceId = next;
     return next;
   }
 
-  private store(): FederationStore {
-    return new FederationStore(getAppStateDb());
+  private store(): FederationStorage {
+    return createFederationStorage();
   }
 
   private sendEnvelopeToTarget(
@@ -5169,7 +5268,7 @@ export class DesktopFederationRuntime {
     }
 
     const gatewayInstanceId = this.gatewayInstanceId ??
-      getAppStateDb().getMeta(GATEWAY_INSTANCE_ID_META_KEY);
+      desktopFederationState.read("gatewayInstanceId");
     if (
       gatewayInstanceId &&
       gatewayInstanceId !== targetInstanceId &&
@@ -5209,7 +5308,7 @@ export class DesktopFederationRuntime {
     }
 
     const gatewayInstanceId = this.gatewayInstanceId
-      ?? getAppStateDb().getMeta(GATEWAY_INSTANCE_ID_META_KEY);
+      ?? desktopFederationState.read("gatewayInstanceId");
     if (
       gatewayInstanceId
       && gatewayInstanceId !== targetInstanceId
@@ -5328,13 +5427,13 @@ export class DesktopFederationRuntime {
   }
 
   private defaultPeerLabel(peerId: FederationInstanceId): string {
-    return peerId === getAppStateDb().getMeta(GATEWAY_INSTANCE_ID_META_KEY)
+    return peerId === desktopFederationState.read("gatewayInstanceId")
       ? "Gateway"
       : peerId;
   }
 
   private defaultPeerRole(peerId: FederationInstanceId): FederationInstanceRole {
-    return peerId === getAppStateDb().getMeta(GATEWAY_INSTANCE_ID_META_KEY)
+    return peerId === desktopFederationState.read("gatewayInstanceId")
       ? "gateway"
       : "client";
   }
@@ -5343,7 +5442,7 @@ export class DesktopFederationRuntime {
     recipientPeerId: FederationInstanceId,
   ): FederationPeerSummary[] {
     const localInstanceId = this.ensureLocalInstanceId();
-    const localProfileName = getAppStateDb().getMeta("profile_name") || undefined;
+    const localProfileName = desktopFederationState.read("profileName") || undefined;
     const compressionEnabled = this.readRuntimeConfig().compressionEnabled;
     const peers: FederationPeerSummary[] = [
       {
@@ -5499,7 +5598,7 @@ export class DesktopFederationRuntime {
       return new Map();
     }
     const map = new Map<FederationInstanceId, CelestialIconAssignment>();
-    const raw = getAppStateDb().getMeta(CELESTIAL_ICON_ASSIGNMENTS_META_KEY);
+    const raw = desktopFederationState.read("celestialIconAssignments");
     if (raw) {
       try {
         const parsed: unknown = JSON.parse(raw);
@@ -5524,8 +5623,8 @@ export class DesktopFederationRuntime {
 
   private persistCelestialAssignments(): void {
     if (!this.celestialAssignments || !isAppStateInitialized()) return;
-    getAppStateDb().setMeta(
-      CELESTIAL_ICON_ASSIGNMENTS_META_KEY,
+    desktopFederationState.write(
+      "celestialIconAssignments",
       JSON.stringify([...this.celestialAssignments.values()]),
     );
   }
@@ -5585,7 +5684,7 @@ export class DesktopFederationRuntime {
    */
   private actsAsCelestialCoordinator(): boolean {
     if (!isAppStateInitialized()) return true;
-    return !getAppStateDb().getMeta(GATEWAY_INSTANCE_ID_META_KEY);
+    return !desktopFederationState.read("gatewayInstanceId");
   }
 
   /** This instance's durable federation identity (creates one if absent). */
@@ -6055,7 +6154,7 @@ export class DesktopFederationRuntime {
       id: this.ensureLocalInstanceId(),
       // restartNow resolves this before any peer can connect.
       label: this.instanceLabel || defaultInstanceLabel(),
-      profileName: getAppStateDb().getMeta("profile_name") || undefined,
+      profileName: desktopFederationState.read("profileName") || undefined,
       host: this.localHostInfo,
     };
     return [
@@ -6155,7 +6254,7 @@ export class DesktopFederationRuntime {
     }
     const gatewayInstanceId = this.actsAsCelestialCoordinator()
       ? undefined
-      : getAppStateDb().getMeta(GATEWAY_INSTANCE_ID_META_KEY) || undefined;
+      : desktopFederationState.read("gatewayInstanceId") || undefined;
     if (gatewayInstanceId && this.router?.getConnection(gatewayInstanceId)) {
       try {
         const response = await this.remoteBackend({
@@ -6202,7 +6301,7 @@ export class DesktopFederationRuntime {
     }
     const gatewayInstanceId = this.actsAsCelestialCoordinator()
       ? undefined
-      : getAppStateDb().getMeta(GATEWAY_INSTANCE_ID_META_KEY) || undefined;
+      : desktopFederationState.read("gatewayInstanceId") || undefined;
     if (gatewayInstanceId && this.router?.getConnection(gatewayInstanceId)) {
       const response = await this.remoteBackend({
         scope: "remote",
@@ -6676,6 +6775,9 @@ export class DesktopFederationRuntime {
     if (status !== "connected") {
       this.services?.disconnect(instanceId);
       this.serviceForwarder.disconnectPeer(instanceId);
+      this.rpcByPeer.get(instanceId)?.rejectAll(new FederationPeerUnavailableError(instanceId, unavailableReason));
+      this.rpcByPeer.delete(instanceId);
+      void this.filePushReceiver?.disconnect(instanceId).catch((error) => log.warn("Unable to suspend incoming blobs", { error }));
     }
     const previous = this.publishedPeerStatuses.get(instanceId);
     if (
@@ -6697,6 +6799,8 @@ export class DesktopFederationRuntime {
     // leave a still-fresh cache marked degraded, and the reconnect refresh
     // has no reason to retry it until another navigation event arrives.
     this.remoteThreadSummaryCache?.invalidate(instanceId);
+
+    invalidatePeerActiveDependencies(this, instanceId);
 
     if (status === "connected") {
       // Hooked to the status TRANSITION (this method already de-dupes
@@ -6895,6 +6999,7 @@ export class DesktopFederationRuntime {
         instanceId: sourceInstanceId,
       },
       notification: decoded.notification,
+      ...(decoded.navigationDirectoryScope ? { navigationDirectoryScope: decoded.navigationDirectoryScope } : {}),
       ...(decoded.errorNoticeContext
         ? { errorNoticeContext: decoded.errorNoticeContext }
         : {}),
@@ -6933,6 +7038,13 @@ export class DesktopFederationRuntime {
   }
 
   private publishReceivedBackendEvent(event: AgentEvent): void {
+    if (event.federationTarget?.scope === "remote"
+      && (event.notification.method === "thread/dependencies/updated"
+        || (event.notification.method === "navigation/invalidated"
+          && event.notification.params.sourceMethod === "thread/dependencies/updated")
+        || event.notification.method === "federation/eventStream/changed")) {
+      invalidatePeerActiveDependencies(this, event.federationTarget.instanceId);
+    }
     this.publishAgentEvent?.(event);
     this.notifyRemoteBackendEventListeners(event);
   }
@@ -7409,6 +7521,24 @@ function localBackendOperations(): FederationBackendOperations {
         pinnedRank: overlay.pinnedRank,
       };
     },
+    async setDirectoryPin(request) {
+      return await setLocalDirectoryPin(request);
+    },
+    async reorderDirectoryPins(request) {
+      return await reorderLocalDirectoryPins(request);
+    },
+    async legacyManageThreadMergeHolds(request: unknown): Promise<{ holds: []; dependents: [] }> {
+      // 1.3.13 and 1.3.14 viewers still ask here. Their reads see nothing;
+      // anything else is told where Wait Until Done went.
+      const action = request && typeof request === "object" ? (request as { action?: unknown }).action : undefined;
+      if (action === "list" || action === "active") return { holds: [], dependents: [] };
+      throw new Error("Wait Until Done moved into Continue After. Update PwrAgent on this machine.");
+    },
+    async manageThreadDependencies(request: unknown, options?: { requesterInstanceId?: string }): Promise<import("@pwragent/shared").ManageThreadDependenciesResponse> {
+      const owned = readFederationThreadDependenciesRequest(request);
+      if (!owned) throw new Error("Unknown Continue After action.");
+      return await getDesktopBackendRegistry().manageThreadDependenciesForPeer(owned, options?.requesterInstanceId);
+    },
     async setThreadLock(
       request: SetThreadLockRequest,
       options?: { requesterInstanceId?: string },
@@ -7421,6 +7551,14 @@ function localBackendOperations(): FederationBackendOperations {
       }, {
         source: "peer",
         ...(options?.requesterInstanceId ? { sourceInstanceId: options.requesterInstanceId } : {}),
+      });
+    },
+    async setThreadCheckoutHibernation(request: SetThreadCheckoutHibernationRequest): Promise<SetThreadCheckoutHibernationResponse> {
+      return await getDesktopBackendRegistry().setThreadCheckoutHibernation({
+        backend: request.backend ?? "codex",
+        threadId: request.threadId,
+        ...(request.restore !== undefined ? { restore: request.restore } : {}),
+        ...(request.keepAwake !== undefined ? { keepAwake: request.keepAwake } : {}),
       });
     },
     async continueThreadEnvironmentStartup(request: ContinueThreadEnvironmentStartupRequest): Promise<ContinueThreadEnvironmentStartupResponse> {
@@ -8004,7 +8142,7 @@ function localBackendOperations(): FederationBackendOperations {
     },
     async listRecentFileReferences(): Promise<ListRecentFileReferencesResponse> {
       return {
-        files: listRecentFileReferencePaths(getAppStateDb()).map((filePath) => ({
+        files: listRecentFileReferencePaths().map((filePath) => ({
           label: path.basename(filePath),
           path: filePath,
         })),
@@ -8013,19 +8151,19 @@ function localBackendOperations(): FederationBackendOperations {
     async recordRecentFileReferences(
       request: RecordRecentFileReferencesRequest,
     ): Promise<void> {
-      recordRecentFileReferencePaths(getAppStateDb(), request.paths ?? []);
+      recordRecentFileReferencePaths(request.paths ?? []);
     },
     async listModelSettingsRecents(
       request: ListModelSettingsRecentsRequest,
     ): Promise<ListModelSettingsRecentsResponse> {
       return {
-        recents: listModelSettingsRecents(getAppStateDb(), request.scope),
+        recents: listModelSettingsRecents(request.scope),
       };
     },
     async recordModelSettingsRecent(
       request: RecordModelSettingsRecentRequest,
     ): Promise<void> {
-      recordModelSettingsRecent(getAppStateDb(), request.scope, request.recent);
+      recordModelSettingsRecent(request.scope, request.recent);
     },
     async attachDirectoryToThread(
       request: AttachDirectoryToThreadRequest,

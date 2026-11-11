@@ -1,12 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { DesktopBackendRegistry } from "../app-server/backend-registry";
 import { WorktreeContainerService } from "../app-server/worktree-container-service";
-import { CodexAppServerClient } from "../codex-app-server/client";
+import { CodexAppServerClient } from "../codex-app-server/desktop-client";
 import { SqliteOverlayStore } from "../state/overlay-store-sqlite";
 import { StateDb } from "../state/state-db";
 import { createTempStateDb } from "./sqlite-test-utils";
@@ -14,12 +14,15 @@ import { runOneTimeArchivedWorktreeRepair } from "../state/archived-worktree-rep
 import { ArchiveCleanupCheckpointStore } from "../state/archive-cleanup-checkpoint";
 import { measureSqliteWrites } from "../state/sqlite-write-metrics";
 import { expectSqliteWriteBudget } from "./fixtures/sqlite-write-budget";
-import { AcpAgentStore } from "../acp/acp-agent-store";
+import { AcpAgentStore } from "../storage/acp-agent-store";
 import { ClaudeSessionStore } from "../claude/claude-session-store";
 import { WorktreeArchiveService } from "../app-server/worktree-archive-service";
 import { FakeAcpAgentTransport } from "../acp/testing/fake-acp-agent";
 import type { AcpTransportFactory } from "../app-server/acp-backend-adapter";
-import { AcpSessionStore } from "../acp/acp-session-store";
+import type { AppServerThreadSummary, PwrAgentThreadOrchestrationRequest, PwrAgentThreadOrchestrationResponse } from "@pwragent/shared";
+import type { ArchiveCleanupContext } from "../app-server/archive-cleanup-queue";
+import type { MaintenanceDiscoveryProgress } from "../app-server/unreferenced-worktrees";
+import { AcpSessionStore } from "../storage/acp-session-store";
 import { ArchiveWorktreeTransport, type ArchiveWorktreeThread } from "./fixtures/archive-worktree-transport";
 
 vi.mock("../log", () => ({ getMainLogger: () => ({ debug() {}, info() {}, warn() {}, error() {} }) }));
@@ -68,11 +71,13 @@ async function createFixture(managed: boolean | "claude" = false) {
   const { dbPath, tempDir } = createTempStateDb("pwragent-archive-restart-db-");
   roots.push(tempDir);
   const claudeStore = new ClaudeSessionStore(path.join(root, "claude"));
-  const reopen = (workspace = directory, checkpoint = false, createAcpTransport?: AcpTransportFactory) => {
+  const reopen = (workspace = directory, checkpoint = false, createAcpTransport?: AcpTransportFactory,
+    extraWorkspaces: Array<typeof directory> = []) => {
     const db = StateDb.open(dbPath);
     databases.push(db);
     const store = new SqliteOverlayStore(db);
-    const client = new CodexAppServerClient({ directoryResolver: async (cwd) => cwd === workspace.worktreePath ? [workspace] : [] });
+    const client = new CodexAppServerClient({ directoryResolver: async (cwd) =>
+      [workspace, ...extraWorkspaces].filter((row) => row.worktreePath === cwd) });
     const acpAgentStore = new AcpAgentStore(db);
     const acpSessionStore = new AcpSessionStore(db);
     const registry = new DesktopBackendRegistry({ codexClient: client, overlayStore: store, messagingStore: null, threadTitleGenerationService: null,
@@ -80,7 +85,8 @@ async function createFixture(managed: boolean | "claude" = false) {
       archiveCleanupCheckpointStore: checkpoint ? new ArchiveCleanupCheckpointStore(db.raw, { processAlive: () => false }) : null,
       claudeBackendOptions: { store: claudeStore },
       acpAgentStore, acpSessionStore, createAcpTransport, discoverLocalAcpAgents: async () => [],
-      acpWorktreeRepositoryResolver: async (cwd) => cwd === worktree ? directory : undefined });
+      acpWorktreeRepositoryResolver: async (cwd) => cwd === worktree ? directory : undefined,
+      managedWorktreeRoots: async () => [path.join(root, ".pwragent", "worktrees")] });
     registries.push(registry);
     return { db, store, client, registry, acpAgentStore, acpSessionStore };
   };
@@ -132,6 +138,38 @@ class ArchiveAcpTransport extends FakeAcpAgentTransport {
     return result;
   }
 }
+
+describe("current-profile worktree registration across providers", () => {
+  it.each(["claude", "acp:fixture"] as const)("registers an archived %s owner's outside checkout without changing its external marker", async (backend) => {
+    const fixture = await createFixture();
+    const instance = fixture.reopen();
+    const owner = { backend, threadId: backend === "claude" ? "11111111-1111-4111-8111-111111111111" : acpOwner.threadId };
+    if (backend === "claude") {
+      await fixture.claudeStore.save({ cwd: fixture.worktree, thread: {
+        id: owner.threadId, source: "claude", title: "Registration fixture", titleSource: "explicit",
+        linkedDirectories: [fixture.directory], updatedAt: 1, archivedAt: 1,
+      } });
+    } else seedAcpOwner(instance, fixture.worktree, true);
+    await instance.store.replaceWorkspaceLinkedDirectory({ ...owner,
+      directory: { ...fixture.directory, worktreeOwnership: "external" } });
+    const internal = instance.registry as unknown as {
+      isLiveDynamicToolCall: () => boolean;
+      requestThreadMaintenanceConfirmation: () => Promise<boolean>;
+      handleThreadOrchestrationRequest: (request: PwrAgentThreadOrchestrationRequest) => Promise<PwrAgentThreadOrchestrationResponse>;
+    };
+    vi.spyOn(internal, "isLiveDynamicToolCall").mockReturnValue(true);
+    vi.spyOn(internal, "requestThreadMaintenanceConfirmation").mockResolvedValue(true);
+    expect(await internal.handleThreadOrchestrationRequest({ operation: "register_thread_worktree",
+      context: { backend: "codex", threadId: "operator-agent", turnId: "registration" },
+      args: { ...owner, worktreePath: fixture.worktree },
+    })).toMatchObject({ ok: true, data: { ...owner, registered: true } });
+    const candidate = (await instance.registry.listAutoArchiveCandidates()).find((item) => item.thread.source === backend && item.thread.id === owner.threadId);
+    expect(candidate?.managedWorktreePath).toBe(fixture.worktree);
+    expect((await instance.registry.auditArchivedCheckouts()).candidates).toContainEqual({ ...owner, worktreePath: fixture.worktree });
+    expect((await instance.store.getThreadOverlayState(owner))?.extraLinkedDirectories[0]?.worktreeOwnership).toBe("external");
+    expect(await readFile(path.join(fixture.worktree, "file.txt"), "utf8")).toBe("original\n");
+  });
+});
 
 describe("ACP snapshot archive and restoration", () => {
   it("preserves archive metadata when an earlier replay read resumes between cleanup inventories", async () => {
@@ -307,7 +345,7 @@ describe("ACP snapshot archive and restoration", () => {
   });
 
   it.each(["primary", "external", "active owner", "unknown capability", "no load", "rebind"])("retains protected ACP checkouts (%s)", async (scenario) => {
-    const fixture = await createFixture("claude");
+    const fixture = await createFixture(scenario === "external" ? false : "claude");
     const instance = fixture.reopen();
     const cwd = scenario === "primary" ? fixture.repo : fixture.worktree;
     seedAcpOwner(instance, cwd);
@@ -324,6 +362,20 @@ describe("ACP snapshot archive and restoration", () => {
     expect(result.cleanup.every((item) => !item.removedWorktree)).toBe(true);
     expect((await stat(cwd)).isDirectory()).toBe(true);
     expect((await instance.store.getThreadOverlayState(acpOwner))?.worktreeSnapshots ?? []).toHaveLength(0);
+  });
+
+  it("snapshots and restores an attached ACP checkout inside the managed root despite its external marker", async () => {
+    const fixture = await createFixture("claude");
+    const instance = fixture.reopen(fixture.directory, false, () => new ArchiveAcpTransport());
+    seedAcpOwner(instance, fixture.worktree);
+    await instance.store.addLinkedDirectory({ ...acpOwner, directory: { ...fixture.directory, worktreeOwnership: "external" } });
+    await writeFile(path.join(fixture.worktree, "file.txt"), "saved managed checkout work\n");
+    const result = await instance.registry.archiveThread(acpOwner);
+    expect(result.cleanup.some((item) => item.removedWorktree)).toBe(true);
+    await expect(stat(fixture.worktree)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(instance.acpSessionStore.getSession(acpOwner.backend, acpOwner.threadId)?.archivedAt).toBeDefined();
+    await instance.registry.restoreThread(acpOwner);
+    expect(await readFile(path.join(fixture.worktree, "file.txt"), "utf8")).toBe("saved managed checkout work\n");
   });
 
   it.each(["checkout", "load", "unsupported", "unadvertised", "partial"])("keeps the session archived and recovery available on %s failure", async (failure) => {
@@ -403,6 +455,133 @@ describe("ACP snapshot archive and restoration", () => {
     expect(await readFile(path.join(fixture.worktree, "file.txt"), "utf8")).toBe("shared dirty edit\n");
     expect(await readFile(path.join(fixture.worktree, "later.txt"), "utf8")).toBe("later shared edit");
   });
+});
+
+describe("checkouts no thread refers to", () => {
+  it.each([
+    { selections: [[0], [0]] },
+    { selections: [[0], [0], [0]] },
+    { selections: [[0, 1], [1, 0]] },
+  ])("refuses every unattributed removal across overlapping requests: $selections", async ({ selections }) => {
+    const fixture = await createFixture("claude");
+    const checkouts = Array.from({ length: Math.max(...selections.flat()) + 1 }, (_, index) =>
+      path.join(fixture.root, ".pwragent", "worktrees", `spare-${index}`, "repo"));
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    for (const [index, checkout] of checkouts.entries()) {
+      await fixture.git(fixture.repo, ["worktree", "add", "-b", `spare-${index}`, checkout]);
+      await writeFile(path.join(checkout, "notes.txt"), `checkout ${index}\n`);
+      await utimes(path.join(checkout, ".git"), twoHoursAgo, twoHoursAgo);
+    }
+    const { registry } = fixture.reopen();
+    const result = await Promise.all(selections.map(async (selection) =>
+      await registry.removeUnreferencedCheckouts(selection.map((index) => checkouts[index]!))));
+    expect(result.flatMap((row) => row.failed)).toEqual([]);
+    expect(result.flatMap((row) => row.removed)).toEqual([]);
+    expect(result.flatMap((row) => row.kept)).toHaveLength(selections.flat().length);
+    expect(result.flatMap((row) => row.kept).every((row) => row.reason === "No identified thread owns this checkout")).toBe(true);
+    // A refusal needs no provider inventory or snapshot mutation.
+    expect(ArchiveWorktreeTransport.requests.filter((request) => request.method === "thread/list")).toHaveLength(0);
+    const registrations = await fixture.git(fixture.repo, ["worktree", "list", "--porcelain"]);
+    expect((await fixture.git(fixture.repo, ["for-each-ref", "--format=%(refname)", "refs/pwragent/snapshots/"])).trim()).toBe("");
+    for (const [index, checkout] of checkouts.entries()) {
+      expect(registrations).toContain(checkout.replaceAll("\\", "/"));
+      expect(await readFile(path.join(checkout, "notes.txt"), "utf8")).toBe(`checkout ${index}\n`);
+    }
+  });
+
+  // Ownership is independent of physical location: a profile not queried
+  // could own any registered checkout. Git verifies that it stays intact.
+  it("identifies every known provider owner of a kept checkout without inferring owners for unknown paths", async () => {
+    const fixture = await createSharedArchiveFixture("codex", false);
+    ArchiveWorktreeTransport.threads[0]!.name = "Investigate widget layout";
+    const { registry } = fixture.reopen();
+    const audit = await registry.auditArchivedCheckouts();
+    const owners = audit.inventory?.owners?.find((row) => row.path === fixture.worktree)?.threads ?? [];
+    // Both providers intentionally use the same thread id: identity is not
+    // a title or a path, and must include the provider that owns it.
+    expect(owners.map((owner) => ({ backend: owner.backend, threadId: owner.threadId })).sort((a, b) => a.backend.localeCompare(b.backend)))
+      .toEqual([...fixture.owners].sort((a, b) => a.backend.localeCompare(b.backend)));
+    expect(owners.find((owner) => owner.backend === "codex")?.title).toBe("Investigate widget layout");
+    expect(owners.find((owner) => owner.backend === "claude")?.title).toBe("Shared archive fixture");
+    expect(audit.candidates).toEqual([]);
+    expect(await stat(fixture.worktree)).toBeDefined();
+  });
+
+  it("limits maintenance inventory to identified thread checkouts and never offers a spare folder for removal", async () => {
+    const fixture = await createSharedArchiveFixture("codex", false);
+    const spare = path.join(fixture.root, ".pwragent", "worktrees", "spare", "repo");
+    await fixture.git(fixture.repo, ["worktree", "add", "-b", "spare", spare]);
+    const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    await utimes(path.join(spare, ".git"), old, old);
+    const { registry } = fixture.reopen();
+    const audit = await registry.auditArchivedCheckouts();
+    expect(audit.inventory!.paths).toEqual([fixture.worktree]);
+    expect(audit.unreferenced).toEqual([]);
+    expect(await registry.removeUnreferencedCheckouts([spare])).toEqual({ removed: [], failed: [],
+      kept: [{ worktreePath: spare, reason: "No identified thread owns this checkout" }] });
+    expect(await stat(spare)).toBeDefined();
+  });
+
+
+});
+
+it("checks archived owners concurrently with bounded work, ordered results and batch pacing", async () => {
+  const fixture = await createFixture("claude");
+  const { registry } = fixture.reopen();
+  const threads: AppServerThreadSummary[] = Array.from({ length: 13 }, (_, index) => ({
+    id: String(index), source: "claude", title: String(index), titleSource: "explicit",
+    linkedDirectories: [{ ...fixture.directory, worktreePath: path.join(fixture.root, `audit-${index}`) }],
+  }));
+  await Promise.all(threads.map((thread) => mkdir(thread.linkedDirectories[0]!.worktreePath!)));
+  type Ownership = { users: AppServerThreadSummary[]; external: boolean };
+  const boundary = registry as unknown as {
+    readPacedArchiveCleanupInventory: () => Promise<{ activeThreads: AppServerThreadSummary[]; archivedThreads: AppServerThreadSummary[] }>;
+    maintenanceThreadWorkspace: (thread: AppServerThreadSummary) => Promise<AppServerThreadSummary>;
+    readCanonicalArchiveOwnership: (_inventory: unknown, target: string) => Promise<Ownership>;
+    describeMaintenanceCheckoutInventory: () => Promise<void>;
+    archiveCleanupQueue: { enqueue: (_key: string, work: (context: ArchiveCleanupContext) => Promise<unknown>) => Promise<unknown> };
+  };
+  vi.spyOn(boundary, "readPacedArchiveCleanupInventory").mockResolvedValue({ activeThreads: [], archivedThreads: threads });
+  vi.spyOn(boundary, "maintenanceThreadWorkspace").mockImplementation(async (thread) => thread);
+  vi.spyOn(boundary, "describeMaintenanceCheckoutInventory").mockResolvedValue();
+  const checkpoint = vi.fn(async () => {});
+  vi.spyOn(boundary.archiveCleanupQueue, "enqueue").mockImplementation(async (_key, work) => await work({
+    checkpoint, assertCurrent() {}, settleCheckpoint: async () => {},
+  }));
+  let active = 0, peak = 0, completed = 0, drain = false;
+  const pending: (() => void)[] = [];
+  vi.spyOn(boundary, "readCanonicalArchiveOwnership").mockImplementation(async (_inventory, target) => {
+    active += 1; peak = Math.max(peak, active);
+    try {
+      if (!drain) await new Promise<void>((resolve) => pending.push(resolve));
+      const index = Number(path.basename(target).slice("audit-".length));
+      if (index % 3 === 2) throw new Error("Fixture unreadable checkout");
+      return { users: index % 3 === 1 ? [threads[index]!] : [], external: false };
+    } finally { active -= 1; completed += 1; }
+  });
+  const progress: MaintenanceDiscoveryProgress[] = [];
+  const audit = registry.auditArchivedCheckouts((update) => progress.push(update));
+  try {
+    // The model holds six independent reads in flight, then completes each
+    // wave backwards. Eligibility and scan order must be timing-independent.
+    while (completed < threads.length) {
+      const before = completed;
+      const expected = Math.min(6, threads.length - completed);
+      await vi.waitFor(() => expect(pending).toHaveLength(expected));
+      for (const release of pending.splice(0).reverse()) release();
+      await vi.waitFor(() => expect(completed).toBe(before + expected));
+    }
+    const result = await audit;
+    expect(peak).toBe(6);
+    expect(active).toBe(0);
+    expect(result.candidates.map((row) => row.threadId)).toEqual(threads.filter((_, index) => index % 3 === 0).map((row) => row.id));
+    expect(checkpoint).toHaveBeenCalledTimes(3);
+    expect(progress.some((row) => row.detail?.includes("13/13 checked"))).toBe(true);
+  } finally {
+    drain = true;
+    for (const release of pending.splice(0)) release();
+    await audit;
+  }
 });
 
 describe("archive worktrees across a desktop restart", () => {
@@ -882,6 +1061,61 @@ describe("archive worktrees across a desktop restart", () => {
     expect(result.cleanup[0]?.removedWorktree).toBe(false);
     expect(activeReads).toBe(2);
     expect((await stat(fixture.worktree)).isDirectory()).toBe(true);
+  });
+
+  it("keeps an orphaned checkout whose repository is gone, as a skip, and still cleans the next one", async () => {
+    const fixture = await createFixture();
+    const goneRepo = path.join(fixture.root, "gone-repo");
+    const orphan = path.join(fixture.root, "orphan");
+    await mkdir(goneRepo);
+    await fixture.git(goneRepo, ["init", "-b", "main"]);
+    await writeFile(path.join(goneRepo, "file.txt"), "gone\n");
+    await fixture.git(goneRepo, ["add", "file.txt"]);
+    await fixture.git(goneRepo, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "-c", "commit.gpgsign=false", "commit", "-m", "gone"]);
+    await fixture.git(goneRepo, ["worktree", "add", "-b", "orphan", orphan]);
+    await rm(goneRepo, { recursive: true, force: true });
+    const orphanDirectory = { id: "orphan", kind: "worktree" as const, label: "gone-repo", path: goneRepo, worktreePath: orphan };
+    ArchiveWorktreeTransport.threads = [
+      { id: "orphan-owner", cwd: orphan, source: "cli", archived: true },
+      { id: "old-target", cwd: fixture.worktree, source: "cli", archived: true },
+    ];
+    const instance = fixture.reopen(fixture.directory, false, undefined, [orphanDirectory]);
+    const result = await instance.registry.repairArchivedThreadWorktrees();
+    expect(result.cleanup).toEqual(expect.arrayContaining([
+      expect.objectContaining({ worktreePath: orphan, removedWorktree: false,
+        skippedReason: "Its repository no longer exists; the checkout was kept." }),
+      expect.objectContaining({ worktreePath: fixture.worktree, removedWorktree: true }),
+    ]));
+    expect(result.cleanup.filter((item) => item.error)).toEqual([]);
+    expect((await stat(orphan)).isDirectory()).toBe(true);
+  });
+
+  it("records a discovery failure for one checkout and still cleans the others", async () => {
+    const fixture = await createFixture();
+    const second = path.join(fixture.root, "second");
+    await fixture.git(fixture.repo, ["worktree", "add", "-b", "second", second]);
+    const secondDirectory = { ...fixture.directory, id: "second", worktreePath: second };
+    ArchiveWorktreeTransport.threads = [
+      { id: "broken-owner", cwd: second, source: "cli", archived: true },
+      { id: "old-target", cwd: fixture.worktree, source: "cli", archived: true },
+    ];
+    const instance = fixture.reopen(fixture.directory, false, undefined, [secondDirectory]);
+    const registry = instance.registry as unknown as { archivedAcpWorktreeBlocker: (worktreePath: string, inventory: unknown) => string | undefined };
+    const original = registry.archivedAcpWorktreeBlocker.bind(registry);
+    let thrown = false;
+    vi.spyOn(registry, "archivedAcpWorktreeBlocker").mockImplementation((worktreePath, inventory) => {
+      if (!thrown && worktreePath === second) {
+        thrown = true;
+        throw new Error("EACCES: permission denied");
+      }
+      return original(worktreePath, inventory);
+    });
+    const result = await instance.registry.repairArchivedThreadWorktrees();
+    expect(result.cleanup).toEqual(expect.arrayContaining([
+      expect.objectContaining({ worktreePath: second, removedWorktree: false, error: "EACCES: permission denied" }),
+      expect.objectContaining({ worktreePath: fixture.worktree, removedWorktree: true }),
+    ]));
+    expect((await stat(second)).isDirectory()).toBe(true);
   });
 
   it("does not remove the primary checkout or invent a snapshot for an absent worktree", async () => {

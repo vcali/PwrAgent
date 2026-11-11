@@ -5,7 +5,7 @@ import { copyFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./fixtures/electron-test";
 import { launchElectronApp } from "./fixtures/electron-app";
 
 const specDir = path.dirname(fileURLToPath(import.meta.url));
@@ -115,7 +115,9 @@ ${rtcProbePage(stunPort)}
 </body></html>`);
   await writeFile(path.join(siteDir, "appendix.html"), "<h1 id=\"appendix\">Appendix</h1>");
 
-  const text = `The brief is ready: [brief.html](${briefPath}).`;
+  // A Markdown link destination treats `\` before punctuation as an escape,
+  // so a Windows path such as `D:\a\_temp\…` would lose that backslash.
+  const text = `The brief is ready: [brief.html](${briefPath.replaceAll("\\", "\\\\")}).`;
   const fixturePath = path.join(rootDir, "html-file-preview.fixture.json");
   await writeFile(fixturePath, JSON.stringify({
     metadata: { backend: "codex", scenario: "html-file-preview" },

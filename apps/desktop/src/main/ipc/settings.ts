@@ -1,6 +1,6 @@
 import { codexAuthState } from "../codex-auth-state";
 import { registerReceivingFolderIpc } from "./receiving-folder";
-import { CodexAppServerClient } from "../codex-app-server/client";
+import { CodexAppServerClient } from "../codex-app-server/desktop-client";
 import { validateGlabCommand } from "../settings/glab-discovery";
 import { validateCodexModelProviders } from "@pwragent/shared";
 import { CodexModelProviderCatalog } from "../app-server/codex-model-provider-catalog";
@@ -50,6 +50,8 @@ import type {
   InspectCodeSignaturesResponse,
   PickGhCommandResponse,
   PickGitCommandResponse,
+  ManagedGitActionRequest,
+  ManagedGitActionResponse,
   RefreshDesktopCodexDiscoveryRequest,
   SetCodexModelProviderApiKeyRequest,
   SetCodexModelProviderApiKeyResponse,
@@ -115,6 +117,7 @@ import {
   SETTINGS_START_CODEX_AUTH_PROFILE_LOGIN_CHANNEL,
   SETTINGS_TEST_CREDENTIALS_CHANNEL,
   SETTINGS_WRITE_CONFIG_CHANNEL,
+  SETTINGS_MANAGED_GIT_ACTION_CHANNEL,
 } from "../../shared/ipc";
 import type { ManagedRuntimeProgress } from "../../shared/managed-runtime-progress";
 import { readManagedRuntimeProgress } from "../managed-runtime-progress";
@@ -166,7 +169,7 @@ import { isSafeExternalOpenUrl, isSlackAppDeepLink } from "../external-url-polic
 import { getMainLogger } from "../log";
 import { timeStartupProfileOperation } from "../diagnostics/startup-profile-events";
 import { BUILT_IN_ACP_STRATEGIES, type AcpAgentStrategy } from "@pwrdrvr/agent-acp";
-import { AcpAgentStore } from "../acp/acp-agent-store";
+import { AcpAgentService } from "../acp/acp-agent-service";
 import { isBannedAcpRegistryId } from "../acp/acp-agent-allowlist";
 import { discoverLocalAcpAgentRecords } from "../acp/acp-instance-discovery";
 import {
@@ -193,7 +196,6 @@ import type {
   AcpRegistryDistribution,
   AcpRegistrySnapshot,
 } from "../acp/acp-registry-types";
-import { getAppStateDb } from "../state/app-state";
 import { resolveWindowsCodexLaunchCommand } from "../codex-windows-launch";
 import { normalizeProfileName } from "../profile";
 
@@ -421,7 +423,7 @@ async function listAcpAgentSettingsImpl(
   permit?: ProviderDiscoveryPermit,
   progress?: ProviderCatalogRefreshProgress,
 ): Promise<ListAcpAgentSettingsResponse> {
-  const store = new AcpAgentStore(getAppStateDb());
+  const store = new AcpAgentService();
   const settingsService = getService(service);
   const registryService = new AcpRegistryService();
   let snapshot: AcpRegistrySnapshot | undefined;
@@ -741,7 +743,7 @@ async function probeInstalledAcpAgent(
 }
 
 async function listInstalledAndLocalAcpAgents(
-  store: AcpAgentStore,
+  store: AcpAgentService,
   options?: {
     permit?: ProviderDiscoveryPermit;
     providers?: ReturnType<DesktopSettingsService["readProvidersConfig"]>;
@@ -1678,7 +1680,7 @@ export function registerSettingsIpcHandlers(
       _event,
       request: AcknowledgeAcpAgentUpdateRequest,
     ): Promise<AcknowledgeAcpAgentUpdateResponse> => {
-      const store = new AcpAgentStore(getAppStateDb());
+      const store = new AcpAgentService();
       const record = isAcpBackendId(request.backendId)
         ? store.getInstalledAgent(request.backendId)
         : undefined;
@@ -1785,6 +1787,12 @@ export function registerSettingsIpcHandlers(
       request: WriteDesktopSettingsConfigRequest,
     ): Promise<DesktopSettingsWriteResponse> => {
       const activeService = getService(service);
+      // A downloaded Git is chosen only through the managed-Git action,
+      // which verifies the release first.
+      if (request.patch.applications?.git) {
+        delete request.patch.applications.git.managed;
+        delete request.patch.applications.git.managedPrevious;
+      }
       const previousProviderDefaults = request.patch.models?.providerDefaults !== undefined
         ? activeService.resolveProviderModelDefaults()
         : undefined;
@@ -2135,6 +2143,18 @@ export function registerSettingsIpcHandlers(
         await getService(service).refreshGitDiscovery(),
       ),
     }),
+  );
+
+  ipcMain.removeHandler(SETTINGS_MANAGED_GIT_ACTION_CHANNEL);
+  ipcMain.handle(
+    SETTINGS_MANAGED_GIT_ACTION_CHANNEL,
+    async (_event, request: ManagedGitActionRequest): Promise<ManagedGitActionResponse> => {
+      const { snapshot, error } = await getService(service).managedGitAction(request);
+      return {
+        snapshot: applyRuntimeMessagingSnapshot(snapshot),
+        ...(error ? { error } : {}),
+      };
+    },
   );
 
   ipcMain.removeHandler(SETTINGS_INSPECT_CODE_SIGNATURES_CHANNEL);

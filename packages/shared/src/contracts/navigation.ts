@@ -14,6 +14,7 @@ import type {
   AppServerThreadReviewEntry,
   AppServerThreadStatus,
   AppServerThreadSummary,
+  AppServerThreadTitleSource,
   CodexEnvironmentAction,
   CodexEnvironmentExecutionTarget,
   CodexThreadEnvironmentRuntime,
@@ -272,6 +273,10 @@ export type NavigationThreadSummary = AppServerThreadSummary & {
   reactions?: string[];
   /** Present while the thread is locked against new turns. */
   lock?: ThreadLock;
+  /** The thread's worktree checkout is hibernated; the next send restores it. */
+  checkoutHibernated?: boolean;
+  /** The operator exempted this thread's checkout from hibernation. */
+  keepCheckoutAwake?: boolean;
   /** Pull requests known for this thread's linked directories + branch history. */
   prs?: PrSummary[];
   /** Codex environments discovered from the active thread workspace. */
@@ -2159,6 +2164,8 @@ export type NavigationRow = {
   reactions?: string[];
   reactionsTruncated?: boolean;
   lock?: ThreadLock;
+  checkoutHibernated?: boolean;
+  keepCheckoutAwake?: boolean;
   prs?: PrSummary[];
   prsTruncated?: boolean;
   messagingBindings?: MessagingThreadBindingSummary[];
@@ -2216,6 +2223,10 @@ export type NavigationDirectoryRow = {
   counts: NavigationCounts;
   pinnedRootCount: number;
   unpinnedRootCount: number;
+  /** Ordinary threads under unpinned directory roots, including all descendants.
+   * Absent on older serving instances; independent of pagination/disclosure.
+   */
+  unpinnedThreadCount?: number;
   latestUpdatedAt?: number;
   pinnedRank?: string;
   directoryThreadsCollapsed?: boolean;
@@ -2304,12 +2315,19 @@ export type NavigationQuery =
       /** Parent rows whose children are explicitly disclosed by the viewer. */
       disclosedParentThreadKeys?: string[];
     }
-  | { kind: "children"; parent: NavigationIdentity }
+  | {
+      kind: "children";
+      parent: NavigationIdentity;
+      /** Directories only: both parent and children must belong to this serving inventory's project. */
+      directoryKey?: string;
+    }
   | { kind: "group-members"; roots: NavigationIdentity[] }
   | {
       kind: "exact";
       identities: NavigationIdentity[];
       includeAncestry?: boolean;
+      /** Single-thread selection in Directories stops ancestry at that thread's home project. */
+      ancestryScope?: "directory";
       /**
        * Viewer inventory only, and never sent to a peer: include each peer
        * identity's row as held by this machine's peer summary cache, which
@@ -2384,6 +2402,8 @@ export type NavigationQueryEntry = {
   row: NavigationRow;
   /** Opaque within this query generation; compare only inside this page set. */
   orderKey: string;
+  /** Exact owner reads: position in the native parent's complete ordinary-child order, before batching. */
+  siblingOrder?: number;
   /** Owner/view-local turn rank. Never compare ranks from different owners. */
   attentionRank?: number;
   placement: NavigationQueryPlacement;
@@ -2627,6 +2647,31 @@ export type SetThreadLockResponse = {
   lock?: ThreadLock;
   /** The lock an unlock removed, so a caller can put it back. */
   previousLock?: ThreadLock;
+};
+
+/**
+ * Brings a hibernated checkout back now, or sets whether the thread is kept
+ * awake. Keeping it awake also restores a hibernated checkout. Runs on the
+ * thread's owner.
+ */
+export type SetThreadCheckoutHibernationRequest = {
+  backend?: AppServerBackendKind;
+  federationTarget?: FederationTarget;
+  threadId: ThreadIdentifier;
+  /** Restore the hibernated checkout now. */
+  restore?: boolean;
+  /** Exempt the thread from hibernation, or end the exemption. Omitted leaves it. */
+  keepAwake?: boolean;
+};
+
+export type SetThreadCheckoutHibernationResponse = {
+  backend: AppServerBackendKind;
+  threadId: ThreadIdentifier;
+  keepAwake: boolean;
+  /** The checkout is still hibernated, for example after a refused restore. */
+  hibernated: boolean;
+  /** Why the restore was refused. The missing-worktree card takes over. */
+  restoreError?: string;
 };
 
 /**
@@ -2920,6 +2965,8 @@ export type SetSubthreadsCollapsedResponse = {
  * be pinned).
  */
 export type SetDirectoryPinRequest = {
+  /** A remote-viewer window edits the selected owner's pins. */
+  federationTarget?: FederationTarget;
   directoryKey: string;
   /** Rank within the pinned section. Null/undefined removes the pin. */
   pinnedRank?: string | null;
@@ -2933,6 +2980,8 @@ export type SetDirectoryPinResponse = {
 };
 
 export type ReorderDirectoryPinsRequest = {
+  /** A remote-viewer window edits the selected owner's complete pin order. */
+  federationTarget?: FederationTarget;
   /** Complete pinned order, first item at the top. */
   directoryKeys?: string[];
   /** Owner-revalidated move preserving every unloaded pin. Exclusive with directoryKeys. */
@@ -3196,6 +3245,18 @@ export type DirectoryOverlayState = {
   forgeAutomation?: ProjectForgeAutomation;
 };
 
+/** Operator authorization for one existing linked checkout, never inferred
+ * from a provider cwd, PR link, or repository trust. Identity changes revoke it. */
+export type ThreadWorktreeRegistration = {
+  worktreePath: string;
+  gitDirectory: string;
+  commonDirectory: string;
+  checkoutIdentity: string;
+  gitDirectoryIdentity: string;
+  authorizedAt: number;
+  requestedBy: { backend: AppServerBackendKind; threadId: string };
+};
+
 export type ThreadOverlayState = {
   /** Absent follows the profile default. */
   monitorJobSuggestionsEnabled?: boolean;
@@ -3203,6 +3264,11 @@ export type ThreadOverlayState = {
   monitorJobSuggestionTurnId?: string;
   backend: AppServerBackendKind;
   threadId: ThreadIdentifier;
+  /** Canonical owner title, retained in compact navigation overlays. */
+  title?: string;
+  titleSource?: AppServerThreadTitleSource;
+  /** Native name acknowledged by the owner; a later provider rename supersedes it. */
+  titleNativeName?: string;
   agent?: ThreadAgentMetadata;
   queuedAgentChange?: {
     agent: NavigationLaunchpadAgent | null;
@@ -3217,6 +3283,9 @@ export type ThreadOverlayState = {
    * sensitive thread wants a way to opt out without touching Settings.
    */
   tokenMiserEnabled?: boolean;
+  /** The operator exempted this thread's checkout from idle hibernation,
+   * until they turn it back off. */
+  keepCheckoutAwake?: boolean;
   executionMode?: ThreadExecutionMode;
   /**
    * Timestamp of the source that last established `executionMode`.
@@ -3276,6 +3345,7 @@ export type ThreadOverlayState = {
   archiveRetentionStartedAt?: number;
   retainedBranchDriftPairs?: ThreadBranchDriftPair[];
   extraLinkedDirectories: LinkedDirectorySummary[];
+  worktreeRegistrations?: ThreadWorktreeRegistration[];
   /**
    * Worktrees this thread created and then left with a fresh-start move.
    * They stay on disk and are not the thread's workspace. Only thread

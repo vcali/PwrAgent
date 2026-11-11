@@ -201,6 +201,26 @@ function directoryMemberThreads(
     .filter((thread): thread is NavigationThreadSummary => Boolean(thread)) ?? [];
 }
 
+function queryDirectory(params: {
+  query: NavigationQueryRequest["query"];
+  index: NavigationQueryIndex;
+  threadsByLegacyKey: ReadonlyMap<string, NavigationThreadSummary>;
+}): NavigationDirectorySummary | undefined {
+  const { query } = params;
+  if (query.kind === "directory" || query.kind === "children") {
+    return params.index.directories.find((directory) => directory.key === query.directoryKey);
+  }
+  if (query.kind === "exact" && query.ancestryScope === "directory") {
+    if (query.identities.length !== 1) throw new Error("Directory-scoped ancestry requires exactly one thread identity.");
+    const key = identityKey(query.identities[0]!);
+    return params.index.directories.find((directory) => directory.threadKeys.some((member) => {
+      const thread = params.threadsByLegacyKey.get(member);
+      return thread && threadKey(thread) === key;
+    }));
+  }
+  return undefined;
+}
+
 function isActive(thread: NavigationThreadSummary): boolean {
   return thread.threadStatus === "active"
     || thread.hasActiveSubAgent === true
@@ -350,6 +370,8 @@ function projectNavigationRow(params: {
     ...(reactions.items ? { reactions: reactions.items } : {}),
     ...(reactions.truncated ? { reactionsTruncated: true } : {}),
     ...(thread.lock ? { lock: thread.lock } : {}),
+    ...(thread.checkoutHibernated ? { checkoutHibernated: true } : {}),
+    ...(thread.keepCheckoutAwake ? { keepCheckoutAwake: true } : {}),
     ...(prs.items ? { prs: prs.items } : {}),
     ...(prs.truncated ? { prsTruncated: true } : {}),
     ...(messagingBindings.items
@@ -438,8 +460,33 @@ function buildDirectoryRows(params: {
   return params.snapshot.directories.map((directory) => {
     const memberThreads = directoryMemberThreads(directory, params.threadsByLegacyKey);
     const parentOf = directoryParentResolver(memberThreads, params.parentCandidates);
-    const rootThreads = memberThreads.filter((thread) => !parentOf(thread));
+    const rootThreads: NavigationThreadSummary[] = [];
+    const children = new Map<string, NavigationThreadSummary[]>();
+    for (const thread of memberThreads) {
+      const parent = parentOf(thread);
+      if (!parent) {
+        rootThreads.push(thread);
+      } else {
+        const key = identityKey(parent);
+        const siblings = children.get(key) ?? [];
+        siblings.push(thread);
+        children.set(key, siblings);
+      }
+    }
     const pinnedRootCount = rootThreads.filter((thread) => thread.pinnedRank).length;
+    // Count the complete unpinned forest once, without loading child pages.
+    // A child's own pin does not move it out of its root's section.
+    const pending = rootThreads.filter((thread) => !thread.pinnedRank);
+    const visited = new Set<string>();
+    let unpinnedThreadCount = 0;
+    while (pending.length) {
+      const thread = pending.pop()!;
+      const key = threadKey(thread);
+      if (visited.has(key)) continue;
+      visited.add(key);
+      if (isOrdinaryThread(thread)) unpinnedThreadCount += 1;
+      for (const child of children.get(key) ?? []) pending.push(child);
+    }
     const gitStatus = projectDirectoryGitStatus(directory);
     // A checkout reads its own remotes; a placeholder carries the peer's.
     const repositoryKey = directory.gitStatus?.originRepository ?? directory.repositoryKey;
@@ -459,6 +506,7 @@ function buildDirectoryRows(params: {
       counts: countsForThreads(memberThreads),
       pinnedRootCount,
       unpinnedRootCount: rootThreads.length - pinnedRootCount,
+      unpinnedThreadCount,
       ...(directory.latestUpdatedAt !== undefined
         ? { latestUpdatedAt: directory.latestUpdatedAt }
         : {}),
@@ -807,7 +855,12 @@ function selectQueryThreads(params: {
   }
   if (query.kind === "children") {
     const parentThread = params.threadsByIdentity.get(identityKey(query.parent));
+    const members = query.directoryKey === undefined ? undefined : new Set(directoryMemberThreads(
+      params.index.directories.find((directory) => directory.key === query.directoryKey), params.threadsByLegacyKey,
+    ));
+    if (members && (!parentThread || !members.has(parentThread))) return [];
     const children = ordinaryThreads.filter((thread) => {
+      if (members && !members.has(thread)) return false;
       const parent = parentIdentity(thread, params.parentCandidates);
       return parent && identityKey(parent) === identityKey(query.parent);
     });
@@ -822,11 +875,14 @@ function selectQueryThreads(params: {
 
   const selected = new Map<string, NavigationThreadSummary>();
   const visiting = new Set<string>();
+  const directory = queryDirectory(params);
+  const parentOf = query.ancestryScope === "directory"
+    ? directoryParentResolver(directoryMemberThreads(directory, params.threadsByLegacyKey), params.parentCandidates) : undefined;
   const addWithAncestry = (thread: NavigationThreadSummary): void => {
     const key = threadKey(thread);
     if (selected.has(key) || visiting.has(key)) return;
     visiting.add(key);
-    const parent = parentIdentity(thread, params.parentCandidates);
+    const parent = parentOf ? parentOf(thread) : parentIdentity(thread, params.parentCandidates);
     if (query.includeAncestry && parent) {
       const parentThread = params.threadsByIdentity.get(identityKey(parent));
       if (parentThread) addWithAncestry(parentThread);
@@ -979,9 +1035,15 @@ export function projectNavigationQuery(params: {
   const repositories = repositoryIdentitiesByPath(params.index);
   const childCountByParent = new Map<string, number>();
   const viewerChildCountByParent = new Map<string, number>();
+  const scopedDirectory = queryDirectory({ query, index: params.index, threadsByLegacyKey });
+  const scopedMembers = scopedDirectory ? new Set(directoryMemberThreads(scopedDirectory, threadsByLegacyKey)) : undefined;
   for (const thread of params.index.threads) {
     const parent = parentIdentity(thread, parentCandidates);
     if (!parent || !isOrdinaryThread(thread)) continue;
+    if (scopedMembers) {
+      const parentThread = threadsByIdentity.get(identityKey(parent));
+      if (!scopedMembers.has(thread) || !parentThread || !scopedMembers.has(parentThread)) continue;
+    }
     const key = identityKey(parent);
     childCountByParent.set(key, (childCountByParent.get(key) ?? 0) + 1);
     if (parent.ownerInstanceId && navigationIdentity(thread).ownerInstanceId !== parent.ownerInstanceId) {
@@ -1040,12 +1102,38 @@ export function projectNavigationQuery(params: {
   // can regroup them. Preserve the actual relationship in row metadata for actions.
   const attentionMemberKeys = query.kind === "lens" && query.lens === "attention"
     ? new Set(selectedThreads.map(threadKey)) : undefined;
-  const directoryMembers = query.kind === "directory"
-    ? directoryMemberThreads(params.index.directories.find((directory) => directory.key === query.directoryKey), threadsByLegacyKey)
+  const directoryMembers = query.kind === "directory" || (query.kind === "exact" && query.ancestryScope === "directory")
+    ? directoryMemberThreads(scopedDirectory, threadsByLegacyKey)
     : undefined;
   const directoryParentOf = directoryMembers ? directoryParentResolver(directoryMembers, parentCandidates) : undefined;
   const homeProjects = query.kind === "group-members"
     ? buildHomeProjects(params.index.directories, threadsByLegacyKey) : undefined;
+  // Exact metadata batches can contain only some mounted siblings. Keep the
+  // native parent's complete order as a scalar, without exporting its full
+  // subthreadOrder collection or depending on viewer pin summaries.
+  const siblingOrders = new Map<string, number>();
+  if (params.request.inventory === "owner" && query.kind === "exact") {
+    const parents = new Map<string, NavigationThreadSummary>();
+    for (const thread of selectedThreads) {
+      const parent = parentIdentity(thread, parentCandidates);
+      if (navigationIdentity(thread).ownerInstanceId || !parent || parent.ownerInstanceId) continue;
+      const parentThread = threadsByIdentity.get(identityKey(parent));
+      if (parentThread) parents.set(identityKey(parent), parentThread);
+    }
+    const siblings = new Map<string, NavigationThreadSummary[]>();
+    for (const thread of params.index.threads) {
+      if (!isOrdinaryThread(thread) || navigationIdentity(thread).ownerInstanceId) continue;
+      const parent = parentIdentity(thread, parentCandidates);
+      const key = parent && identityKey(parent);
+      if (!key || !parents.has(key)) continue;
+      const children = siblings.get(key) ?? [];
+      children.push(thread);
+      siblings.set(key, children);
+    }
+    for (const [key, children] of siblings) {
+      sortSubthreadSummaries(parents.get(key)!, children).forEach((thread, order) => siblingOrders.set(threadKey(thread), order));
+    }
+  }
   const entries = selectedThreads.map((thread, index): NavigationQueryEntry => {
     const parent = parentIdentity(thread, parentCandidates);
     const placementParent = attentionMemberKeys && parent && !attentionMemberKeys.has(identityKey(parent))
@@ -1065,6 +1153,7 @@ export function projectNavigationQuery(params: {
         homeProject: homeProjects?.get(thread),
       }),
       orderKey: rowOrderKey(index),
+      ...(siblingOrders.has(threadKey(thread)) ? { siblingOrder: siblingOrders.get(threadKey(thread))! } : {}),
       ...(params.attentionOrder?.members.has(navigationAttentionIdentity(thread))
         ? { attentionRank: params.attentionOrder.members.get(navigationAttentionIdentity(thread))!.rank }
         : {}),
@@ -1097,7 +1186,7 @@ export function projectNavigationQuery(params: {
       backends: query.kind === "directory-index"
         || (query.kind === "star-map" && query.projectKey === undefined),
     }),
-    ...(query.kind === "directory" ? {
+    ...(query.kind === "directory" || (query.kind === "children" && query.directoryKey !== undefined) ? {
       selectionDirectory: buildDirectoryRows({ snapshot: { ...params.index,
         directories: params.index.directories.filter((directory) => directory.key === query.directoryKey),
       }, threadsByLegacyKey, parentCandidates })[0],

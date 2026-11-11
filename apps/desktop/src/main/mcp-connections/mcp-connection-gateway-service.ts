@@ -72,8 +72,9 @@ import {
 import { gatewayToolRevision, validateGatewayArguments, type McpGatewayTool, type McpGatewayInvocation } from "./mcp-gateway-catalog";
 import {
   PWRSNAP_MCP_CONNECTION_ID,
+  isMcpIpcUrl,
   PWRGIT_MCP_CONNECTION_ID,
-  PWRSNAP_SESSION_REVOKED_DETAIL,
+  PWRSNAP_SESSION_REJECTED_DETAIL,
   SANDBOXER_MCP_CONNECTION_ID,
   isAcpBackendId,
   isBuiltInMcpConnectionId,
@@ -111,8 +112,8 @@ import {
   type RuntimeLeaseHolder,
 } from "../runtime-lease-manager";
 import { getDesktopSettingsService } from "../settings/desktop-settings-singleton";
-import { getAppStateDb, getAppStateMode, getAppOverlayStore } from "../state/app-state";
-import { ThreadSandboxStore } from "../state/thread-sandbox-store";
+import { getAppStateMode } from "../storage/desktop-runtime-storage";
+import { desktopMcpConnectionSelectionStorage, recordCreatedSandbox } from "../storage/desktop-mcp-connection-storage";
 import { readCreatedSandbox, type SandboxerCleanupTransport } from "./sandboxer-pr-cleanup";
 import {
   McpConnectionRegistry,
@@ -129,6 +130,7 @@ import {
   McpReauthorizationRequiredError,
 } from "./mcp-oauth-session-coordinator";
 import { createMcpSafeFetch } from "./mcp-safe-fetch";
+import { createMcpIpcTransport, normalizeMcpIpcBearerToken } from "./mcp-ipc-http";
 import { probeMcpConnectionUrl } from "./mcp-connection-probe";
 import {
   MCP_GATEWAY_TOOL_SEARCH_TIMEOUT_MS,
@@ -151,10 +153,11 @@ const PWRSNAP_SCOPES = [
   "sizzle.compose",
   "sizzle.preview.read",
   "sizzle.full.read",
+  "sizzle.assets.import",
 ].join(" ");
 /** Returned to agents through the bridge, where no Connect button is visible. */
-export const PWRSNAP_SESSION_REVOKED_ERROR =
-  "PwrSnap revoked this connection. PwrSnap tools stay unavailable until the operator chooses Connect to PwrSnap on New thread in PwrAgent.";
+export const PWRSNAP_SESSION_REJECTED_ERROR =
+  "PwrSnap rejected this connection's authorization. PwrSnap tools stay unavailable until the operator chooses Connect to PwrSnap on New thread in PwrAgent.";
 const OAUTH_CALLBACK_TIMEOUT_MS = 5 * 60_000;
 const MAX_RPC_LINE_BYTES = 1024 * 1024;
 const MAX_RPC_CONNECTIONS = 32;
@@ -674,7 +677,7 @@ export class McpConnectionGatewayService {
   private readonly initializations = new WeakMap<Client, InitializeResult>();
   private readonly disconnectedStdioGrants = new Set<string>();
   private connectPromise?: Promise<ConnectPwrSnapResponse>;
-  private sessionRevoked = false;
+  private sessionRejected = false;
   private leaseHeld = false;
   private brokerToken?: string;
   private nonOwnerHolder?: RuntimeLeaseHolder;
@@ -721,13 +724,10 @@ export class McpConnectionGatewayService {
 
   constructor(options: McpConnectionGatewayServiceOptions = {}) {
     this.recordCreatedSandbox = options.recordCreatedSandbox
-      ?? ((params) => {
-        if (!getAppStateMode()) return;
-        new ThreadSandboxStore(getAppStateDb().raw).recordCreated(params);
-      });
+      ?? recordCreatedSandbox;
     this.threadRootsResolver = options.resolveThreadRoots;
     this.readGatewaySelection = options.readGatewaySelection
-      ?? (async (context) => (await getAppOverlayStore().getThreadOverlayState(context))?.mcpConnectionIds ?? []);
+      ?? (async (context) => desktopMcpConnectionSelectionStorage.readSelection(context));
     this.bridgeEntryPath =
       options.bridgeEntryPath ?? join(__dirname, "mcp-connection-bridge.js");
     this.fetchFn = options.fetchFn ?? globalThis.fetch.bind(globalThis);
@@ -783,8 +783,8 @@ export class McpConnectionGatewayService {
     ]);
     const installed = endpointAvailable || Boolean(this.findInstalledPath());
     const details: string[] = [];
-    if (!configured && this.sessionRevoked) {
-      details.push(PWRSNAP_SESSION_REVOKED_DETAIL);
+    if (!configured && this.sessionRejected) {
+      details.push(PWRSNAP_SESSION_REJECTED_DETAIL);
     }
     if (!endpointAvailable && installed) {
       details.push("Open PwrSnap and enable Local Agent Access to connect agents.");
@@ -897,6 +897,9 @@ export class McpConnectionGatewayService {
   ): Promise<McpConnectionStatus> {
     const ownership = await this.ensureOwnerBroker();
     if (!ownership.owned) {
+      if (request.ipcBearerToken !== undefined) {
+        throw new Error("Set the IPC session token in the PwrAgent instance that owns this profile's MCP gateway.");
+      }
       return this.announced(await this.requestOwnerBroker<McpConnectionStatus>(
         ownership.holder,
         "broker/create",
@@ -904,6 +907,7 @@ export class McpConnectionGatewayService {
       ));
     }
     if (request.stdio !== undefined) {
+      if (request.ipcBearerToken !== undefined) throw new Error("Session bearer tokens require a local IPC URL.");
       if (request.serverUrl !== undefined) {
         throw new Error("Add either a remote URL or a local command, not both.");
       }
@@ -921,10 +925,18 @@ export class McpConnectionGatewayService {
     if (typeof request.serverUrl !== "string") {
       throw new Error("Enter a remote MCP URL or a local command.");
     }
+    const ipcBearerToken = request.ipcBearerToken === undefined ? undefined : normalizeMcpIpcBearerToken(request.ipcBearerToken);
+    if (ipcBearerToken !== undefined && !isMcpIpcUrl(request.serverUrl)) throw new Error("Session bearer tokens require a local IPC URL.");
     const connection = this.registry.create({
       displayName: request.displayName,
       serverUrl: request.serverUrl,
     });
+    try {
+      if (ipcBearerToken) await this.credentialVault.write(connection.id, { resourceUrl: connection.serverUrl, ipcBearerToken });
+    } catch (error) {
+      this.registry.remove(connection.id);
+      throw error;
+    }
     return this.announced(await this.connectionStatus(connection));
   }
 
@@ -1145,6 +1157,9 @@ export class McpConnectionGatewayService {
       ));
     }
     const connection = this.requireConnection(connectionId);
+    if (isMcpIpcUrl(connection.serverUrl)) {
+      throw new Error("Local IPC uses the server app's approval, not browser OAuth. Approve access in the server app and check the connection in Settings.");
+    }
     if (connection.kind === "stdio") {
       throw new Error(`${connection.displayName} is a local command. It has nothing to sign in to.`);
     }
@@ -1182,7 +1197,7 @@ export class McpConnectionGatewayService {
         waitForCode: callback.waitForCode,
       });
       if (connection.id === PWRSNAP_MCP_CONNECTION_ID) {
-        this.sessionRevoked = false;
+        this.sessionRejected = false;
         await this.settings.clearPwrSnapMcpCredential();
       }
       // A different account can see a different set of tools.
@@ -1231,7 +1246,7 @@ export class McpConnectionGatewayService {
       ));
     }
     const connection = this.requireConnection(connectionId);
-    if (connection.authMode === "local_cli" || connection.kind === "stdio") return this.announced(await this.connectionStatus(connection));
+    if (connection.authMode === "local_cli" || connection.authMode === "none") return this.announced(await this.connectionStatus(connection));
     // Retire the attempt in the coordinator *before* ending its wait, so the
     // rejection that follows lands on a stale attempt and cannot report a
     // called-off authorization as `reauthorization_required`. Doing it the
@@ -1265,6 +1280,9 @@ export class McpConnectionGatewayService {
   ): Promise<McpConnectionStatus> {
     const ownership = await this.ensureOwnerBroker();
     if (!ownership.owned) {
+      if (request.ipcBearerToken !== undefined) {
+        throw new Error("Set the IPC session token in the PwrAgent instance that owns this profile's MCP gateway.");
+      }
       return this.announced(await this.requestOwnerBroker<McpConnectionStatus>(
         ownership.holder,
         "broker/update",
@@ -1272,6 +1290,8 @@ export class McpConnectionGatewayService {
       ));
     }
     const existing = this.requireConnection(request.connectionId);
+    const ipcBearerToken = request.ipcBearerToken === undefined ? undefined : normalizeMcpIpcBearerToken(request.ipcBearerToken);
+    if (ipcBearerToken !== undefined && !isMcpIpcUrl(request.serverUrl ?? existing.serverUrl)) throw new Error("Session bearer tokens require a local IPC URL.");
     if (existing.kind === "stdio") {
       return this.announced(await this.updateStdioConnection(existing, request));
     }
@@ -1285,9 +1305,16 @@ export class McpConnectionGatewayService {
     });
     if (serverUrlChanged) {
       await this.closeConnectionSessions(request.connectionId);
-      await this.coordinatorFor(existing).disconnect();
+      if (existing.authMode === "oauth") await this.coordinatorFor(existing).disconnect();
+      else if (isMcpIpcUrl(existing.serverUrl)) await this.credentialVault.delete(existing.id);
       this.coordinators.delete(request.connectionId);
       this.invalidateConnectionTools(request.connectionId);
+    }
+    if (ipcBearerToken !== undefined) {
+      await this.closeConnectionSessions(request.connectionId);
+      if (ipcBearerToken) await this.credentialVault.write(connection.id, { resourceUrl: connection.serverUrl, ipcBearerToken });
+      else await this.credentialVault.delete(connection.id);
+      this.invalidateConnectionTools(connection.id);
     }
     return this.announced(await this.connectionStatus(connection));
   }
@@ -1404,16 +1431,21 @@ export class McpConnectionGatewayService {
     }
     const connection = this.requireConnection(connectionId);
     await this.closeConnectionSessions(connectionId);
+    if (isMcpIpcUrl(connection.serverUrl)) {
+      await this.credentialVault.delete(connection.id);
+      this.invalidateConnectionTools(connectionId);
+      return this.announced(await this.connectionStatus(this.registry.setEnabled(connectionId, false)));
+    }
     if (connection.kind === "sandboxer" && connection.authMode === "local_cli") {
       return this.announced(await this.connectionStatus(this.registry.setEnabled(connectionId, false)));
     }
     // A local command holds no credentials to discard; stopping its running
     // copies is all a disconnect can mean.
     if (connection.kind === "stdio") return this.announced(await this.connectionStatus(connection));
-    await this.coordinatorFor(connection).disconnect();
+    if (connection.authMode === "oauth") await this.coordinatorFor(connection).disconnect();
     this.invalidateConnectionTools(connectionId);
     if (connection.id === PWRSNAP_MCP_CONNECTION_ID) {
-      this.sessionRevoked = false;
+      this.sessionRejected = false;
       await this.settings.clearPwrSnapMcpCredential();
     }
     return this.announced(await this.connectionStatus(connection));
@@ -1599,6 +1631,29 @@ export class McpConnectionGatewayService {
   }
 
   /**
+   * Set or clear one project's Tool approval for a connection. Like the
+   * connection's own mode, the gateway reads it as each call reaches
+   * approval, so nothing live changes.
+   */
+  async setConnectionProjectToolApproval(
+    connectionId: string,
+    repository: string,
+    toolApproval: McpConnectionToolApproval | null,
+  ): Promise<McpConnectionStatus> {
+    const ownership = await this.ensureOwnerBroker();
+    if (!ownership.owned) {
+      return this.announced(await this.requestOwnerBroker<McpConnectionStatus>(
+        ownership.holder,
+        "broker/set-project-tool-approval",
+        { connectionId, repository, toolApproval },
+      ));
+    }
+    this.requireConnection(connectionId);
+    const connection = this.registry.setProjectToolApproval(connectionId, repository, toolApproval);
+    return this.announced(await this.connectionStatus(connection));
+  }
+
+  /**
    * The tools a managed connection publishes, read outside any thread.
    *
    * A managed connection is only ever opened on a thread's behalf, so
@@ -1735,7 +1790,8 @@ export class McpConnectionGatewayService {
       this.announceChanged([connectionId]);
       return removed;
     }
-    await this.coordinatorFor(connection).disconnect();
+    if (isMcpIpcUrl(connection.serverUrl)) await this.credentialVault.delete(connection.id);
+    if (connection.authMode === "oauth") await this.coordinatorFor(connection).disconnect();
     this.coordinators.delete(connectionId);
     this.invalidateConnectionTools(connectionId);
     const removed = this.registry.remove(connectionId);
@@ -1783,7 +1839,7 @@ export class McpConnectionGatewayService {
     signal?.throwIfAborted();
     if (
       !configured
-      && !(connection.id === PWRSNAP_MCP_CONNECTION_ID && this.sessionRevoked)
+      && !(connection.id === PWRSNAP_MCP_CONNECTION_ID && this.sessionRejected)
     ) {
       throw new Error(
         connection.authMode === "local_cli" || connection.kind === "stdio" ? status.detail
@@ -2458,7 +2514,7 @@ export class McpConnectionGatewayService {
           ? {
               discardRejectedCredentials: true,
               onCredentialRejected: async () => {
-                this.sessionRevoked = true;
+                this.sessionRejected = true;
                 await this.settings.clearPwrSnapMcpCredential();
               },
             }
@@ -2496,6 +2552,12 @@ export class McpConnectionGatewayService {
     cachedLocalStatus = false,
     sandboxerStatusMaxAgeMs?: number,
   ): Promise<McpConnectionStatus> {
+    if (isMcpIpcUrl(connection.serverUrl)) {
+      return {
+        ...connection, configured: true, state: "ready",
+        discovery: this.discoveryHealth.get(connection.id) ?? { state: "untested" },
+      };
+    }
     if (connection.kind === "sandboxer" && connection.authMode === "local_cli") {
       // New-thread defaults have a two-second total budget. Refresh enabled
       // compute in the background without delaying unrelated defaults. A cold
@@ -2675,7 +2737,7 @@ export class McpConnectionGatewayService {
    * Open an authorized MCP client for a connection.
    *
    * Shared by the per-thread proxy sessions and the Settings tool listing, so
-   * both get the same credential check and the same PwrSnap revocation
+   * both get the same credential check and the same PwrSnap credential rejection
    * handling rather than two copies that drift.
    */
   private async connectUpstreamClient(
@@ -2693,7 +2755,10 @@ export class McpConnectionGatewayService {
     if (connection.kind === "stdio") {
       return await this.connectStdioClient(connection, options);
     }
-    if (connection.kind === "sandboxer" && connection.authMode === "local_cli") {
+    if (isMcpIpcUrl(connection.serverUrl)) {
+      const credential = await this.credentialVault.read(connection.id, connection.serverUrl);
+      transport = createMcpIpcTransport(connection.serverUrl, { bearerToken: credential?.ipcBearerToken });
+    } else if (connection.kind === "sandboxer" && connection.authMode === "local_cli") {
       const status = await this.sandboxer.readStatus();
       if (!status.configured) throw new Error(status.detail);
       transport = this.sandboxer.createTransport();
@@ -2701,8 +2766,8 @@ export class McpConnectionGatewayService {
       const coordinator = this.coordinatorFor(connection);
       if (!(await coordinator.configured())) {
         throw new Error(
-          connection.id === PWRSNAP_MCP_CONNECTION_ID && this.sessionRevoked
-            ? PWRSNAP_SESSION_REVOKED_ERROR
+          connection.id === PWRSNAP_MCP_CONNECTION_ID && this.sessionRejected
+            ? PWRSNAP_SESSION_REJECTED_ERROR
             : `${connection.displayName} needs to be reauthorized in Settings → Plugins.`,
         );
       }
@@ -2730,10 +2795,10 @@ export class McpConnectionGatewayService {
       await transport.close().catch(() => undefined);
       if (
         connection.id === PWRSNAP_MCP_CONNECTION_ID
-        && (this.sessionRevoked
+        && (this.sessionRejected
           || error instanceof McpReauthorizationRequiredError)
       ) {
-        throw new Error(PWRSNAP_SESSION_REVOKED_ERROR, { cause: error });
+        throw new Error(PWRSNAP_SESSION_REJECTED_ERROR, { cause: error });
       }
       throw error;
     } finally {
@@ -3434,6 +3499,7 @@ export class McpConnectionGatewayService {
       return await this.createConnection({
         displayName: values.displayName,
         ...(typeof values.serverUrl === "string" ? { serverUrl: values.serverUrl } : {}),
+        ...(values.ipcBearerToken !== undefined ? { ipcBearerToken: values.ipcBearerToken as string } : {}),
         // Validated field by field in prepareStdioLaunch.
         ...(values.stdio !== undefined ? { stdio: values.stdio as McpStdioLaunchInput } : {}),
       });
@@ -3478,6 +3544,7 @@ export class McpConnectionGatewayService {
         ...(typeof values.serverUrl === "string"
           ? { serverUrl: values.serverUrl }
           : {}),
+        ...(values.ipcBearerToken !== undefined ? { ipcBearerToken: values.ipcBearerToken as string } : {}),
         ...(values.stdio !== undefined ? { stdio: values.stdio as McpStdioLaunchInput } : {}),
       });
     }
@@ -3525,6 +3592,20 @@ export class McpConnectionGatewayService {
       }
       return await this.setConnectionToolApproval(
         values.connectionId,
+        values.toolApproval,
+      );
+    }
+    if (operation === "broker/set-project-tool-approval") {
+      if (
+        typeof values.connectionId !== "string"
+        || typeof values.repository !== "string"
+        || (values.toolApproval !== null && !isMcpConnectionToolApproval(values.toolApproval))
+      ) {
+        throw new Error("Invalid MCP connection project tool approval request.");
+      }
+      return await this.setConnectionProjectToolApproval(
+        values.connectionId,
+        values.repository,
         values.toolApproval,
       );
     }

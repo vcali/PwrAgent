@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { expect, test, type Locator, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "./fixtures/electron-test";
 import { launchElectronApp } from "./fixtures/electron-app";
 
 const PROJECTS = ["Aproject", "Bproject", "Cproject"] as const;
@@ -135,7 +135,7 @@ async function recordDirectoryPinFrames(page: Page, label: string): Promise<void
       if (!sampler.running) return;
       const row = [...document.querySelectorAll(".directory-row")].find((candidate) =>
         candidate.querySelector(".directory-row__title")?.textContent?.trim() === target);
-      const state = row?.getAttribute("data-directory-pinned") === "true" ? "pinned" : "unpinned";
+      const state = !row ? "missing" : row.getAttribute("data-directory-pinned") === "true" ? "pinned" : "unpinned";
       if (frames[frames.length - 1] !== state) frames.push(state);
       window.requestAnimationFrame(sample);
     };

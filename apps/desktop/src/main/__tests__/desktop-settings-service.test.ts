@@ -16,6 +16,7 @@ import { issueProviderDiscoveryPermit } from "../settings/provider-discovery-per
 import { DesktopConfigStore } from "../settings/config-store/desktop-config-store";
 import { CodexDiscoveryCoordinator } from "../codex-discovery-coordinator";
 import { StateDb } from "../state/state-db";
+import { DurableConfigSnapshotStore } from "../storage/durable-config-snapshot-store";
 import { createTempStateDb } from "./sqlite-test-utils";
 import { measureSqliteWrites, SQLITE_WRITE_METRICS_ENV } from "../state/sqlite-write-metrics";
 import { expectSqliteWriteBudget } from "./fixtures/sqlite-write-budget";
@@ -427,6 +428,7 @@ describe("DesktopSettingsService", () => {
     expect(discover).toHaveBeenCalledWith(undefined, {
       allowStaleSuccess: false,
       force: true,
+      signal: expect.any(AbortSignal),
     });
 
     await service.writeConfigPatchTargeted({
@@ -490,7 +492,7 @@ describe("DesktopSettingsService", () => {
     const { dbPath, tempDir } = createTempStateDb("pwragent-settings-db-");
     tempRoots.push(tempDir);
     const db = StateDb.open(dbPath);
-    const configStore = new DesktopConfigStore({ configPath, stateDb: db });
+    const configStore = new DesktopConfigStore({ configPath, storage: new DurableConfigSnapshotStore(db) });
     const automatic = path.join(root, "auto-codex");
     const standalone = path.join(root, "standalone-codex");
     const invalid = path.join(root, "missing-codex");
@@ -2458,6 +2460,7 @@ describe("DesktopSettingsService", () => {
     expect(discover).toHaveBeenLastCalledWith("/operator/codex", {
       allowStaleSuccess: false,
       force: true,
+      signal: expect.any(AbortSignal),
     });
   });
 
@@ -3156,6 +3159,33 @@ describe("DesktopSettingsService", () => {
 
     expect(fs.readFileSync(configPath, "utf8")).toContain("pinned_threads_on_top = false");
     expect((await service.readSettingsProjection()).general.pinnedThreadsOnTop).toEqual({
+      value: false,
+      source: "config",
+    });
+  });
+
+  it("starts reviews with Auto-fix on by default and persists the opt-out", async () => {
+    const root = createTempRoot();
+    const configPath = path.join(root, "config.toml");
+    const service = new DesktopSettingsService({
+      configPath,
+      env: {},
+      secretStore: new MemoryDesktopSecretStore(),
+    });
+
+    expect((await service.readSettingsProjection()).general.autoFixReviews).toEqual({
+      value: true,
+      source: "default",
+    });
+
+    await service.writeConfigPatchTargeted({
+      general: {
+        autoFixReviews: false,
+      },
+    });
+
+    expect(fs.readFileSync(configPath, "utf8")).toContain("auto_fix_reviews = false");
+    expect((await service.readSettingsProjection()).general.autoFixReviews).toEqual({
       value: false,
       source: "config",
     });
@@ -4536,6 +4566,33 @@ describe("DesktopSettingsService", () => {
     expect(service.resolveCodexSpawnEnv().CODEX_HOME).toBe(
       path.join(root, "codex", "profiles", "work"),
     );
+  });
+
+  it("never reads the operator's home profile when given a child env", () => {
+    // The operator's real ~/.pwragent chose another Git; this process runs
+    // under its own PWRAGENT_HOME. An injected env names neither root.
+    const home = createTempRoot();
+    const operatorProfile = path.join(home, ".pwragent", "profiles", "default");
+    fs.mkdirSync(operatorProfile, { recursive: true });
+    fs.writeFileSync(
+      path.join(operatorProfile, "config.toml"),
+      "[applications.git]\npath = \"/operator/host-git/bin/git\"\n",
+    );
+    vi.stubEnv("HOME", home);
+    vi.stubEnv("USERPROFILE", home);
+    vi.stubEnv("PWRAGENT_HOME", createTempRoot());
+    try {
+      const service = new DesktopSettingsService({
+        env: { PATH: ["/usr/bin", "/bin"].join(path.delimiter) } as NodeJS.ProcessEnv,
+        secretStore: new MemoryDesktopSecretStore(),
+        resolveCodexShellEnv: () => ({ PATH: "/usr/bin" }),
+      });
+
+      expect(service.resolveGitCommandPreference()).toBeUndefined();
+      expectBundledGitPath(service.resolveCodexSpawnEnv().PATH, ["/usr/bin"]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("adds login shell PATH entries to the Codex app-server spawn env", () => {

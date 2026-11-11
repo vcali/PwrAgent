@@ -5,7 +5,7 @@ import {
   PwrAgentFederatedThreadInspectionError,
   type PwrAgentFederatedThreadInspectionHandler,
 } from "../agent-tools/pwragent-thread-agent-tools";
-import type { RemoteThreadTargetStore } from "../state/remote-thread-target-store";
+import type { RemoteThreadTargetStore } from "../storage/remote-thread-target-store";
 import {
   FederatedThreadTargetError,
   resolveFederatedThreadTarget,
@@ -81,6 +81,7 @@ export function createFederatedThreadInspectionHandler(
       instanceId: match.peer.target.instanceId,
       instanceLabel: match.peer.label,
       thread: match.thread,
+      archived: match.archived,
       ...(summary ? { summary } : {}),
       read,
     };

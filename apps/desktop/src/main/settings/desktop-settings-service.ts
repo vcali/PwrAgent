@@ -5,6 +5,7 @@ import {
   FORGE_AGENT_TOOL_GROUPS,
   codexModelProviderApiKeyEnv,
   isValidCodexModelProviderId,
+  normalizeCheckoutHibernationPolicy,
   normalizeThreadArchivePolicy,
   upsertForgeAgentToolRule,
   type CodexModelProviderSettings,
@@ -16,7 +17,7 @@ import {
 } from "@pwragent/shared";
 import { bundledGitExecutable, bundledGitLfsExecutable } from "../bundled-git";
 import { gitRuntimeEnvironment } from "../git-runtime";
-import { getAppStateDb } from "../state/app-state";
+import { createTokenMiserStorage } from "../storage/desktop-runtime-storage";
 import {
   DESKTOP_UI_LAYOUT_DEFAULTS,
   FORGE_PRODUCTS,
@@ -45,6 +46,9 @@ import type {
   DesktopCodexProfileModel,
   DesktopFederationMode,
   DesktopGitDiscoverySnapshot,
+  DesktopGitRuntimeChoice,
+  DesktopManagedGitSnapshot,
+  ManagedGitActionRequest,
   DesktopHotCpuProfileStartDelayMs,
   DesktopHotCpuProfileTriggerMode,
   DesktopIntegratedTerminalWindowsShell,
@@ -102,6 +106,8 @@ import {
   resolveDesktopUpdateSelection,
   DESKTOP_WORKTREE_STORAGE_DEFAULT,
   MANAGED_CODEX_BUILD_CHANNEL_DEFAULT,
+  MANAGED_GIT_BUILD_CHANNEL_DEFAULT,
+  parseDesktopUpdateChannel,
   MANAGED_GROK_BUILD_CHANNEL_DEFAULT,
   MAX_PR_AUTO_DISPATCH_BUDGET_CAPACITY,
   MAX_PR_AUTO_DISPATCH_BUDGET_REFILL_PER_MINUTE,
@@ -239,7 +245,7 @@ import {
   TOKEN_MISER_DIAGNOSTICS_DIRNAME,
   type TokenMiserActivationStatus,
 } from "../token-miser/token-miser-types";
-import { TokenMiserStore } from "../token-miser/token-miser-store";
+import type { TokenMiserStore } from "../token-miser/token-miser-store";
 import {
   discoverCodexAuthProfiles,
   resolveCodexHomeForProfile,
@@ -247,6 +253,31 @@ import {
 } from "@pwrdrvr/codex-discovery";
 import { discoverDesktopApplications } from "./application-discovery";
 import { GIT_COMMAND_ENV, discoverGitCommands } from "./git-discovery";
+import {
+  cancelManagedGitInstall,
+  checkManagedGitReleases,
+  installManagedGit,
+  listManagedGitGenerations,
+  managedGitInstallInProgress,
+  managedGitResolutionFailure,
+  managedGitSupported,
+  MANAGED_GIT_CHECK_TTL_MS,
+  noteManagedGitVerified,
+  pruneManagedGitGenerations,
+  readManagedGitCheck,
+  removeManagedGitGeneration,
+  resolveManagedGitRuntime,
+  verifyManagedGitGeneration,
+  BUNDLED_GIT_VERSION,
+} from "../managed-git-runtime";
+import {
+  currentGitRuntimeChoice,
+  decodeGitRuntimeChoice,
+  gitRuntimeSelectionPatch,
+  managedGenerationsNamed,
+  readProfileManagedGitSelections,
+} from "./managed-git-selection";
+import { resolvePwragentRoot } from "../profile";
 import { discoverGlabCommands } from "./glab-discovery";
 import { discoverGhCommands } from "./gh-discovery";
 import { getMainLogger } from "../log";
@@ -696,9 +727,13 @@ export class DesktopSettingsService {
   constructor(private readonly options: DesktopSettingsServiceOptions) {
     this.env = options.env ?? process.env;
     this.argv = options.argv ?? process.argv;
+    // The service's own profile belongs to the running process. `env` and
+    // `argv` hold setting overrides and what child processes inherit;
+    // reading the profile from them sent an env without PWRAGENT_HOME to
+    // the operator's real ~/.pwragent.
     this.configPath =
       options.configPath ??
-      resolveDesktopConfigPath({ argv: this.argv, env: this.env });
+      resolveDesktopConfigPath();
     this.configStore = options.configStore ?? new DesktopConfigStore({
       configPath: this.configPath,
     });
@@ -723,9 +758,9 @@ export class DesktopSettingsService {
 
   async readTokenMiserUsage() {
     // Explicit usage requests query SQLite; ordinary settings reads do no accounting I/O.
-    this.tokenMiserUsageStore ??= this.options.tokenMiserStore ?? new TokenMiserStore(
+    this.tokenMiserUsageStore ??= this.options.tokenMiserStore ?? createTokenMiserStorage(
       path.join(path.dirname(this.configPath), "state", "token-miser", "objects"),
-      { stateDb: getAppStateDb() },
+      {},
     );
     return await this.tokenMiserUsageStore.summarizeUsage();
   }
@@ -883,6 +918,7 @@ export class DesktopSettingsService {
     const glabDiscovery = this.glabDiscoveryCache?.result ?? { candidates: [] };
     const ghDiscovery = this.ghDiscoveryCache?.result ?? { candidates: [] };
     const gitDiscovery = this.gitDiscoveryCache?.result ?? { candidates: [] };
+    const managedGit = await this.readManagedGitSnapshot(config.applications?.git);
     const applications = this.applicationsDiscovery
       ?? emptyApplicationsSnapshot();
     const preferredEditorId = this.resolveConfigString(
@@ -981,6 +1017,12 @@ export class DesktopSettingsService {
         // below newer threads in Updated or Created is easy to forget.
         pinnedThreadsOnTop: this.resolveConfigBoolean(
           config.general?.pinnedThreadsOnTop,
+          true,
+        ),
+        // Default on: a review is usually started to be acted on, and the
+        // point of Auto-fix is that nobody has to come back to send it.
+        autoFixReviews: this.resolveConfigBoolean(
+          config.general?.autoFixReviews,
           true,
         ),
         // Default on: agents then run the same toolchain the setup script
@@ -1729,6 +1771,7 @@ export class DesktopSettingsService {
         git: {
           path: this.resolveString(config.applications?.git?.path, GIT_COMMAND_ENV),
           discovery: gitDiscovery,
+          managed: managedGit,
         },
       },
       git: {
@@ -1769,12 +1812,23 @@ export class DesktopSettingsService {
       worktrees: {
         ...this.resolveWorktrees(config.worktrees?.storage),
         archive: normalizeThreadArchivePolicy(config.worktrees?.archive),
+        hibernate: normalizeCheckoutHibernationPolicy(config.worktrees?.hibernate),
       },
     };
   }
 
   resolveThreadArchivePolicy() {
     return normalizeThreadArchivePolicy(this.configStore.read("worktrees")?.archive);
+  }
+
+  resolveCheckoutHibernationPolicy() {
+    return normalizeCheckoutHibernationPolicy(this.configStore.read("worktrees")?.hibernate);
+  }
+
+  /** The retired automatic-archive switch was on: set to true, or never set,
+   * since it defaulted on. Only the one-time retirement notice reads it. */
+  resolveAutomaticArchiveWasOn(): boolean {
+    return this.configStore.read("worktrees")?.archive?.legacyEnabled !== false;
   }
 
   readMessagingConfig(): ConfigDomainMap["messaging"] {
@@ -1963,13 +2017,23 @@ export class DesktopSettingsService {
   private discoverGitCommandsCached(
     configuredCommand?: string,
   ): Promise<DesktopGitDiscoverySnapshot> {
-    const key = configuredCommand?.trim() ?? "";
+    const selectedManaged = this.resolveManagedGitSelection();
+    const key = `${configuredCommand?.trim() ?? ""}\0${selectedManaged ?? ""}`;
     if (this.gitDiscoveryCache?.key !== key) {
       const promise = this.commandDiscoveryLifetime.run(
         () => discoverGitCommands({
           configuredCommand,
           env: this.env,
           signal: this.commandDiscoveryLifetime.signal,
+          managed: async () => (await listManagedGitGenerations()).map((release) => ({
+            generation: release.generation,
+            executable: release.executable,
+            root: release.root,
+            ...(managedGitResolutionFailure(release.generation)
+              ? { failure: managedGitResolutionFailure(release.generation) }
+              : {}),
+          })),
+          ...(selectedManaged ? { selectedManaged } : {}),
         }),
         { candidates: [] },
       );
@@ -2780,6 +2844,7 @@ export class DesktopSettingsService {
     permit: ProviderDiscoveryPermit,
   ): Promise<DesktopSettingsSnapshot> {
     assertProviderDiscoveryPermit(permit, ["startup"]);
+    if (this.commandDiscoveryLifetime.signal.aborted) return await this.readSettingsProjection();
     const startedAt = performance.now();
     // Keep startup timings at info level without logging probe results or
     // settings values. Failures still flow to the existing allSettled boundary.
@@ -2812,9 +2877,13 @@ export class DesktopSettingsService {
           // finish. Neither failure may poison subsequent discovery attempts.
           this.rejectedStartupCachedCommand = true;
           this.sessionCodexRetention = Promise.resolve()
-            .then(() => (this.options.retainCachedCodexCommand ?? retainManagedCodexCommand)(cached.command))
+            .then(async () => {
+              if (this.commandDiscoveryLifetime.signal.aborted) return;
+              await (this.options.retainCachedCodexCommand ?? retainManagedCodexCommand)(cached.command);
+            })
             .then(() => {
-              if (generation !== this.sessionCodexSelectionGeneration) return;
+              if (this.commandDiscoveryLifetime.signal.aborted
+                || generation !== this.sessionCodexSelectionGeneration) return;
               this.sessionCodexCommand = cached;
               this.rejectedStartupCachedCommand = false;
               settingsLog.info("startup Codex selection reused", { source: cached.source });
@@ -2891,7 +2960,17 @@ export class DesktopSettingsService {
     return await this.readSettingsProjection();
   }
 
-  private async runCodexDiscovery(
+  private runCodexDiscovery(
+    permit: ProviderDiscoveryPermit,
+  ): Promise<void> {
+    assertProviderDiscoveryPermit(permit);
+    return this.commandDiscoveryLifetime.run(
+      () => this.runAdmittedCodexDiscovery(permit),
+      undefined,
+    );
+  }
+
+  private async runAdmittedCodexDiscovery(
     permit: ProviderDiscoveryPermit,
   ): Promise<void> {
     assertProviderDiscoveryPermit(permit);
@@ -2922,6 +3001,8 @@ export class DesktopSettingsService {
     releaseCommandSelection: () => void,
   ): Promise<void> {
     await this.sessionCodexRetention;
+    const signal = this.commandDiscoveryLifetime.signal;
+    if (signal.aborted) return;
     this.codexSpawnEnvHydratedAt = undefined;
     const config = this.readConfig().config;
     const checkMode = permit.intent === "startup" ? "ttl" : "force";
@@ -2947,6 +3028,7 @@ export class DesktopSettingsService {
         failed: Boolean(this.managedCodexError),
       });
     }
+    if (signal.aborted) return;
     if (this.managedCodexRuntime) {
       // Release callers already awaiting selection before a listener closes
       // their client. close() drains initialization, which would otherwise
@@ -2966,6 +3048,7 @@ export class DesktopSettingsService {
         runtime: this.managedCodexRuntime,
       });
     }
+    if (signal.aborted) return;
     const configuredCommand = this.resolveActiveCodexCommand(config);
     const executableStartedAt = performance.now();
     const discovery = await this.codexDiscoveryCoordinator.discover(
@@ -2973,8 +3056,10 @@ export class DesktopSettingsService {
       {
         allowStaleSuccess: permit.intent === "startup",
         force: permit.intent !== "startup",
+        signal,
       },
     );
+    if (signal.aborted) return;
     settingsLog.info("Codex discovery executable probes completed", {
       durationMs: Math.round(performance.now() - executableStartedAt),
       candidateCount: discovery.candidates.length,
@@ -3159,7 +3244,7 @@ export class DesktopSettingsService {
         ? this.options.resolveActiveManagedGrokCommand?.()
         : undefined);
     const gitCommand = this.resolveGitCommandPreference();
-    return [gitCommand ?? bundledGitExecutable(), ...(gitCommand ? [] : [bundledGitLfsExecutable()]), codexCommand, grokCommand].filter(
+    return [...(gitCommand ? [gitCommand] : this.resolveRuntimeGitCommands()), codexCommand, grokCommand].filter(
       (command): command is string => command !== undefined,
     );
   }
@@ -3705,6 +3790,197 @@ export class DesktopSettingsService {
   resolveGitCommandPreference(): string | undefined {
     return readEnvString(this.env, GIT_COMMAND_ENV)
       ?? (this.configStore.read("applications").git?.path?.trim() || undefined);
+  }
+
+  /**
+   * The downloaded PwrDrvr Git release this profile chose with Use. Git
+   * resolution consults it only when no explicit command is set.
+   */
+  resolveManagedGitSelection(): string | undefined {
+    if (!managedGitSupported()) return undefined;
+    const choice = currentGitRuntimeChoice({
+      managed: this.configStore.read("applications").git?.managed,
+    });
+    return choice.kind === "managed" ? choice.generation : undefined;
+  }
+
+  /** git and git-lfs of the bundle or the selected release, for terminals. */
+  private resolveRuntimeGitCommands(): string[] {
+    const managed = this.resolveManagedGitSelection();
+    if (!managed) return [bundledGitExecutable(), bundledGitLfsExecutable()];
+    try {
+      const { root, executable } = resolveManagedGitRuntime(managed);
+      return [executable, path.join(root, "libexec", "git-core", "git-lfs")];
+    } catch {
+      // A rejected release puts nothing of PwrAgent's on a terminal's PATH.
+      return [];
+    }
+  }
+
+  private async readManagedGitSnapshot(
+    git: {
+      path?: string;
+      managed?: string;
+      managedPrevious?: string;
+      managedBuildChannel?: DesktopUpdateChannel;
+    } | undefined,
+  ): Promise<DesktopManagedGitSnapshot> {
+    const supported = managedGitSupported();
+    const track = git?.managedBuildChannel ?? MANAGED_GIT_BUILD_CHANNEL_DEFAULT;
+    if (!supported) return { supported, bundledVersion: BUNDLED_GIT_VERSION, track, tracks: {}, releases: [] };
+    const [releases, check] = await Promise.all([
+      listManagedGitGenerations().catch(() => []),
+      readManagedGitCheck(),
+    ]);
+    const selected = this.resolveManagedGitSelection();
+    const previous = decodeGitRuntimeChoice(git?.managedPrevious);
+    const installing = managedGitInstallInProgress();
+    const answer = check?.tracks[track];
+    const latestTag = check?.tracks.latest.available?.version;
+    const prereleaseTag = check?.tracks.prerelease.available?.version;
+    // The whole check failing outranks one track having nothing usable.
+    const error = check?.error ?? (answer?.available ? undefined : answer?.error);
+    return {
+      supported,
+      bundledVersion: BUNDLED_GIT_VERSION,
+      track,
+      tracks: {
+        ...(latestTag ? { latestTag } : {}),
+        ...(prereleaseTag ? { prereleaseTag } : {}),
+      },
+      ...(selected ? { selected } : {}),
+      ...(previous ? { previous } : {}),
+      releases: releases.map((release) => {
+        const failure = managedGitResolutionFailure(release.generation);
+        return {
+          generation: release.generation,
+          version: release.version,
+          tag: release.tag,
+          executable: release.executable,
+          ...(release.lfsVersion ? { lfsVersion: release.lfsVersion } : {}),
+          installedAt: release.installedAt,
+          ...(failure ? { failure } : {}),
+        };
+      }),
+      ...(check
+        ? {
+          check: {
+            checkedAt: check.checkedAt,
+            ...(answer?.available
+              ? {
+                available: {
+                  tag: answer.available.tag,
+                  version: answer.available.version,
+                  generation: answer.available.generation,
+                  ...(answer.available.archiveBytes !== undefined
+                    ? { archiveBytes: answer.available.archiveBytes }
+                    : {}),
+                },
+              }
+              : {}),
+            ...(answer?.needsAppUpdate ? { needsAppUpdate: answer.needsAppUpdate } : {}),
+            ...(error ? { error } : {}),
+          },
+        }
+        : {}),
+      ...(installing ? { installing } : {}),
+    };
+  }
+
+  /** Releases a profile under this PwrAgent root still names. */
+  private protectedManagedGitGenerations(): Set<string> {
+    const named = readProfileManagedGitSelections(resolvePwragentRoot());
+    // This profile's live config, in case its file is mid-write or elsewhere.
+    for (const generation of managedGenerationsNamed(this.configStore.read("applications").git)) {
+      named.add(generation);
+    }
+    return named;
+  }
+
+  /**
+   * Settings → Git → Updates. Every action is one the operator asked for:
+   * nothing here runs on a timer, and only `select` changes which Git runs.
+   * Only install, select and remove change the Git list, so only they probe
+   * every Git again.
+   */
+  async managedGitAction(
+    request: ManagedGitActionRequest,
+  ): Promise<{ snapshot: DesktopSettingsSnapshot; error?: string }> {
+    const error = await this.runManagedGitAction(request);
+    const changesGit = request.action === "install"
+      || request.action === "select"
+      || request.action === "remove";
+    const snapshot = changesGit
+      ? await this.refreshGitDiscovery()
+      : await this.readSettingsProjection();
+    return { snapshot, ...(error ? { error } : {}) };
+  }
+
+  private async runManagedGitAction(request: ManagedGitActionRequest): Promise<string | undefined> {
+    if (!managedGitSupported()) return "PwrDrvr Git updates are not available on this platform.";
+    try {
+      switch (request.action) {
+        case "check":
+          if (request.ifStale) await this.refreshManagedGitCheckIfStale();
+          else await checkManagedGitReleases({ manual: true });
+          break;
+        case "install": {
+          await installManagedGit({ tag: request.tag });
+          break;
+        }
+        case "cancel":
+          cancelManagedGitInstall();
+          break;
+        case "select":
+          await this.selectGitRuntime(request.choice);
+          break;
+        case "remove":
+          await removeManagedGitGeneration(request.generation, this.protectedManagedGitGenerations());
+          break;
+        case "track":
+          await this.setManagedGitTrack(request.track);
+          break;
+      }
+      return undefined;
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") return undefined;
+      return error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  /**
+   * A track changes only what Updates offers. Both tracks' answers are
+   * already stored, so this writes the track and nothing else: no release
+   * check, no download, and the selected Git stays as it is.
+   */
+  private async setManagedGitTrack(track: unknown): Promise<void> {
+    const channel = parseDesktopUpdateChannel(track);
+    if (!channel) throw new Error("Not a build track.");
+    await this.writeConfigPatchTargeted({ applications: { git: { managedBuildChannel: channel } } });
+  }
+
+  /** Settings opening Git asks GitHub at most every few hours. */
+  async refreshManagedGitCheckIfStale(): Promise<void> {
+    if (!managedGitSupported()) return;
+    const check = await readManagedGitCheck();
+    if (check && Date.now() - check.checkedAt < MANAGED_GIT_CHECK_TTL_MS) return;
+    await checkManagedGitReleases({ manual: false }).catch(() => undefined);
+  }
+
+  private async selectGitRuntime(choice: DesktopGitRuntimeChoice): Promise<void> {
+    if (readEnvString(this.env, GIT_COMMAND_ENV)) {
+      throw new Error(`${GIT_COMMAND_ENV} is set, so it wins over anything chosen here.`);
+    }
+    if (choice.kind === "managed") {
+      // Every check again, signatures included, before this profile runs it.
+      noteManagedGitVerified(await verifyManagedGitGeneration(choice.generation));
+    }
+    const git = this.configStore.read("applications").git;
+    const patch = gitRuntimeSelectionPatch(currentGitRuntimeChoice(git), choice);
+    await this.writeConfigPatchTargeted({ applications: { git: patch } });
+    // Commands already running keep the executable they started with;
+    // releases nobody names any more are removed once nothing runs them.
+    await pruneManagedGitGenerations(this.protectedManagedGitGenerations()).catch(() => undefined);
   }
 
   private readConfig(): ConfigReadResult {

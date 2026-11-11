@@ -1,20 +1,25 @@
+import { ownerStorage } from "./helpers/owner-storage.js";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { fixtureCodexClient } from "./helpers/codex-client.js";
 import { HeadlessBackend, PLACEHOLDER_THREAD_TITLE } from "../src/federation-backend.js";
 
-function backendFixture(t, jobs, read = async () => ({ thread: { turns: [] } })) {
+function backendFixture(t, jobs, read = async () => ({ thread: { turns: [] } }), legacyThreads) {
   const local = fileURLToPath(new URL("../../../.local/", import.meta.url));
   mkdirSync(local, { recursive: true });
   const directory = mkdtempSync(path.join(local, "titles-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const owner = ownerStorage(t, directory, directory, legacyThreads);
+  const codex = fixtureCodexClient(read);
   const runtime = { projects: { list: () => [{ path: directory, label: "Fixture" }] }, workspace: directory, loadedThreads: new Set(),
-    store: { directory: path.join(directory, "jobs"), jobs }, codex: { request: read }, onFailure: (error) => { throw error; } };
+    store: { directory: path.join(owner.directory, "jobs"), jobs, threadRegistry: owner.threadRegistry, inventory: owner.inventory,
+      retainedOwners: owner.storage.retainedOwners }, codex, onFailure: (error) => { throw error; } };
   const published = [];
   const backend = new HeadlessBackend(runtime, (event, eventClass) => published.push({ eventClass, ...event.notification }));
-  return { backend, published, registry: () => JSON.parse(readFileSync(backend.file, "utf8")).threads };
+  return { backend, published, registry: () => [...backend.threads.values()] };
 }
 
 function job(id, threadId, extra = {}) {
@@ -22,11 +27,10 @@ function job(id, threadId, extra = {}) {
 }
 
 test("a thread keeps desktop's placeholder title until it is named, including one stored under the old placeholder", (t) => {
-  const { backend } = backendFixture(t, new Map());
-  writeFileSync(backend.file, JSON.stringify({ version: 1, threads: [
+  const { backend } = backendFixture(t, new Map(), undefined, [
     { id: "legacy", title: "New outpost thread", titleSource: "fallback", createdAt: 1 },
     { id: "named", title: "New outpost thread", titleSource: "explicit", createdAt: 1 },
-  ] }));
+  ]);
   const reopened = new HeadlessBackend(backend.runtime, () => {});
   assert.equal(PLACEHOLDER_THREAD_TITLE, "Untitled thread");
   assert.deepEqual((({ title, titleSource }) => ({ title, titleSource }))(reopened.summary(reopened.owned("legacy"))),
@@ -73,6 +77,9 @@ test("an explicit rename is never replaced, and an empty prompt leaves the place
   assert.deepEqual(published[0], { eventClass: "transcript", method: "thread/name/updated",
     params: { threadId: "named", threadName: "Release checklist", titleSource: "explicit" } });
   backend.event({ method: "headless/turnStarted", params: { threadId: "named", jobId: "named", prompt: "Rewrite everything" } });
+  const beforeDerived = published.length;
+  backend.event({ method: "thread/name/updated", params: { threadId: "named", threadName: "Rewrite everything", titleSource: "derived" } });
+  assert.equal(published.length, beforeDerived, "a rejected derived title is not published");
   await backend.readThread("named");
   assert.equal(backend.owned("named").title, "Release checklist");
   assert.equal(backend.owned("named").titleSource, "explicit");

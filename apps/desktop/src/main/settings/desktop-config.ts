@@ -1,4 +1,4 @@
-import type { DesktopThreadArchivePolicy, ThreadExecutionMode, ThreadTodoMergeMethod } from "@pwragent/shared";
+import type { DesktopCheckoutHibernationPolicy, DesktopThreadArchiveConfig, ThreadExecutionMode, ThreadTodoMergeMethod } from "@pwragent/shared";
 import {
   FORGE_AGENT_TOOL_GROUPS,
   FORGE_AGENT_TOOL_RULE_GROUPS,
@@ -132,6 +132,7 @@ export type DesktopSettingsConfig = {
     confirmQuitWithInProgressThreads?: boolean;
     attentionPromoteOnTurnEnd?: boolean;
     pinnedThreadsOnTop?: boolean;
+    autoFixReviews?: boolean;
     passSetupVariablesToAgents?: boolean;
     interactiveSvgSkipNotice?: boolean;
     interactiveSvgAutoOpen?: boolean;
@@ -414,10 +415,17 @@ export type DesktopSettingsConfig = {
     };
     git?: {
       path?: string;
+      /** Downloaded PwrDrvr Git release chosen with Use (generation id). */
+      managed?: string;
+      /** What Roll back returns to: `bundled`, `managed:<id>` or `path:<path>`. */
+      managedPrevious?: string;
+      /** Build track Settings → Git → Updates offers releases from. */
+      managedBuildChannel?: DesktopUpdateChannel;
     };
   };
   worktrees?: {
-    archive?: Partial<DesktopThreadArchivePolicy>;
+    archive?: DesktopThreadArchiveConfig;
+    hibernate?: Partial<DesktopCheckoutHibernationPolicy>;
     storage?: DesktopWorktreeStorageLocation;
   };
 };
@@ -430,6 +438,8 @@ const LEGACY_CHAT_REPLY_COMPOSER_LAST_VERSION = "1.0.0-alpha.8";
 const LEGACY_BACKGROUND_PR_POLLING_LAST_VERSION = "1.0.0-beta.50";
 const LEGACY_FEDERATION_GATEWAY_URL_LAST_VERSION = "1.0.0-beta.50";
 const LEGACY_TOKEN_MISER_GENERAL_LAST_VERSION = "1.1.0-alpha.1";
+/** Last version whose hourly sweep archived threads by `[worktrees.archive] enabled`. */
+const LEGACY_AUTOMATIC_ARCHIVE_LAST_VERSION = "1.3.13";
 
 export function defaultDesktopConfigDir(
   options?: DesktopConfigPathOptions,
@@ -716,6 +726,9 @@ export function desktopSettingsPatchToEdits(
       ["general", "pinned_threads_on_top"],
       patch.general.pinnedThreadsOnTop,
     );
+  }
+  if (patch.general?.autoFixReviews !== undefined) {
+    set(["general", "auto_fix_reviews"], patch.general.autoFixReviews);
   }
   if (patch.general?.passSetupVariablesToAgents !== undefined) {
     set(
@@ -2141,15 +2154,44 @@ export function desktopSettingsPatchToEdits(
   if (patch.applications?.git?.path !== undefined) {
     set(["applications", "git", "path"], patch.applications.git.path);
   }
+  if (patch.applications?.git?.managed !== undefined) {
+    set(["applications", "git", "managed"], patch.applications.git.managed);
+  }
+  if (patch.applications?.git?.managedPrevious !== undefined) {
+    set(["applications", "git", "managed_previous"], patch.applications.git.managedPrevious);
+  }
+  if (patch.applications?.git?.managedBuildChannel !== undefined) {
+    set(["applications", "git", "managed_build_channel"], patch.applications.git.managedBuildChannel);
+  }
 
   if (patch.worktrees?.archive) {
     const archive = patch.worktrees.archive;
+    // `enabled` was the automatic-archive switch. This version never writes or
+    // removes it, so an older build keeps its own behavior after a downgrade.
+    if (readBoolean(currentTables["worktrees.archive"]?.enabled) !== undefined) {
+      edits.push({
+        op: "ensureCommentBefore",
+        path: ["worktrees", "archive", "enabled"],
+        marker: LEGACY_SETTINGS_MARKER,
+        comment: legacyAutomaticArchiveComment(),
+      });
+    }
     for (const [property, key] of [
-      ["enabled", "enabled"], ["mode", "mode"],
+      ["mode", "mode"],
       ["inactivityDays", "inactivity_days"], ["keepPerProject", "keep_per_project"],
       ["retentionDays", "retention_days"],
     ] as const) {
       if (archive[property] !== undefined) set(["worktrees", "archive", key], archive[property]);
+    }
+  }
+
+  if (patch.worktrees?.hibernate) {
+    const hibernate = patch.worktrees.hibernate;
+    for (const [property, key] of [
+      ["enabled", "enabled"], ["idleDays", "idle_days"], ["maxSnapshotMb", "max_snapshot_mb"],
+      ["removeRebuildableOutput", "remove_rebuildable_output"], ["restoreOn", "restore_on"],
+    ] as const) {
+      if (hibernate[property] !== undefined) set(["worktrees", "hibernate", key], hibernate[property]);
     }
   }
 
@@ -2211,6 +2253,7 @@ function normalizeDesktopConfig(
   const gitApplication = tables["applications.git"];
   const worktrees = tables["worktrees"];
   const archive = tables["worktrees.archive"];
+  const hibernate = tables["worktrees.hibernate"];
 
   return pruneEmptyConfig({
     general: {
@@ -2221,6 +2264,7 @@ function normalizeDesktopConfig(
         general?.attention_promote_on_turn_end,
       ),
       pinnedThreadsOnTop: readBoolean(general?.pinned_threads_on_top),
+      autoFixReviews: readBoolean(general?.auto_fix_reviews),
       passSetupVariablesToAgents: readBoolean(
         general?.pass_setup_variables_to_agents,
       ),
@@ -2684,15 +2728,25 @@ function normalizeDesktopConfig(
       },
       git: {
         path: readString(gitApplication?.path),
+        managed: readString(gitApplication?.managed),
+        managedPrevious: readString(gitApplication?.managed_previous),
+        managedBuildChannel: readUpdateChannel(gitApplication?.managed_build_channel),
       },
     },
     worktrees: {
       archive: archive ? {
-        enabled: readBoolean(archive?.enabled),
+        legacyEnabled: readBoolean(archive?.enabled),
         mode: archive?.mode === "age" || archive?.mode === "count" ? archive.mode : undefined,
         inactivityDays: readNumber(archive?.inactivity_days),
         keepPerProject: readNumber(archive?.keep_per_project),
         retentionDays: readNumber(archive?.retention_days),
+      } : undefined,
+      hibernate: hibernate ? {
+        enabled: readBoolean(hibernate.enabled),
+        idleDays: readNumber(hibernate.idle_days),
+        maxSnapshotMb: readNumber(hibernate.max_snapshot_mb),
+        removeRebuildableOutput: readBoolean(hibernate.remove_rebuildable_output),
+        restoreOn: hibernate.restore_on === "send" || hibernate.restore_on === "open" ? hibernate.restore_on : undefined,
       } : undefined,
       storage: readWorktreeStorage(worktrees?.storage),
     },
@@ -2718,6 +2772,7 @@ function pruneEmptyConfig(config: DesktopSettingsConfig): DesktopSettingsConfig 
     config.general?.confirmQuitWithInProgressThreads;
   const attentionPromoteOnTurnEnd = config.general?.attentionPromoteOnTurnEnd;
   const pinnedThreadsOnTop = config.general?.pinnedThreadsOnTop;
+  const autoFixReviews = config.general?.autoFixReviews;
   const passSetupVariablesToAgents = config.general?.passSetupVariablesToAgents;
   const interactiveSvgSkipNotice = config.general?.interactiveSvgSkipNotice;
   const interactiveSvgAutoOpen = config.general?.interactiveSvgAutoOpen;
@@ -2744,6 +2799,7 @@ function pruneEmptyConfig(config: DesktopSettingsConfig): DesktopSettingsConfig 
     confirmQuitWithInProgressThreads !== undefined ||
     attentionPromoteOnTurnEnd !== undefined ||
     pinnedThreadsOnTop !== undefined ||
+    autoFixReviews !== undefined ||
     passSetupVariablesToAgents !== undefined ||
     interactiveSvgSkipNotice !== undefined ||
     interactiveSvgAutoOpen !== undefined ||
@@ -2790,6 +2846,9 @@ function pruneEmptyConfig(config: DesktopSettingsConfig): DesktopSettingsConfig 
     }
     if (pinnedThreadsOnTop !== undefined) {
       pruned.general.pinnedThreadsOnTop = pinnedThreadsOnTop;
+    }
+    if (autoFixReviews !== undefined) {
+      pruned.general.autoFixReviews = autoFixReviews;
     }
     if (passSetupVariablesToAgents !== undefined) {
       pruned.general.passSetupVariablesToAgents = passSetupVariablesToAgents;
@@ -4050,6 +4109,17 @@ function legacyBackgroundPrPollingComment(): string {
     "key=background_pr_polling",
     "shape=boolean",
     `used_through=${LEGACY_BACKGROUND_PR_POLLING_LAST_VERSION}`,
+    "kept_for_older_clients",
+  ].join(" ");
+}
+
+function legacyAutomaticArchiveComment(): string {
+  return [
+    "#",
+    LEGACY_SETTINGS_MARKER,
+    "key=enabled",
+    "shape=boolean",
+    `used_through=${LEGACY_AUTOMATIC_ARCHIVE_LAST_VERSION}`,
     "kept_for_older_clients",
   ].join(" ");
 }

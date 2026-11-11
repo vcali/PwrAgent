@@ -1,9 +1,20 @@
 import { getDesktopBackendRegistry } from "../app-server/backend-registry";
 import type { DismissOperatorQuestionRequest, OperatorQuestionThreadRequest, ListOperatorRequestsRequest, MarkOperatorItemsSeenRequest, SubmitThreadReplyRequest, SubmitThreadReplyResponse } from "@pwragent/shared";
 import { isAppServerBackendKind } from "@pwragent/shared";
-import type { OperatorRequestService } from "./operator-request-service";
+import { OperatorRequestService } from "./operator-request-service";
+import { createOperatorRequestStorage } from "../storage/desktop-operator-request-storage";
 
 let service: OperatorRequestService | undefined;
+
+export function createDesktopOperatorRequestService(
+  broadcast: ConstructorParameters<typeof OperatorRequestService>[0]["broadcast"],
+): OperatorRequestService {
+  return new OperatorRequestService({
+    registry: getDesktopBackendRegistry(),
+    store: createOperatorRequestStorage(),
+    broadcast,
+  });
+}
 
 export function installOperatorRequestService(current: OperatorRequestService): void {
   service = current;

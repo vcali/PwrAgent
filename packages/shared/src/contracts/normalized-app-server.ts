@@ -142,6 +142,8 @@ export type AppServerAvailableCommandSummary = {
   name: string;
   description?: string;
   aliases?: string[];
+  /** The arguments the command takes, such as `[low|medium|high] [--fix]`. */
+  argumentHint?: string;
   backend?: AppServerBackendKind;
   scope?: "backend" | "session";
   source?: "provider";
@@ -350,6 +352,9 @@ export type LinkedDirectorySummary = {
 export type WorktreeSnapshotState =
   | "present"
   | "archived"
+  /** An idle thread's checkout, removed after this snapshot; the thread stays
+   * in the lists and the next send puts the checkout back. */
+  | "hibernated"
   | "restored"
   | "unavailable";
 
@@ -365,6 +370,13 @@ export type WorktreeSnapshotSummary = {
   sourceHead?: string;
   createdAt: number;
   archivedAt?: number;
+  /** When an idle checkout was hibernated. Set with state "hibernated". */
+  hibernatedAt?: number;
+  /** What a hibernation saved, for the thread card: uncommitted files and
+   * their size, and the ignored output folders removed with the checkout. */
+  changedFileCount?: number;
+  changedBytes?: number;
+  removedOutput?: string[];
   restoredAt?: number;
   /** Physical checkout successfully recreated by restore, for shared-owner reuse. */
   restoredCheckoutIdentity?: { device: string; inode: string; birthtimeNs: string; gitDirectory: string };
@@ -696,6 +708,9 @@ export type AppServerThreadSummary = {
   };
   /** Set by the owner's selected-detail read when the worktree folder is gone. */
   workspaceMissing?: ThreadMissingWorkspace;
+  /** Set by the owner's selected-detail read while the worktree is hibernated
+   * and comes back on the next send. A failed restore reports workspaceMissing. */
+  workspaceHibernated?: ThreadHibernatedWorkspace;
   codexEnvironmentRuntime?: CodexThreadEnvironmentRuntime;
   worktreeSnapshots?: WorktreeSnapshotSummary[];
   /** Native Codex provenance when this summary itself is a spawned worker. */
@@ -792,6 +807,11 @@ export type AppServerThreadMessageOrigin = {
     outcome: "success" | "failure" | "cancelled";
     summary: string;
   };
+  /**
+   * PwrAgent sent this message when a review started with auto-fix finished.
+   * Display text only: the review's id and title as the owner recorded them.
+   */
+  reviewAutoFix?: { reviewId: string; title?: string; findingCount: number };
   prAutomation?: {
     kind: "auto-fix" | "watch";
     prKey: string;
@@ -1111,6 +1131,14 @@ export type ArchiveThreadCleanupResult = {
   error?: string;
 };
 
+export type ArchiveCleanupProgress = {
+  batchId: string;
+  active: Array<{ backend: AppServerBackendKind; threadId: string; worktreePath?: string }>;
+  queued: number;
+  completed: number;
+  total: number;
+};
+
 export type ArchiveThreadRequest = {
   backend: AppServerBackendKind;
   threadId: ThreadIdentifier;
@@ -1313,8 +1341,32 @@ export type WorktreeRecoveryStep = {
   detail?: string;
 };
 
+/** A hibernated checkout: removed while idle, restored on the next send. */
+export type ThreadHibernatedWorkspace = {
+  worktreePath: string;
+  repositoryPath: string;
+  hibernatedAt: number;
+  branch?: string;
+  /** Uncommitted files the snapshot holds, and their size. */
+  changedFileCount?: number;
+  changedBytes?: number;
+  /** Ignored output folders, such as node_modules, removed with the checkout. */
+  removedOutput?: string[];
+  /** A restore is running now. */
+  restoring?: boolean;
+  /** How far the running restore is: putting the checkout back, then the
+   * project environment setup. */
+  restorePhase?: "checkout" | "setup";
+  /** The restore runs the project environment setup after the checkout. */
+  runsSetup?: boolean;
+  /** The operator exempted this thread from hibernation. */
+  keepAwake?: boolean;
+};
+
 export type WorktreeRecoveryFailureReason =
   | "repository-missing"
+  /** The branch no longer points at the commit the checkout was saved on. */
+  | "branch-moved"
   | "path-occupied"
   | "record-locked"
   | "checkpoint-missing"
@@ -2123,6 +2175,12 @@ export type AppServerNotification =
           durationMs?: number | null;
           error: {
             message: string;
+            /**
+             * A way forward the client can offer. `claudeSessionGone`:
+             * Claude Code deleted the session the thread resumes, and the
+             * thread can continue in a new one.
+             */
+            recovery?: "claudeSessionGone";
           };
         };
       };
@@ -2264,10 +2322,16 @@ export type AppServerNotification =
       };
     }
   | {
+      method: "archiveCleanup/progress";
+      params: ArchiveCleanupProgress;
+    }
+  | {
       method: "thread/archiveCleanup/completed";
       params: {
         threadId: string;
         archivedAt: number;
+        /** Recovery and released references report together, without archive action toasts. */
+        reporting?: "background";
         cleanup: ArchiveThreadCleanupResult[];
         error?: string;
       };
@@ -2526,6 +2590,18 @@ export type AppServerNotification =
         threadId: string;
         queuedExecutionMode: ThreadExecutionMode;
         queuedAt: number;
+      };
+    }
+  | {
+      /** A thread's checkout hibernated, began or advanced a restore, came
+       * back, or its Keep it awake setting changed. `workspace` is the
+       * hibernated checkout as the thread card shows it, null once the
+       * checkout is awake, and absent when only `keepAwake` changed. */
+      method: "thread/checkoutHibernation/updated";
+      params: {
+        threadId: string;
+        workspace?: ThreadHibernatedWorkspace | null;
+        keepAwake?: boolean;
       };
     }
   | {

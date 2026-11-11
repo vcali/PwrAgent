@@ -1,7 +1,14 @@
 import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { AppServerThreadReviewEntry, ThreadReview, ThreadTodo, ThreadTodosChangedEvent } from "@pwragent/shared";
+import type {
+  AppServerThreadReviewEntry,
+  ReviewAutoFixRun,
+  ReviewAutoFixStatus,
+  ThreadReview,
+  ThreadTodo,
+  ThreadTodosChangedEvent,
+} from "@pwragent/shared";
 import { threadReviewDisplayTitle, threadReviewTodo } from "@pwragent/shared";
 import type { DesktopApi } from "../../../lib/desktop-api";
 import { TranscriptReview } from "../../thread-detail/TranscriptReview";
@@ -39,6 +46,16 @@ afterEach(() => {
 });
 
 describe("review status controls", () => {
+  it("routes a mounted thread's review through its thread owner when file context has no target", async () => {
+    const api = installApi(review);
+    render(<TranscriptReview entry={entry} parentThreadId="owner"
+      threadLinkSource={{ backend: "codex", instanceId: "peer" }}
+      fileViewerContext={{ key: "remote-thread", title: "Remote thread", projectPath: "/owner/worktree" }} />);
+    await screen.findByRole("button", { name: "Dismiss review" });
+    expect(api.listThreadReviews).toHaveBeenCalledWith({ backend: "codex", threadId: "owner", status: "all",
+      federationTarget: { scope: "remote", instanceId: "peer" } });
+  });
+
   it("loads and updates tracked findings on a mounted remote thread", async () => {
     const target = { scope: "remote" as const, instanceId: "peer" };
     const api = installApi({ ...review, status: "handled" });
@@ -162,7 +179,7 @@ function renderCard(current: ThreadReview, onDoHere = vi.fn()) {
 const prompt = (lines: string[]) => [...lines, "", "Use PwrAgent's `list_reviews` tool for their details and how to record each fix."].join("\n");
 
 describe("review To-do card", () => {
-  it("lists findings by priority with no mark at rest, and fixes every open one by default", async () => {
+  it("lists findings by priority with no mark at rest, and auto-fixes every open one by default", async () => {
     const current: ThreadReview = {
       ...review,
       items: [
@@ -188,14 +205,23 @@ describe("review To-do card", () => {
     expect(within(rows[3]!).getByText("Declined")).toBeInTheDocument();
     expect(within(rows[3]!).getByRole("button", { name: "Reopen finding: Name the retry budget" })).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Fix all" }));
-    expect(handlers.onDoHere).toHaveBeenCalledWith(todo, { prompt: prompt([
+    // The thread's agent decides each open finding.
+    fireEvent.click(screen.getByRole("button", { name: "Auto-fix" }));
+    expect(handlers.onDoHere).toHaveBeenCalledWith(todo, { prompt: expect.stringMatching(
+      /^Auto-fix the 2 findings from Code review\. Decide which ones to fix\.\n\n1\. \[P1\] Abort pending exports\n2\. \[P2\] Keep the selected output format\n/,
+    ) });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Auto-fix" })).toBeEnabled());
+
+    // Fix all, from the menu, asks for every one.
+    fireEvent.click(screen.getByRole("button", { name: "Review fix options" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Fix all 2" }));
+    expect(handlers.onDoHere).toHaveBeenLastCalledWith(todo, { prompt: prompt([
       "Fix these 2 findings from Code review:",
       "",
       "1. [P1] Abort pending exports",
       "2. [P2] Keep the selected output format",
     ]) });
-    await waitFor(() => expect(screen.getByRole("button", { name: "Fix all" })).toBeEnabled());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Auto-fix" })).toBeEnabled());
 
     fireEvent.click(screen.getByRole("button", { name: "Dismiss review" }));
     expect(handlers.onResolve).toHaveBeenCalledWith(todo, "dismissed");
@@ -218,7 +244,7 @@ describe("review To-do card", () => {
       "",
       "1. [P2] Keep the selected output format",
     ]) });
-    await screen.findByRole("button", { name: "Fix all" });
+    await screen.findByRole("button", { name: "Auto-fix" });
     expect(select).toHaveAttribute("aria-pressed", "false");
   });
 
@@ -256,28 +282,28 @@ describe("review To-do card", () => {
       "",
       "1. [P2] Keep the selected output format",
     ]) });
-    await waitFor(() => expect(screen.getByRole("button", { name: "Fix all" })).toBeEnabled());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Auto-fix" })).toBeEnabled());
   });
 
   it("sends the hand-off once while the first send is still settling", async () => {
     let settle: (sent: boolean) => void = () => {};
     const onDoHere = vi.fn(() => new Promise<boolean>((resolve) => { settle = resolve; }));
     renderCard({ ...review, items: [finding("abort", "Abort pending exports", 1)] }, onDoHere);
-    const button = await screen.findByRole("button", { name: "Fix all" });
+    const button = await screen.findByRole("button", { name: "Auto-fix" });
     fireEvent.click(button);
     fireEvent.click(button);
     expect(onDoHere).toHaveBeenCalledTimes(1);
-    expect(button).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Sending…" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Fix now: Abort pending exports" })).toBeDisabled();
     settle(true);
-    await waitFor(() => expect(button).toBeEnabled());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Auto-fix" })).toBeEnabled());
   });
 
   it("shows Sending then Working and blocks duplicate fixes until the owning turn finishes", async () => {
     let settle: (sent: boolean) => void = () => {};
     const onDoHere = vi.fn(() => new Promise<boolean>((resolve) => { settle = resolve; }));
     const { rerenderCard } = renderCard({ ...review, items: [finding("abort", "Abort pending exports", 1)] }, onDoHere);
-    fireEvent.click(await screen.findByRole("button", { name: "Fix all" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Auto-fix" }));
     const sending = screen.getByRole("button", { name: "Sending…" });
     expect(sending).toBeDisabled();
     expect(sending).toHaveAttribute("aria-busy", "true");
@@ -296,7 +322,7 @@ describe("review To-do card", () => {
     expect(onDoHere).toHaveBeenCalledTimes(1);
 
     rerenderCard(false);
-    expect(screen.getByRole("button", { name: "Fix all" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Auto-fix" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Fix now: Abort pending exports" })).toBeEnabled();
   });
 
@@ -309,7 +335,7 @@ describe("review To-do card", () => {
     let settle: (sent: boolean) => void = () => {};
     const onDoHere = vi.fn(() => new Promise<boolean>((resolve) => { settle = resolve; }));
     const { rerenderCard } = renderCard({ ...review, items: [finding("abort", "Abort pending exports", 1)] }, onDoHere);
-    fireEvent.click(await screen.findByRole("button", { name: "Fix all" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Auto-fix" }));
     const sendingRing = screen.getByRole("button", { name: "Sending…" }).querySelector(".pending-spinner");
     expect(sendingRing?.matches(pairedRing)).toBe(true);
 
@@ -343,7 +369,7 @@ describe("review To-do card", () => {
     fireEvent.click(retry);
     await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
     expect(onDoHere).toHaveBeenCalledTimes(2);
-    expect(await screen.findByRole("button", { name: "Fix all" })).toBeEnabled();
+    expect(await screen.findByRole("button", { name: "Auto-fix" })).toBeEnabled();
   });
 
   it("declines a finding from its row", async () => {
@@ -389,6 +415,131 @@ describe("review To-do card", () => {
     fireEvent.click(screen.getByRole("button", { name: "Show 2 more" }));
     expect(screen.getAllByRole("listitem")).toHaveLength(6);
     expect(screen.getByRole("button", { name: "Show fewer" })).toHaveAttribute("aria-expanded", "true");
+  });
+});
+
+function installAutoFix(api: Partial<DesktopApi>, status: ReviewAutoFixStatus | Error) {
+  const next = { ...api,
+    readReviewAutoFix: vi.fn(async () => {
+      if (status instanceof Error) throw status;
+      return { status };
+    }),
+    disarmReviewAutoFix: vi.fn(async () => ({ disarmed: true, status: { armedTurnIds: [], runs: {} } })),
+  };
+  Object.assign(window, { pwragent: next });
+  return next;
+}
+
+const runningEntry: AppServerThreadReviewEntry = { ...entry, turn: { id: "turn-review", status: "in_progress" } };
+
+describe("review Auto-fix status", () => {
+  it("shows Auto-fix armed on a running review and disarms that review", async () => {
+    const api = installAutoFix(installApi(review), { armedTurnIds: ["turn-review"], runs: {} });
+    render(<TranscriptReview entry={runningEntry} parentThreadId="owner" />);
+    await screen.findByText("Auto-fix armed");
+    expect(screen.getByText("This thread's agent settles the findings when the review ends.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Don't auto-fix" }));
+    expect(api.disarmReviewAutoFix).toHaveBeenCalledWith({ backend: "codex", threadId: "owner", turnId: "turn-review" });
+    await waitFor(() => expect(screen.queryByText("Auto-fix armed")).not.toBeInTheDocument());
+  });
+
+  it("says nothing for a review that is not armed or has ended", async () => {
+    const api = installAutoFix(installApi(review), { armedTurnIds: ["another-turn"], runs: {} });
+    const { rerender } = render(<TranscriptReview entry={runningEntry} parentThreadId="owner" />);
+    await waitFor(() => expect(api.readReviewAutoFix).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText("Auto-fix armed")).not.toBeInTheDocument();
+    rerender(<TranscriptReview entry={{ ...entry, turn: { id: "turn-review", status: "completed" } }} parentThreadId="owner" />);
+    expect(screen.queryByText("Auto-fix armed")).not.toBeInTheDocument();
+    expect(api.readReviewAutoFix).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-reads armed reviews when the owner announces a change", async () => {
+    const base = installApi(review);
+    let changed: (event: ThreadTodosChangedEvent) => void = () => {};
+    vi.mocked(base.onThreadTodosChanged!).mockImplementation((listener) => { changed = listener; return () => {}; });
+    const api = installAutoFix(base, { armedTurnIds: [], runs: {} });
+    render(<TranscriptReview entry={runningEntry} parentThreadId="owner" />);
+    await waitFor(() => expect(api.readReviewAutoFix).toHaveBeenCalledTimes(1));
+    vi.mocked(api.readReviewAutoFix).mockResolvedValueOnce({ status: { armedTurnIds: ["turn-review"], runs: {} } });
+    act(() => changed({ backend: "codex", threadId: "owner", at: 2 }));
+    await screen.findByText("Auto-fix armed");
+  });
+
+  it("does not let a read from before a change answer for it", async () => {
+    const base = installApi(review);
+    let changed: (event: ThreadTodosChangedEvent) => void = () => {};
+    vi.mocked(base.onThreadTodosChanged!).mockImplementation((listener) => { changed = listener; return () => {}; });
+    const api = installAutoFix(base, { armedTurnIds: [], runs: {} });
+    let answerFirst: (value: { status: ReviewAutoFixStatus }) => void = () => {};
+    vi.mocked(api.readReviewAutoFix)
+      .mockImplementationOnce(() => new Promise((resolve) => { answerFirst = resolve; }))
+      .mockResolvedValueOnce({ status: { armedTurnIds: [], runs: {} } });
+    render(<TranscriptReview entry={runningEntry} parentThreadId="owner" />);
+    await waitFor(() => expect(api.readReviewAutoFix).toHaveBeenCalledTimes(1));
+    // Disarmed elsewhere while the first read is still out.
+    act(() => changed({ backend: "codex", threadId: "owner", at: 2 }));
+    await waitFor(() => expect(api.readReviewAutoFix).toHaveBeenCalledTimes(2));
+    await act(async () => answerFirst({ status: { armedTurnIds: ["turn-review"], runs: {} } }));
+    expect(screen.queryByText("Auto-fix armed")).not.toBeInTheDocument();
+  });
+
+  it.each<[string, ReviewAutoFixRun, string | undefined]>([
+    ["running", { phase: "running", at: 1 }, "Auto-fixing · started when the review finished"],
+    ["queued", { phase: "queued", at: 1 }, "Auto-fix queued · sends when the current turn ends"],
+    ["failed", { phase: "failed", at: 1, reason: "Thread is locked." }, "Auto-fix could not start: Thread is locked."],
+    ["finished", { phase: "finished", at: 1 }, "Auto-fix left 1 open"],
+  ])("tells the review card when its Auto-fix is %s", async (phase, run, text) => {
+    const api = installAutoFix(installApi(review, review), { armedTurnIds: [], runs: { review: run } });
+    Object.assign(window, { pwragent: api });
+    render(<ThreadTodoCard todo={threadReviewTodo(review)} running={false}
+      onRun={vi.fn()} onStartReview={vi.fn()} onResolve={vi.fn()} onDoHere={vi.fn()} onSetItemChecked={vi.fn()} />);
+    await waitFor(() => expect(document.querySelector(`.review-todo__auto[data-phase="${phase}"]`)).toHaveTextContent(text!));
+  });
+
+  it("hides a failed send once the card sends its own fix, and shows a new failure", async () => {
+    const base = installApi(review, review);
+    let changed: (event: ThreadTodosChangedEvent) => void = () => {};
+    vi.mocked(base.onThreadTodosChanged!).mockImplementation((listener) => { changed = listener; return () => {}; });
+    const api = installAutoFix(base,
+      { armedTurnIds: [], runs: { review: { phase: "failed", at: 5, reason: "Thread is locked." } } });
+    const onDoHere = vi.fn(async () => true);
+    render(<ThreadTodoCard todo={threadReviewTodo(review)} running={false}
+      onRun={vi.fn()} onStartReview={vi.fn()} onResolve={vi.fn()} onDoHere={onDoHere} onSetItemChecked={vi.fn()} />);
+    await screen.findByText("Auto-fix could not start:");
+    fireEvent.click(screen.getByRole("button", { name: "Auto-fix" }));
+    await waitFor(() => expect(onDoHere).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(document.querySelector(".review-todo__auto")).toBeNull());
+    // A later automatic send that fails again is news.
+    vi.mocked(api.readReviewAutoFix).mockResolvedValueOnce(
+      { status: { armedTurnIds: [], runs: { review: { phase: "failed", at: 9, reason: "Model unavailable." } } } });
+    act(() => changed({ backend: "codex", threadId: "owner", at: 10 }));
+    await screen.findByText("Model unavailable.", { exact: false });
+  });
+
+  it("shows no Auto-fix line when the run left nothing open or the owner does not answer", async () => {
+    const dismissed: ThreadReview = { ...review, status: "dismissed" };
+    const dismissedApi = installAutoFix(installApi(dismissed, dismissed),
+      { armedTurnIds: [], runs: { review: { phase: "finished", at: 1 } } });
+    const dismissedCard = render(<ThreadTodoCard todo={threadReviewTodo(dismissed)} running={false}
+      onRun={vi.fn()} onStartReview={vi.fn()} onResolve={vi.fn()} onDoHere={vi.fn()} onSetItemChecked={vi.fn()} />);
+    await waitFor(() => expect(dismissedApi.readReviewAutoFix).toHaveBeenCalled());
+    await act(async () => {});
+    // A dismissed review has nothing left to settle, whatever its findings say.
+    expect(document.querySelector(".review-todo__auto")).toBeNull();
+    dismissedCard.unmount();
+    const settled: ThreadReview = { ...review, items: [{ ...review.items[0]!, status: "addressed" }] };
+    const props = { running: false, onRun: vi.fn(), onStartReview: vi.fn(), onResolve: vi.fn(), onDoHere: vi.fn(), onSetItemChecked: vi.fn() };
+    let api = installAutoFix(installApi(settled, settled), { armedTurnIds: [], runs: { review: { phase: "finished", at: 1 } } });
+    const { unmount } = render(<ThreadTodoCard todo={threadReviewTodo(settled)} {...props} />);
+    await waitFor(() => expect(api.readReviewAutoFix).toHaveBeenCalled());
+    await act(async () => {});
+    expect(document.querySelector(".review-todo__auto")).toBeNull();
+    unmount();
+    api = installAutoFix(installApi(review, review), new Error("Unknown method threadReviews.readAutoFix"));
+    render(<ThreadTodoCard todo={threadReviewTodo(review)} {...props} />);
+    await waitFor(() => expect(api.readReviewAutoFix).toHaveBeenCalled());
+    await act(async () => {});
+    expect(document.querySelector(".review-todo__auto")).toBeNull();
   });
 });
 

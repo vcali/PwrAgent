@@ -109,6 +109,7 @@ const mainLogErrorMock = vi.fn();
 const initializeAppStateMock = vi.fn();
 const runStartupStorageMaintenanceMock = vi.fn<typeof import("../storage-maintenance").runStartupStorageMaintenance>();
 const disposeAppStateMock = vi.fn();
+const stopProfileRuntimeHeartbeatRefreshMock = vi.fn();
 const isAppStateInitializedMock = vi.fn();
 const prewarmWindowsJobWrapperMock = vi.fn<() => Promise<void>>();
 const messagingRuntimeStartMock = vi.fn<() => Promise<void>>();
@@ -188,6 +189,14 @@ const refreshProvidersAtStartupMock = vi.fn<() => Promise<void>>(
   async () => undefined,
 );
 const startThreadArchiveSweeperMock = vi.fn();
+const startupBackgroundMocks = {
+  startCodexIdleThreadUnsubscriber: vi.fn(),
+  startCodexAppServerRecycler: vi.fn(),
+  startAcpIdleSessionCloser: vi.fn(),
+  beginRestartContinuationDispatch: vi.fn(),
+  resumeArchiveCleanupsAtStartup: vi.fn(async () => undefined),
+  prepareTokenMiserRuntimeAtStartup: vi.fn(async () => undefined),
+};
 const disposeDesktopMessagingRuntimeMock = vi.fn();
 const registerMessagingStatusIpcHandlersMock = vi.fn();
 const disposeMessagingStatusIpcHandlersMock = vi.fn();
@@ -633,6 +642,7 @@ vi.mock("../state/app-state", () => ({
   hadExistingAppStateDatabase: vi.fn(() => true),
   getAppStateDb: vi.fn(() => ({ raw: {} })),
   disposeAppState: disposeAppStateMock,
+  stopProfileRuntimeHeartbeatRefresh: stopProfileRuntimeHeartbeatRefreshMock,
   isAppStateInitialized: isAppStateInitializedMock,
   getAppOverlayStore: vi.fn(() => ({
     rememberRemoteThreadTarget: vi.fn(),
@@ -684,10 +694,12 @@ const runtimeFederationLeaseCoordinatorMock = {
 
 vi.mock("../app-server/backend-registry", () => ({
   getExistingDesktopBackendRegistry: vi.fn(() => ({
+    ...startupBackgroundMocks,
     startThreadArchiveSweeper: startThreadArchiveSweeperMock,
     stopRunningTurnsForShutdown: vi.fn(async () => undefined),
   })),
   getDesktopBackendRegistry: vi.fn(() => ({
+    ...startupBackgroundMocks,
     onEvent: vi.fn(() => () => {}),
     synchronizeProviderRuntimeSelections: synchronizeProviderRuntimeSelectionsMock,
     listThreads: listThreadsMock,
@@ -874,6 +886,7 @@ describe("bootstrapApp", () => {
     mainLogErrorMock.mockReset();
     initializeAppStateMock.mockReset();
     disposeAppStateMock.mockReset();
+    stopProfileRuntimeHeartbeatRefreshMock.mockReset();
     isAppStateInitializedMock.mockReset();
     isAppStateInitializedMock.mockReturnValue(true);
     prewarmWindowsJobWrapperMock.mockReset();
@@ -935,6 +948,7 @@ describe("bootstrapApp", () => {
     listThreadsMock.mockResolvedValue([]);
     refreshProvidersAtStartupMock.mockReset();
     refreshProvidersAtStartupMock.mockResolvedValue(undefined);
+    for (const mock of Object.values(startupBackgroundMocks)) mock.mockClear();
     startThreadArchiveSweeperMock.mockReset();
     resolveCodexCommandMock.mockReset();
     resolveCodexCommandMock.mockResolvedValue({ command: "/cached/codex", source: "config" });
@@ -1849,6 +1863,73 @@ describe("bootstrapApp", () => {
     expect(refreshProvidersAtStartupMock).toHaveBeenCalledOnce();
   });
 
+  // The native quit event owns admission, even while startup is suspended.
+  // Exercise both dependency boundaries and both ways each can settle.
+  it.each([
+    ["selection", false], ["selection", true],
+    ["providers", false], ["providers", true],
+  ] as const)("startup ownership oracle: quit before %s settles (reject=%s)", async (boundary, reject) => {
+    let release!: () => void;
+    const dependency = new Promise<void>((resolve, fail) => {
+      release = () => reject ? fail(new Error("fixture startup failure")) : resolve();
+    });
+    if (boundary === "selection") {
+      resolveCodexCommandMock.mockImplementation(async () => {
+        await dependency;
+        return { command: "/fixture/codex", source: "config" };
+      });
+    } else {
+      refreshProvidersAtStartupMock.mockReturnValue(dependency);
+    }
+    await import("../index");
+    await flushMicrotasks();
+    const admitted = refreshProvidersAtStartupMock.mock.calls.length;
+    appEventHandlers.get("before-quit")?.({ preventDefault: vi.fn() });
+    await flushMicrotasks();
+    release();
+    await flushMicrotasks();
+
+    expect(refreshProvidersAtStartupMock).toHaveBeenCalledTimes(admitted);
+    expect(startThreadArchiveSweeperMock).not.toHaveBeenCalled();
+    for (const mock of Object.values(startupBackgroundMocks)) expect(mock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["selection", "cancel"], ["selection", "reject"],
+    ["providers", "cancel"], ["providers", "reject"],
+  ] as const)("startup ownership oracle: a %s result survives quit confirmation %s", async (boundary, outcome) => {
+    let releaseStartup!: () => void;
+    const dependency = new Promise<void>((resolve) => { releaseStartup = resolve; });
+    if (boundary === "selection") {
+      resolveCodexCommandMock.mockImplementation(async () => {
+        await dependency;
+        return { command: "/fixture/codex", source: "config" };
+      });
+    } else {
+      refreshProvidersAtStartupMock.mockReturnValue(dependency);
+    }
+    await import("../index");
+    await flushMicrotasks();
+
+    let finishConfirmation!: () => void;
+    requestQuitMock.mockReturnValue(new Promise<boolean>((resolve, reject) => {
+      finishConfirmation = () => outcome === "cancel"
+        ? resolve(false) : reject(new Error("fixture confirmation failed"));
+    }));
+    isQuitAllowedMock.mockReturnValue(false);
+    appEventHandlers.get("before-quit")?.({ preventDefault: vi.fn() });
+    releaseStartup();
+    await flushMicrotasks();
+    expect(disposeAppServerIpcHandlersMock).not.toHaveBeenCalled();
+    finishConfirmation();
+    await flushMicrotasks();
+
+    expect(refreshProvidersAtStartupMock).toHaveBeenCalledOnce();
+    expect(startThreadArchiveSweeperMock).toHaveBeenCalledOnce();
+    for (const mock of Object.values(startupBackgroundMocks)) expect(mock).toHaveBeenCalledOnce();
+    expect(quitMock).not.toHaveBeenCalled();
+  });
+
   it("skips the prewarm when the Codex bootstrap is deferred for onboarding", async () => {
     startupProfilerInstance.start.mockResolvedValue();
     isCodexBootstrapDeferredMock.mockReturnValue(true);
@@ -2400,6 +2481,34 @@ describe("bootstrapApp", () => {
     expect(handoff).toHaveBeenCalledOnce();
     expect(quitMock).not.toHaveBeenCalled();
     expect(stopWindowDiagnosticsMock).toHaveBeenCalledOnce();
+  });
+
+  it("stops the profile heartbeat refresh between the resource barrier and quit", async () => {
+    // The heartbeat is a synchronous main-thread write every 10s. Left armed,
+    // it ran inside Electron's native quit on Windows and blocked the close.
+    let refreshArmed = true;
+    stopProfileRuntimeHeartbeatRefreshMock.mockImplementation(() => {
+      refreshArmed = false;
+    });
+    let refreshArmedAtQuit: boolean | undefined;
+    quitMock.mockImplementation(() => {
+      refreshArmedAtQuit ??= refreshArmed;
+    });
+    startupProfilerInstance.start.mockResolvedValue();
+
+    await import("../index");
+    await flushMicrotasks();
+
+    appEventHandlers.get("before-quit")?.({ preventDefault: vi.fn() });
+    await vi.waitFor(() => expect(quitMock).toHaveBeenCalledTimes(1));
+
+    expect(refreshArmedAtQuit).toBe(false);
+    expect(stopProfileRuntimeHeartbeatRefreshMock).toHaveBeenCalledTimes(1);
+    // Not before the runtime is released: the marker is its liveness proof.
+    expect(disposeAppServerIpcHandlersMock.mock.invocationCallOrder[0]).toBeLessThan(
+      stopProfileRuntimeHeartbeatRefreshMock.mock.invocationCallOrder[0],
+    );
+    expect(disposeAppStateMock).not.toHaveBeenCalled();
   });
 
   it("awaits async resource disposal before completing quit", async () => {

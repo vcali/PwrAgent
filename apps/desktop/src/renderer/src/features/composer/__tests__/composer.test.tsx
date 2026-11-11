@@ -8039,6 +8039,43 @@ describe("Composer", () => {
     }));
   });
 
+  /**
+   * Rule: the review panel's Auto-fix switch starts at Settings -> General ->
+   * Reviews, and the request carries what the operator leaves it at.
+   */
+  it.each([
+    { setting: undefined, starts: true },
+    { setting: true, starts: true },
+    { setting: false, starts: false },
+  ])("starts the Auto-fix switch at the Settings default ($setting) and sends the choice", async ({ setting, starts }) => {
+    const startReview = vi.fn(async () => ({ backend: "codex" as const, threadId: "thread-1", reviewThreadId: "thread-1", turnId: "review" }));
+    const backend = backendSummary("codex");
+    backend.capabilities = { ...backend.capabilities, startReview: true, reviewRunMode: true, reviewRunner: true,
+      reviewCodexSubAgent: true, reviewAutoFix: true };
+    render(<Composer
+      backends={[backend]}
+      desktopApi={{ onAgentEvent: () => () => undefined, startReview }}
+      disabled={false} skills={[]}
+      reviewAutoFixDefault={setting}
+      thread={{
+        id: "thread-1", title: "Review default", titleSource: "explicit",
+        source: "codex", executionMode: "default", inbox: { inInbox: false },
+        linkedDirectories: [],
+      }}
+    />);
+    fireEvent.change(screen.getByLabelText("Reply"), { target: { value: "/review" } });
+    fireEvent.keyDown(screen.getByLabelText("Reply"), { key: "Enter" });
+    const toggle = screen.getByRole("switch", { name: "Auto-fix findings" });
+    expect(toggle).toHaveAttribute("aria-checked", String(starts));
+    // One click changes this review only.
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-checked", String(!starts));
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Start review" })); });
+    expect(startReview).toHaveBeenCalledWith(expect.objectContaining({
+      afterReview: starts ? "wait" : "auto-fix",
+    }));
+  });
+
   it.each(["click", "keyboard"])("routes a sole secondary PR with its required review mode via %s", async (input) => {
     const startReview = vi.fn(async () => ({ backend: "codex" as const, threadId: "thread-1", reviewThreadId: "thread-1", turnId: "review" }));
     const backend = backendSummary("codex");
@@ -9077,6 +9114,42 @@ describe("Composer", () => {
       }));
       expect(screen.getByLabelText("Queued message")).toHaveTextContent("Answer: Staging");
       expect(screen.getByLabelText("Queued message")).not.toHaveTextContent("send_user_message");
+    });
+
+    it("labels a reply that waits for a hibernated checkout's restore", async () => {
+      const startTurn = vi.fn(async (request: StartTurnRequest) => ({
+        backend: request.backend,
+        threadId: request.threadId,
+        turnId: "queue-entry-1",
+        queueStatus: "queued" as const,
+        queueEntryId: "queue-entry-1",
+      }));
+      const onReplySubmissionSettled = vi.fn();
+      const restoring = {
+        ...thread,
+        workspaceHibernated: {
+          worktreePath: "/home/dev/.pwragent/worktrees/k3m9q2/harbor-web", repositoryPath: "/home/dev/src/harbor-web",
+          hibernatedAt: 1, restoring: true, restorePhase: "checkout" as const,
+        },
+      };
+      const props = {
+        backends: [backendSummary("codex")],
+        desktopApi: { onAgentEvent: () => () => undefined, startTurn },
+        onReplySubmissionSettled,
+        skills: [],
+        thread: restoring,
+        threadBusy: true,
+      };
+      const view = render(<Composer {...props} />);
+      view.rerender(<Composer {...props} replySubmission={{ id: 1, threadId: thread.id, backend: "codex", text: reply }} />);
+      await waitFor(() => expect(onReplySubmissionSettled).toHaveBeenCalledWith(1, true));
+      const queued = screen.getByLabelText("Queued message");
+      expect(queued).toHaveClass("composer__queued--waiting-checkout");
+      expect(queued).toHaveTextContent("Waiting for checkout");
+
+      // Once the checkout is back the row reads as an ordinary queued message.
+      view.rerender(<Composer {...props} thread={thread} />);
+      expect(screen.getByLabelText("Queued message")).not.toHaveTextContent("Waiting for checkout");
     });
 
     it.each([false, true])("honors a to-do's queue choice on a steerable thread (busy: %s)", async (busy) => {
@@ -11422,6 +11495,41 @@ describe("Composer", () => {
     expect(within(dialog).getByAltText("queued.png")).toBeInTheDocument();
     fireEvent.keyDown(window, { key: "Escape" });
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it.each([false, true])("removes optimistic transcript input when the owner queues a reply (remote=%s)", async (remote) => {
+    const addOptimisticUserMessage = vi.fn(() => "optimistic-queued-reply");
+    const removeOptimisticMessage = vi.fn();
+    const onPendingStatusChange = vi.fn();
+    const startTurn = vi.fn(async () => ({
+      backend: "codex" as const, threadId: "thread-1", turnId: "owner-entry",
+      queueStatus: "queued" as const, queueEntryId: "owner-entry",
+    }));
+    render(<Composer
+      desktopApi={{ onAgentEvent: () => () => undefined, startTurn }}
+      addOptimisticUserMessage={addOptimisticUserMessage}
+      removeOptimisticMessage={removeOptimisticMessage}
+      onPendingStatusChange={onPendingStatusChange}
+      disabled={false}
+      skills={[]}
+      thread={{
+        id: "thread-1", title: "Fixture", titleSource: "explicit", source: "codex",
+        linkedDirectories: [], inbox: { inInbox: false },
+        ...(remote ? { federation: { instanceLabel: "Fixture owner", ref: buildFederatedThreadRef({
+          backend: "codex", threadId: "thread-1", instanceId: "fixture-owner",
+        }) } } : {}),
+      }}
+    />);
+    fireEvent.change(screen.getByRole("textbox", { name: "Reply" }), {
+      target: { value: "did this finish?" },
+    });
+    await clickButton("Send");
+    await waitFor(() => expect(startTurn).toHaveBeenCalledTimes(1));
+    // The owning FIFO is the oracle: a queued response has no user item in
+    // the provider transcript and cannot establish a new thinking state.
+    await waitFor(() => expect(removeOptimisticMessage).toHaveBeenCalledWith("optimistic-queued-reply"));
+    expect(onPendingStatusChange).toHaveBeenLastCalledWith(undefined);
+    expect(screen.getByLabelText("Queued message")).toHaveTextContent("did this finish?");
   });
 
   it("submits a busy-thread queued reply to the backend before navigation", async () => {
@@ -13914,6 +14022,66 @@ describe("Composer", () => {
     expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
   });
 
+  it.each(["scheduled", "dispatching", "queued", "failed"] as const)(
+    "shows the queued toast only after the owner accepts a native review follow-up (%s)",
+    async (status) => {
+      const backend = backendSummary("codex");
+      backend.capabilities.steerTurn = true;
+      const onShowNotice = vi.fn();
+      const startTurn = vi.fn();
+      const steerTurn = vi.fn(async (request: SteerTurnRequest) => ({
+        backend: request.backend, threadId: request.threadId, turnId: request.expectedTurnId,
+        disposition: "scheduled" as const,
+        fallbackReason: "native-review" as const,
+        scheduledAction: {
+          id: "native-review-follow-up", backend: request.backend, threadId: request.threadId,
+          kind: "turn" as const, origin: "desktop" as const, status,
+          scheduledFor: Date.now(), createdAt: Date.now(), updatedAt: Date.now(),
+          displayText: request.fallback!.displayText, turn: request.fallback!.turn,
+          ...(status === "queued" ? { queueEntryId: "queued-follow-up" } : {}),
+          ...(status === "failed" ? { errorMessage: "Could not queue follow-up" } : {}),
+        },
+      }));
+      render(<Composer
+        activeTurnId="review-turn"
+        backends={[backend]}
+        desktopApi={{ steerTurn, startTurn, onAgentEvent: () => () => undefined }}
+        onShowNotice={onShowNotice}
+        skills={[]}
+        thread={{
+          id: "native-review-parent", title: "Native review", source: "codex",
+          titleSource: "explicit", executionMode: "default", linkedDirectories: [],
+          inbox: { inInbox: false },
+        }}
+      />);
+
+      fireEvent.change(screen.getByLabelText("Reply"), {
+        target: { value: "Was `/etc` protected on Linux, I hope?" },
+      });
+      fireEvent.keyDown(screen.getByLabelText("Reply"), { key: "Enter", metaKey: true });
+
+      if (status === "failed") {
+        await waitFor(() => expect(screen.getByText("Could not queue follow-up")).toBeInTheDocument());
+        expect(onShowNotice).not.toHaveBeenCalled();
+        expect(screen.getByLabelText("Pending steer message")).toHaveTextContent("Was `/etc` protected on Linux, I hope?");
+        expect(startTurn).not.toHaveBeenCalled();
+        return;
+      }
+      await waitFor(() => expect(onShowNotice).toHaveBeenCalledOnce());
+      expect(onShowNotice).toHaveBeenCalledWith(expect.objectContaining({
+        title: "Message queued",
+        message: "Steering is unavailable during this type of Codex review. Your message was queued instead.",
+        tone: "neutral",
+      }));
+      expect(steerTurn).toHaveBeenCalledOnce();
+      expect(startTurn).not.toHaveBeenCalled();
+      expect(screen.getByLabelText("Queued message")).toHaveTextContent("Was `/etc` protected on Linux, I hope?");
+      expect(screen.queryByLabelText("Pending steer message")).not.toBeInTheDocument();
+      expect(screen.queryByText("Action failed")).not.toBeInTheDocument();
+      expect(screen.getByLabelText("Reply")).toHaveValue("");
+    },
+  );
+
   it("does not reinterpret a backend-owned stale steer fallback in React", async () => {
     let agentEventHandler:
       | ((event: {
@@ -14042,6 +14210,38 @@ describe("Composer", () => {
     });
 
     expect(startTurn).not.toHaveBeenCalled();
+  });
+
+  it.each(["started", "busy", "blocked"] as const)("owner disposition oracle permits Retry during a live turn and retains unadmitted input (%s)", async disposition => {
+    // The owner knows whether this held identity can steer. Its disposition,
+    // rather than the viewer's active-turn flag, decides whether input left.
+    const draftStore = createComposerDraftStore();
+    const scope = buildThreadComposerScopeKey("codex", "thread-1");
+    draftStore.setQueuedTurns(scope, [{
+      id: "backend-queued:held-1", queueEntryId: "held-1", manualReleaseRequired: true,
+      holdReason: "Review before retry", text: "Invented immutable held input",
+      imageAttachments: [], fileAttachments: [],
+    }]);
+    const releaseQueuedTurn = vi.fn(async () => ({ queueEntryId: "held-1", disposition,
+      ...(disposition === "started" ? { turnId: "native-owner" } : {}),
+      ...(disposition === "blocked" ? { errorMessage: "Owner still refuses" } : {}),
+    }));
+    const onUserRepliedToThread = vi.fn(), startTurn = vi.fn(), steerTurn = vi.fn();
+    render(<Composer backends={[backendSummary("codex")]} desktopApi={{
+      onAgentEvent: () => () => undefined, releaseQueuedTurn, startTurn, steerTurn,
+    }} disabled={false} activeTurnId="native-owner" draftStore={draftStore}
+    onUserRepliedToThread={onUserRepliedToThread} skills={[]} thread={{
+      id: "thread-1", title: "Invented live owner", titleSource: "explicit", source: "codex",
+      executionMode: "default", linkedDirectories: [], inbox: { inInbox: false },
+    }} />);
+    expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
+    await clickButton("Retry");
+    expect(releaseQueuedTurn).toHaveBeenCalledExactlyOnceWith({ queueEntryId: "held-1" });
+    expect(startTurn).not.toHaveBeenCalled();
+    expect(steerTurn).not.toHaveBeenCalled();
+    expect(onUserRepliedToThread).toHaveBeenCalledTimes(disposition === "started" ? 1 : 0);
+    expect(draftStore.getQueuedTurns(scope).map(entry => ({ id: entry.queueEntryId, text: entry.text })))
+      .toEqual(disposition === "started" ? [] : [{ id: "held-1", text: "Invented immutable held input" }]);
   });
 
   it("releases a held backend queue entry only when the operator retries it", async () => {

@@ -1,9 +1,8 @@
-import { setGitCommandResolver } from "../git-command";
+import { setGitCommandResolver, setManagedGitSelectionResolver } from "../git-command";
 import { codexAuthState } from "../codex-auth-state";
 import { app, safeStorage } from "electron";
 import { DesktopSettingsService } from "./desktop-settings-service";
-import { DbBackedSafeStorageSecretStore } from "../state/secret-store-sqlite";
-import { getAppStateDb, getAppStateMode } from "../state/app-state";
+import { createDesktopSecretStorage, getAppStateMode } from "../storage/desktop-settings-storage";
 import { broadcastAppearanceChange } from "../appearance-broadcast";
 import { syncThemedDockIcon } from "../themed-dock-icon";
 import { resolveBootstrapProfilePath } from "../profile";
@@ -22,8 +21,10 @@ import {
 import { resolveDesktopConfigPath } from "./desktop-config";
 import { readEvalManagedRuntime } from "../eval-managed-runtime";
 import { closeSharedCommandDiscovery } from "./command-discovery";
+import { onManagedGitVerificationFailed } from "../managed-git-runtime";
 
 let unsubscribeAuth: (() => void) | undefined;
+let unsubscribeManagedGitFailure: (() => void) | undefined;
 let desktopSettingsService: DesktopSettingsService | undefined;
 let commandDiscoveryClosed = false;
 
@@ -61,7 +62,7 @@ export function getDesktopSettingsService(): DesktopSettingsService {
       app.isPackaged,
     )
       ? new MemoryDesktopSecretStore()
-      : new DbBackedSafeStorageSecretStore(safeStorage, getAppStateDb());
+      : createDesktopSecretStorage(safeStorage);
     desktopSettingsService = new DesktopSettingsService({
       defaultDeveloperMode: app.isPackaged === true ? false : true,
       configStore,
@@ -108,10 +109,17 @@ export function getDesktopSettingsService(): DesktopSettingsService {
     if (commandDiscoveryClosed) void desktopSettingsService.closeCommandDiscovery();
     const service = desktopSettingsService;
     setGitCommandResolver(() => service.resolveGitCommandPreference());
-    unsubscribeAuth = codexAuthState.subscribe(() => {
+    setManagedGitSelectionResolver(() => service.resolveManagedGitSelection());
+    const announceRuntimeChange = (): void => {
       for (const webContents of subscribersForChannel(SETTINGS_RUNTIME_CHANGED_EVENT_CHANNEL)) {
         webContents.send(SETTINGS_RUNTIME_CHANGED_EVENT_CHANNEL);
       }
+    };
+    unsubscribeAuth = codexAuthState.subscribe(announceRuntimeChange);
+    // The full check of the selected release runs after startup; when it
+    // rejects the release, Settings must stop showing it as healthy.
+    unsubscribeManagedGitFailure = onManagedGitVerificationFailed(() => {
+      void service.refreshGitDiscovery().catch(() => undefined).finally(announceRuntimeChange);
     });
     configStore.subscribe(["general"], ({ values }) => {
       broadcastAppearanceChange(values.general.appearance);
@@ -139,8 +147,11 @@ export function getDesktopSettingsService(): DesktopSettingsService {
 export function resetDesktopSettingsServiceForTests(): void {
   unsubscribeAuth?.();
   unsubscribeAuth = undefined;
+  unsubscribeManagedGitFailure?.();
+  unsubscribeManagedGitFailure = undefined;
   desktopSettingsService = undefined;
   commandDiscoveryClosed = false;
   setGitCommandResolver(undefined);
+  setManagedGitSelectionResolver(undefined);
   disposeDesktopConfigStore();
 }

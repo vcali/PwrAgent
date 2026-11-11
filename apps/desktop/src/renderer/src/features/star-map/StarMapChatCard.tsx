@@ -60,6 +60,7 @@ import {
   withOwnerPause,
 } from "../composer/queued-turn-pause";
 import { useQueuedRowReorder } from "../composer/useQueuedRowReorder";
+import { backendDrawsCommandChips } from "../composer/composer-command-chip";
 import { restoreQueuedMessage } from "../composer/queued-message-content";
 import { useOwnedComposerDraftStore } from "../composer/useOwnedComposerDraftStore";
 import { useNavigationSelectedDetail } from "../../lib/useNavigationSelectedDetail";
@@ -155,6 +156,8 @@ export type StarMapChatCardProps = {
   /** Stack position; the host owns the order, we only read our depth. */
   zIndex: number;
   pastedImageMaxPatches?: number;
+  /** Settings -> General -> Reviews: whether a new review panel opens with Auto-fix on. */
+  reviewAutoFixDefault?: boolean;
 };
 
 type DragState = {
@@ -749,6 +752,8 @@ export function StarMapChatCard(props: StarMapChatCardProps) {
             : command.name;
           return {
             aliases: command.aliases,
+            argumentHint: command.argumentHint,
+            chip: backendDrawsCommandChips(commandBackend),
             description: command.description,
             name: command.name,
             // Codex compaction is a client action. ACP commands remain
@@ -2247,6 +2252,7 @@ export function StarMapChatCard(props: StarMapChatCardProps) {
           mentionSources={mentionSources}
           model={threadModel}
           normalizeImageForUpload={desktopApi?.normalizeImageForUpload}
+          preserveImageBytes={federationTarget?.scope === "remote"}
           onAttachmentError={onAttachmentError}
           onDraftRestoreApplied={onDraftRestoreApplied}
           onInterrupt={onInterrupt}
@@ -2267,6 +2273,7 @@ export function StarMapChatCard(props: StarMapChatCardProps) {
             error={reviewError}
             onCancel={closeReviewSetup}
             onSubmit={submitReviewSetup}
+            reviewAutoFixDefault={props.reviewAutoFixDefault}
             submitting={reviewSubmitting}
             thread={thread}
           />

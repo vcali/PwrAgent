@@ -3,6 +3,8 @@ import path from "node:path";
 import { randomBytes } from "node:crypto";
 import {
   MCP_CONNECTION_IDS,
+  isMcpIpcUrl,
+  parseMcpIpcUrl,
   PWRSNAP_MCP_CONNECTION_ID,
   PWRGIT_MCP_CONNECTION_ID,
   SANDBOXER_MCP_CONNECTION_ID,
@@ -13,11 +15,14 @@ import {
   isMcpConnectionToolApproval,
   isLinearMcpServerUrl,
   MCP_STDIO_ENV_NAME_PATTERN,
+  type McpConnectionProjectToolApproval,
   type McpConnectionRecord,
   type McpConnectionToolApproval,
   type McpStdioLaunch,
+  upsertMcpConnectionProjectToolApproval,
 } from "@pwragent/shared";
 import { resolveDesktopConfigPath } from "../settings/desktop-config";
+import { validateMcpIpcPlatform } from "./mcp-ipc-http";
 import {
   applyTomlEdits,
   parseTomlTables,
@@ -25,6 +30,10 @@ import {
 } from "../settings/toml-editor";
 
 const CONNECTIONS_TABLE = ["mcp_connections", "connections"] as const;
+// One table for every connection, built-in or stored, so a project's Tool
+// approval needs no per-connection key and a stored row keeps its shape:
+// `{ connection, repository, tool_approval }`.
+const PROJECT_TOOL_APPROVAL_TABLE = ["mcp_connections", "project_tool_approval"] as const;
 // PwrSnap is synthesized rather than stored, so it has no row to carry an
 // `enabled` flag. A scalar beside the table records the one piece of PwrSnap
 // state the operator owns, without a phantom row that `create` and `remove`
@@ -74,12 +83,16 @@ export class McpConnectionRegistry {
     // config.toml for itself, so a single `list()` cost three -- and `get()`
     // goes through `list()`, so every connection lookup did too.
     const table = this.readConnectionsTable();
+    const projects = readProjectToolApprovals(table);
     return [
       this.pwrSnapConnection(table),
       this.pwrGitConnection(table),
       this.sandboxerConnection(table),
       ...this.readStoredConnections(table),
-    ];
+    ].map((connection) => {
+      const entries = projects.get(connection.id);
+      return entries?.length ? { ...connection, projectToolApprovals: entries } : connection;
+    });
   }
 
   get(connectionId: string): McpConnectionRecord | undefined {
@@ -236,6 +249,54 @@ export class McpConnectionRegistry {
     return updated;
   }
 
+  /**
+   * Set or clear one project's Tool approval for a connection.
+   *
+   * The rows of every other connection and project are written back as they
+   * were read, including ones this build cannot parse, as
+   * `writeStoredConnections` keeps unknown connection rows.
+   */
+  setProjectToolApproval(
+    connectionId: string,
+    repository: string,
+    toolApproval: McpConnectionToolApproval | null,
+  ): McpConnectionRecord {
+    const target = this.get(connectionId);
+    if (!target) throw new Error("That MCP connection no longer exists.");
+    const entries = upsertMcpConnectionProjectToolApproval(
+      target.projectToolApprovals,
+      repository,
+      toolApproval,
+    );
+    if (!entries) {
+      throw new Error("Enter the repository as host/owner/repo, such as github.com/pwrdrvr/PwrAgent.");
+    }
+    this.writeProjectToolApprovalRows(connectionId, entries);
+    return this.get(connectionId)!;
+  }
+
+  private writeProjectToolApprovalRows(
+    connectionId: string,
+    entries: readonly McpConnectionProjectToolApproval[],
+  ): void {
+    const rows = readProjectToolApprovalRows(this.readConnectionsTable())
+      .filter((row) => row.connection !== connectionId);
+    for (const entry of entries) {
+      rows.push({
+        connection: connectionId,
+        repository: entry.repository,
+        tool_approval: entry.toolApproval,
+      });
+    }
+    this.writeConfig((source) =>
+      applyTomlEdits(source, [{
+        op: "setTableArray",
+        path: PROJECT_TOOL_APPROVAL_TABLE,
+        value: rows,
+      }]),
+    );
+  }
+
   /** The `[mcp_connections]` table, or undefined when there is no config yet. */
   private readConnectionsTable(): Record<string, unknown> | undefined {
     if (!fs.existsSync(this.configPath)) return undefined;
@@ -372,7 +433,7 @@ export class McpConnectionRegistry {
       id,
       displayName,
       serverUrl,
-      authMode: "oauth",
+      authMode: isMcpIpcUrl(serverUrl) ? "none" : "oauth",
       kind: "remote",
       enabled: true,
       selectForNewThreads: false,
@@ -450,6 +511,7 @@ export class McpConnectionRegistry {
       ...target,
       displayName,
       serverUrl,
+      authMode: isMcpIpcUrl(serverUrl) ? "none" : "oauth",
       updatedAt: this.now(),
     };
     this.writeStoredConnections(
@@ -468,6 +530,12 @@ export class McpConnectionRegistry {
     const next = current.filter((connection) => connection.id !== connectionId);
     if (next.length === current.length) return false;
     this.writeStoredConnections(next);
+    // A connection added later never gets an id back, so its project entries
+    // would only sit in the file.
+    if (readProjectToolApprovalRows(this.readConnectionsTable())
+      .some((row) => row.connection === connectionId)) {
+      this.writeProjectToolApprovalRows(connectionId, []);
+    }
     return true;
   }
 
@@ -601,6 +669,11 @@ export class McpConnectionRegistry {
 }
 
 export function normalizeMcpServerUrl(value: string): string {
+  if (isMcpIpcUrl(value)) {
+    const endpoint = parseMcpIpcUrl(value.trim());
+    validateMcpIpcPlatform(endpoint);
+    return endpoint.url;
+  }
   let url: URL;
   try {
     url = new URL(value.trim());
@@ -640,6 +713,36 @@ function builtInPwrSnapConnection(): McpConnectionRecord {
 
 // An unknown or hand-mistyped value reads as the default, which still asks
 // for anything the server does not mark safe.
+function readProjectToolApprovalRows(
+  table: Record<string, unknown> | undefined,
+): StoredConnectionRow[] {
+  const rows = table?.project_tool_approval;
+  if (!Array.isArray(rows)) return [];
+  return rows.filter(
+    (raw): raw is StoredConnectionRow =>
+      Boolean(raw) && !Array.isArray(raw) && typeof raw === "object",
+  );
+}
+
+/** Each connection's project entries; a malformed row is skipped, not fatal. */
+function readProjectToolApprovals(
+  table: Record<string, unknown> | undefined,
+): Map<string, McpConnectionProjectToolApproval[]> {
+  const byConnection = new Map<string, McpConnectionProjectToolApproval[]>();
+  for (const row of readProjectToolApprovalRows(table)) {
+    const { connection, repository, tool_approval: toolApproval } = row;
+    if (typeof connection !== "string" || typeof repository !== "string"
+      || !isMcpConnectionToolApproval(toolApproval)) continue;
+    const entries = upsertMcpConnectionProjectToolApproval(
+      byConnection.get(connection),
+      repository,
+      toolApproval,
+    );
+    if (entries) byConnection.set(connection, entries);
+  }
+  return byConnection;
+}
+
 function readToolApproval(value: unknown): McpConnectionToolApproval {
   return isMcpConnectionToolApproval(value) ? value : "auto";
 }
@@ -827,7 +930,7 @@ function connectionFromRow(
       id,
       displayName,
       serverUrl: normalizeMcpServerUrl(serverUrl),
-      authMode: "oauth",
+      authMode: isMcpIpcUrl(serverUrl) ? "none" : "oauth",
       kind: "remote",
       enabled: row.enabled !== false,
       // Opt-in: a row written before this key existed, or by hand without it,

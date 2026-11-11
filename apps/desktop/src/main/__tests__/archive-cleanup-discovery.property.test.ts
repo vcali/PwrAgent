@@ -11,7 +11,7 @@ import type { AppServerThreadSummary, LinkedDirectorySummary, ThreadOverlayState
 import type { ArchiveCleanupIntent } from "../state/archive-cleanup-checkpoint";
 import type { ArchiveCleanupContext } from "../app-server/archive-cleanup-queue";
 import { DesktopBackendRegistry } from "../app-server/backend-registry";
-import { CodexAppServerClient } from "../codex-app-server/client";
+import { CodexAppServerClient } from "../codex-app-server/desktop-client";
 import { ArchiveCleanupTransport } from "./fixtures/archive-cleanup-transport";
 
 vi.mock("../codex-app-server/stdio-transport", async () => ({
@@ -35,7 +35,7 @@ type CleanupBoundary = {
   enqueueArchiveCleanup(intent: ArchiveCleanupIntent): Promise<{ cleanup: Array<{ removedWorktree: boolean }> }>;
   completeArchivedThreadCleanup(params: { backend: "codex"; threadId: string; archivedAt: number;
     codexRolloutMissing: boolean; messagingCleanup: { error?: string }; context: ArchiveCleanupContext }): Promise<{ cleanup: Array<{ removedWorktree: boolean }> }>;
-  findThreadForArchiveCleanup(params: { backend: "codex"; threadId: string; context: ArchiveCleanupContext; reuseInventory: boolean }): Promise<{ thread: AppServerThreadSummary }>;
+  findThreadForArchiveCleanup(params: { backend: "codex"; threadId: string; context: ArchiveCleanupContext }): Promise<{ thread: AppServerThreadSummary }>;
   worktreeArchiveService: WorktreeArchiveService;
   claudeBackend: { listThreads(params: { archived: boolean }): Promise<AppServerThreadSummary[]> };
 };
@@ -145,18 +145,21 @@ it("shares identities across candidate roots without reusing another root's enri
   try {
     run.rows.archived.push({ id: "second", cwd: "/fixture/second" });
     run.overlays.set("second", { backend: "codex", threadId: "second", extraLinkedDirectories: [worktree("/fixture/second")] });
-    const first = await run.boundary.findThreadForArchiveCleanup({ backend: "codex", threadId: "target", context: run.context, reuseInventory: true });
+    const first = await run.boundary.findThreadForArchiveCleanup({ backend: "codex", threadId: "target", context: run.context });
     const pages = run.transport.listings.length;
     const discoveries = run.effects.git;
-    const second = await run.boundary.findThreadForArchiveCleanup({ backend: "codex", threadId: "second", context: run.context, reuseInventory: true });
+    const second = await run.boundary.findThreadForArchiveCleanup({ backend: "codex", threadId: "second", context: run.context });
     expect(run.transport.listings).toHaveLength(pages);
     expect(run.effects.git).toBeGreaterThan(discoveries);
     expect(first.thread.id).toBe("target");
     expect(second.thread.linkedDirectories).toContainEqual(worktree("/fixture/second"));
     // A directory write invalidates the identity proof too, even in one batch.
+    // The batch's fleet index reads that identity's provider row again rather
+    // than every identity: the write names the thread it changed.
+    const reads = vi.spyOn(run.client, "readArchiveCleanupThreadSummary");
     await run.registry.withThreadWorkspaceMutation({ backend: "codex", threadId: "second" }, async () => {});
-    await run.boundary.findThreadForArchiveCleanup({ backend: "codex", threadId: "second", context: run.context, reuseInventory: true });
-    expect(run.transport.listings.length).toBeGreaterThan(pages);
+    await run.boundary.findThreadForArchiveCleanup({ backend: "codex", threadId: "second", context: run.context });
+    expect(reads).toHaveBeenCalledWith("second", expect.any(Function));
   } finally { await run.registry.close(); }
 });
 
@@ -301,12 +304,12 @@ it("uses real Git and canonical paths as the snapshot/removal oracle at the chan
         run.overlays.set("external", { backend: "codex", threadId: "external", extraLinkedDirectories: [{ ...worktree(alias), path: repo, worktreeOwnership: "external" }] });
       }
       try {
-        await run.boundary.findThreadForArchiveCleanup({ backend: "codex", threadId: "target", context: run.context, reuseInventory: true });
+        await run.boundary.findThreadForArchiveCleanup({ backend: "codex", threadId: "target", context: run.context });
         const baselineDiscoveries = run.effects.git;
         run.rows.active.push({ id: "noise-alias", cwd: unrelatedAlias }, { id: "noise-repeat", cwd: unrelatedAlias });
         run.rows.archived.push({ id: "noise-real", cwd: unrelated });
         run.context.batch = {};
-        await run.boundary.findThreadForArchiveCleanup({ backend: "codex", threadId: "target", context: run.context, reuseInventory: true });
+        await run.boundary.findThreadForArchiveCleanup({ backend: "codex", threadId: "target", context: run.context });
         expect(run.effects.git).toBe(2 * baselineDiscoveries);
         for (const id of ["noise-alias", "noise-repeat", "noise-real"]) expect(run.inspected).toContain(`codex:${id}`);
         const result = await run.cleanup();

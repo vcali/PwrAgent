@@ -22,6 +22,7 @@ import {
   describeMcpAuthStatus,
   describeMcpConnectionAuth,
   formatMcpCommandLine,
+  isMcpIpcUrl,
   mcpConnectionIdsForNewThread,
   resolveMcpConnectionSetup,
   summarizeMcpConnectionReadiness,
@@ -72,8 +73,11 @@ import {
   sandboxerCannotStart,
   sandboxerNeedsSetup,
 } from "./SandboxerConnectionSetup";
+import { McpProjectToolApprovals } from "./McpProjectToolApprovals";
 import { SettingsSwitch } from "./SettingsSwitch";
 import { sourceBadge } from "./settings-fields";
+import { shortenCodexHome } from "./shorten-codex-home";
+import { getHomeDir } from "../../lib/tildify-path";
 
 
 type ActionNotice = {
@@ -124,6 +128,7 @@ type ConnectionEditDraft = {
   connectionId: string;
   displayName: string;
   serverUrl: string;
+  ipcBearerToken?: string;
   /**
    * What the row held when the dialog opened.
    *
@@ -184,17 +189,6 @@ function normalizeCodexHome(value: string): string {
     .replaceAll("\\", "/")
     .replace(/\/$/, "")
     .replace(/^([A-Z]):/, (_, drive: string) => `${drive.toLowerCase()}:`);
-}
-
-/**
- * `~/.codex/profiles/work` is the form operators recognise. Only the
- * conventional `.codex` root is abbreviated; a `CODEX_HOME` pointed somewhere
- * else is shown in full rather than given a misleading `~`.
- */
-function shortenCodexHome(value: string): string {
-  const normalized = value.replaceAll("\\", "/").replace(/\/$/, "");
-  const match = /^.*?(\/\.codex(?:\/.*)?)$/.exec(normalized);
-  return match ? `~${match[1]}` : normalized;
 }
 
 function readStartupStatus(
@@ -296,6 +290,7 @@ export function PluginsSettings(props: {
   const [connectionNotice, setConnectionNotice] = useState<ActionNotice>();
   const [connectionName, setConnectionName] = useState("");
   const [connectionUrl, setConnectionUrl] = useState("");
+  const [ipcBearerToken, setIpcBearerToken] = useState("");
   const [probe, setProbe] = useState<ProbeMcpConnectionResponse>();
   const [connectionAddKind, setConnectionAddKind] =
     useState<ConnectionAddKind>("remote");
@@ -1009,15 +1004,17 @@ export function PluginsSettings(props: {
         // The probe resolves discovery redirects, so store what it reached
         // rather than what was typed.
         serverUrl: probe.serverUrl,
+        ...(isMcpIpcUrl(probe.serverUrl) && ipcBearerToken ? { ipcBearerToken } : {}),
       });
       setConnectionName("");
       setConnectionUrl("");
+      setIpcBearerToken("");
       setProbe(undefined);
       await loadConnections();
       setConnectionPending(undefined);
       // The new row carries the sign-in from here, so "Adding..." is done.
       setConnectionNotice(undefined);
-      await authorizeConnection(response.connection, true);
+      if (response.connection.authMode === "oauth") await authorizeConnection(response.connection, true);
     } catch (error) {
       setConnectionNotice({
         kind: "error",
@@ -1131,10 +1128,11 @@ export function PluginsSettings(props: {
             connectionId: draft.connectionId,
             displayName: draft.displayName,
             serverUrl: draft.serverUrl,
+            ...(draft.ipcBearerToken === undefined ? {} : { ipcBearerToken: draft.ipcBearerToken }),
           });
       closeConnectionEdit();
       // A failed sign-in describes the server it was attempted against.
-      if (editDraftRepointsServer(draft)) {
+      if (editDraftRepointsServer(draft) && !isMcpIpcUrl(draft.serverUrl)) {
         setAuthorizationError(draft.connectionId);
       }
       await loadConnections();
@@ -1143,7 +1141,7 @@ export function PluginsSettings(props: {
         // Re-pointing drops the credentials the old server issued, so say so
         // rather than letting the row look merely renamed.
         text: editDraftRepointsServer(draft)
-          ? `${draft.displayName} now points at a different server. Authorize it again.`
+          ? `${draft.displayName} now points at a different server.${isMcpIpcUrl(draft.serverUrl) ? " Approve a new session in the server app if required." : " Authorize it again."}`
           : draft.local && draft.local.runningIn > 0
             ? `${draft.displayName} was updated. Threads using it get the new version on their next tool call.`
             : `${draft.displayName} was updated.`,
@@ -1339,6 +1337,50 @@ export function PluginsSettings(props: {
     }
   };
 
+  /** Resolves false when nothing was saved, so a form can stay open. */
+  const setConnectionProjectToolApproval = async (
+    connection: McpConnectionStatus,
+    repository: string,
+    toolApproval: McpConnectionToolApproval | null,
+    projectLabel: string,
+  ): Promise<boolean> => {
+    if (
+      connectionPending
+      || !props.desktopApi?.setMcpConnectionProjectToolApproval
+    ) return false;
+    setConnectionPending({
+      kind: "toolApproval",
+      connectionId: connection.id,
+    });
+    try {
+      await props.desktopApi.setMcpConnectionProjectToolApproval({
+        connectionId: connection.id,
+        repository,
+        toolApproval,
+      });
+      await loadConnections();
+      setConnectionNotice({
+        kind: "success",
+        text: toolApproval === null
+          ? `Threads in ${projectLabel} follow ${connection.displayName}'s Tool approval again.`
+          : toolApproval === "approve"
+            ? `${connection.displayName} runs every tool without asking in ${projectLabel}.`
+            : toolApproval === "prompt"
+              ? `${connection.displayName} asks before every tool in ${projectLabel}.`
+              : `${connection.displayName} asks before tools that make changes in ${projectLabel}.`,
+      });
+      return true;
+    } catch (error) {
+      setConnectionNotice({
+        kind: "error",
+        text: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    } finally {
+      setConnectionPending(undefined);
+    }
+  };
+
   const removeConnection = async () => {
     const connection = connectionRemoveCandidate;
     if (
@@ -1521,6 +1563,17 @@ export function PluginsSettings(props: {
                           void setConnectionToolApproval(connection, toolApproval)
                       : undefined
                   }
+                  onProjectToolApprovalChange={
+                    props.desktopApi?.setMcpConnectionProjectToolApproval
+                      ? async (repository, toolApproval, projectLabel) =>
+                          await setConnectionProjectToolApproval(
+                            connection,
+                            repository,
+                            toolApproval,
+                            projectLabel,
+                          )
+                      : undefined
+                  }
                   onSandboxerCleanupOnPrCloseChange={
                     connection.kind === "sandboxer"
                     && props.desktopApi?.setSandboxerCleanupOnPrClose
@@ -1528,7 +1581,7 @@ export function PluginsSettings(props: {
                           void setSandboxerCleanupOnPrClose(connection, enabled)
                       : undefined
                   }
-                  onChanged={() => void loadConnections()}
+                  onChanged={loadConnections}
                   onDisconnect={() => void disconnectConnection(connection)}
                   onEdit={() =>
                     setConnectionEdit({
@@ -1571,7 +1624,7 @@ export function PluginsSettings(props: {
               disabled={Boolean(connectionPending)}
               label="Server type"
               options={[
-                { label: "Remote URL", meta: "Signs in with OAuth", value: "remote" },
+                { label: "Server URL", meta: "HTTP over network or local IPC", value: "remote" },
                 { label: "Local command", meta: "Runs on this computer", value: "local" },
               ]}
               value={connectionAddKind}
@@ -1588,8 +1641,8 @@ export function PluginsSettings(props: {
                   * so first is cheaper than a discovery failure afterwards.
                   */}
                 <p className="settings-mcp-create__constraint">
-                  A remote server that signs in with OAuth. PwrAgent keeps its
-                  credentials and refreshes them.
+                  Network servers sign in with OAuth. For local unix:// and pipe://
+                  HTTP servers, approve access in the server app and paste its session token if required.
                 </p>
                 <div className="settings-mcp-create__fields">
                   <label>
@@ -1603,7 +1656,7 @@ export function PluginsSettings(props: {
                     />
                   </label>
                   <label>
-                    <span>Remote MCP URL</span>
+                    <span>MCP server URL</span>
                     <input
                       className="settings-input"
                       disabled={Boolean(connectionPending)}
@@ -1612,6 +1665,7 @@ export function PluginsSettings(props: {
                       value={connectionUrl}
                       onChange={(event) => {
                         setConnectionUrl(event.target.value);
+                        setIpcBearerToken("");
                         // A probe describes one URL. Keeping a stale verdict
                         // beside an edited field would offer to save
                         // something that was never checked.
@@ -1625,6 +1679,7 @@ export function PluginsSettings(props: {
                       Boolean(connectionPending)
                       || !connectionUrl.trim()
                       || (probe?.ok === true && !connectionName.trim())
+                      || (probe?.ok === true && probe.needsIpcBearer === true && !ipcBearerToken.trim())
                     }
                     type="submit"
                   >
@@ -1633,10 +1688,18 @@ export function PluginsSettings(props: {
                       : connectionPending?.kind === "create"
                         ? "Adding..."
                         : probe?.ok
-                          ? "Add and authorize"
+                          ? probe.authMode === "none" ? "Add connection" : "Add and authorize"
                           : "Check"}
                   </button>
                 </div>
+                {isMcpIpcUrl(connectionUrl) ? (
+                  <label>
+                    <span>Session bearer token (optional)</span>
+                    <input className="settings-input" type="password" autoComplete="off"
+                      disabled={Boolean(connectionPending)} value={ipcBearerToken}
+                      onChange={(event) => setIpcBearerToken(event.target.value)} />
+                  </label>
+                ) : null}
                 {probe ? (
                   <p
                     className={`settings-mcp-probe settings-mcp-probe--${
@@ -1645,7 +1708,9 @@ export function PluginsSettings(props: {
                     role={probe.ok ? "status" : "alert"}
                   >
                     {probe.ok
-                      ? `Found ${probe.serverName ?? "an MCP server"} at ${probe.serverUrl}. It signs in with OAuth${
+                      ? probe.needsIpcBearer
+                        ? "The same-user HTTP endpoint requires a bearer token. Approve a session in the server app and paste its token above. No authenticated session has been opened."
+                        : `Found ${probe.serverName ?? "an MCP server"} at ${probe.serverUrl}. ${probe.authMode === "none" ? "Access is approved in the local server app" : "It signs in with OAuth"}${
                           probe.toolCount === undefined
                             ? ""
                             : ` and offers ${probe.toolCount} tools`
@@ -1766,7 +1831,7 @@ export function PluginsSettings(props: {
           <span className="settings-mcp-scope__value">
             <strong>{activeProfileLabel}</strong>
             <code>
-              {activeCodexHome ? shortenCodexHome(activeCodexHome) : "Loading..."}
+              {activeCodexHome ? shortenCodexHome(activeCodexHome, getHomeDir()) : "Loading..."}
             </code>
           </span>
           <span className="settings-mcp-scope__key">Codex</span>
@@ -1948,7 +2013,7 @@ export function PluginsSettings(props: {
               </label>
               {connectionEdit.local ? null : (
                 <label>
-                  <span>Remote MCP URL</span>
+                  <span>MCP server URL</span>
                   <input
                     className="settings-input"
                     disabled={Boolean(connectionPending)}
@@ -1958,11 +2023,22 @@ export function PluginsSettings(props: {
                       setConnectionEdit({
                         ...connectionEdit,
                         serverUrl: event.target.value,
+                        ipcBearerToken: undefined,
                       })
                     }
                   />
                 </label>
               )}
+              {!connectionEdit.local && isMcpIpcUrl(connectionEdit.serverUrl) ? (
+                <label>
+                  <span>New session bearer token (leave blank to keep)</span>
+                  <input className="settings-input" type="password" autoComplete="off"
+                    disabled={Boolean(connectionPending)} value={connectionEdit.ipcBearerToken ?? ""}
+                    onChange={(event) => setConnectionEdit({ ...connectionEdit, ipcBearerToken: event.target.value || undefined })} />
+                  <button type="button" className="button button--secondary" disabled={Boolean(connectionPending)}
+                    onClick={() => setConnectionEdit({ ...connectionEdit, ipcBearerToken: "" })}>Clear saved token</button>
+                </label>
+              ) : null}
             </div>
             {connectionEdit.local ? (
               <>
@@ -2186,14 +2262,17 @@ function useManagedConnectionTools(params: {
   desktopApi?: DesktopApi;
   identity: string;
   listable: boolean;
+  autoRead?: boolean;
   /** Completed sign-ins; a change forces a fresh read past any cache. */
   signIns: number;
+  /** A failed request may have caused the backend to discard credentials. */
+  onFailure: () => void;
 }): {
   inventory: ManagedMcpToolInventory | undefined;
   test: () => void;
   testResult?: ManagedConnectionTestResult;
 } {
-  const { connectionId, identity, listable, signIns } = params;
+  const { connectionId, identity, listable, signIns, onFailure, autoRead = true } = params;
   const list = params.desktopApi?.listMcpConnectionTools;
   const [inventory, setInventory] = useState<ManagedMcpToolInventory>();
   const [testResult, setTestResult] = useState<ManagedConnectionTestResult>();
@@ -2232,13 +2311,14 @@ function useManagedConnectionTools(params: {
         error: cause instanceof Error ? cause.message : String(cause),
       });
       if (testing) setTestResult({ status: "failed", elapsedMs: performance.now() - startedAt });
+      onFailure();
     }
-  }, [connectionId, list]);
+  }, [connectionId, list, onFailure]);
 
   useEffect(() => {
-    if (!listable || !list) {
+    if (!listable || !list || !autoRead) {
       latestRead.current += 1;
-      setInventory(listable ? { status: "unavailable" } : undefined);
+      setInventory(listable && autoRead ? { status: "unavailable" } : undefined);
       setTestResult(undefined);
       return;
     }
@@ -2248,7 +2328,7 @@ function useManagedConnectionTools(params: {
     return () => {
       latestRead.current += 1;
     };
-  }, [identity, list, listable, read, signIns]);
+  }, [autoRead, identity, list, listable, read, signIns]);
 
   return {
     inventory,
@@ -2286,6 +2366,11 @@ function ManagedMcpConnectionRow(props: {
   onAvailabilityChange?: (enabled: boolean) => void;
   onSelectForNewThreadsChange?: (selectForNewThreads: boolean) => void;
   onToolApprovalChange?: (toolApproval: McpConnectionToolApproval) => void;
+  onProjectToolApprovalChange?: (
+    repository: string,
+    toolApproval: McpConnectionToolApproval | null,
+    projectLabel: string,
+  ) => Promise<boolean>;
   /** Sandboxer only. */
   onSandboxerCleanupOnPrCloseChange?: (enabled: boolean) => void;
   onChanged: () => void;
@@ -2305,11 +2390,17 @@ function ManagedMcpConnectionRow(props: {
   const localSandboxer = sandboxer && connection.authMode === "local_cli";
   const [transportBusy, setTransportBusy] = useState(false);
   const stdio = connection.kind === "stdio";
+  const ipc = isMcpIpcUrl(connection.serverUrl);
   const app = connection.kind === "pwrgit"
     ? "PwrGit"
     : connection.kind === "pwrsnap" ? "PwrSnap" : undefined;
   const { status: localStatus, refresh: refreshLocal } =
     useLocalConnectionStatus(app, props.desktopApi);
+  const onChanged = props.onChanged;
+  const refreshStatus = useCallback(() => {
+    void refreshLocal();
+    onChanged();
+  }, [onChanged, refreshLocal]);
   const setup = resolveMcpConnectionSetup({
     connection,
     gatewayEnabled: props.gatewayEnabled,
@@ -2319,9 +2410,15 @@ function ManagedMcpConnectionRow(props: {
   const { inventory: fetchedInventory, test: testConnection, testResult } = useManagedConnectionTools({
     connectionId: connection.id,
     desktopApi: props.desktopApi,
-    identity: `${connection.serverUrl}\n${connection.configured}`,
+    // IPC token edits keep the URL and configured state, but update the
+    // connection revision. Retire old tests and in-flight reads on save.
+    identity: `${connection.serverUrl}\n${connection.configured}${ipc ? `\n${connection.updatedAt}` : ""}`,
     listable,
+    // Opening a session can consume a ticket approved in the native app.
+    // Only an explicit test or a selected thread may do that for IPC.
+    autoRead: !ipc,
     signIns: props.signIns,
+    onFailure: refreshStatus,
   });
   const inventory = reconcileManagedMcpInventory(fetchedInventory, connection.discovery);
   const health = readManagedMcpConnectionHealth(setup, inventory);
@@ -2331,7 +2428,7 @@ function ManagedMcpConnectionRow(props: {
   // point at the wrong one. Credentials held from before still say something.
   // A local command has no sign-in; its chip only ever reports a secret
   // that encrypted storage could not hand back.
-  const showAuthChip = stdio
+  const showAuthChip = stdio || ipc
     ? !connection.configured
     : connection.configured
       || (setup.state !== "app_not_installed" && setup.state !== "app_not_running");
@@ -2467,7 +2564,8 @@ function ManagedMcpConnectionRow(props: {
               className="button button--secondary"
               disabled={disabled || !listable || inventory?.status === "loading" || inventory?.status === "unavailable"}
               title={listable
-                ? `Verify ${connection.displayName} by connecting and reading its available tools.`
+                ? ipc ? `Open and close an MCP session to test ${connection.displayName}. This can consume a one-use ticket; approve a fresh ticket before connecting a thread.`
+                  : `Verify ${connection.displayName} by connecting and reading its available tools.`
                 : setup.detail}
               type="button"
               onClick={testConnection}
@@ -2520,13 +2618,10 @@ function ManagedMcpConnectionRow(props: {
                   disabled={props.disabled}
                   status={localStatus}
                   onAuthorize={props.onAuthorize}
-                  onChanged={() => {
-                    void refreshLocal();
-                    props.onChanged();
-                  }}
+                  onChanged={refreshStatus}
                   onNotice={props.onNotice}
                 />
-              ) : stdio ? null : (
+              ) : stdio || ipc ? null : (
                 <button
                   className="button button--secondary"
                   disabled={props.disabled}
@@ -2549,12 +2644,13 @@ function ManagedMcpConnectionRow(props: {
                 * by side with no way to tell which one you wanted.
                 */}
               {connection.configured
-                && connection.authMode !== "local_cli"
-                && connection.authMode !== "none" ? (
+                && (ipc || (connection.authMode !== "local_cli"
+                  && connection.authMode !== "none")) ? (
                 <button
                   className="button button--ghost"
                   disabled={props.disabled}
-                  title={`Discard the credentials PwrAgent holds for ${connection.displayName} and close its open sessions. The connection stays in this list, so you can authorize it again without retyping its URL.`}
+                  title={ipc ? `Clear the saved IPC session token for ${connection.displayName}, close its sessions and stop offering it to threads. The server app owns revocation of its approval.`
+                    : `Discard the credentials PwrAgent holds for ${connection.displayName} and close its open sessions. The connection stays in this list, so you can authorize it again without retyping its URL.`}
                   type="button"
                   onClick={props.onDisconnect}
                 >
@@ -2830,6 +2926,16 @@ function ManagedMcpConnectionRow(props: {
                     : TOOL_APPROVAL_OPTIONS.find((option) => option.value === toolApproval)?.description}
                   {" "}Full Access threads never ask.
                 </span>
+                {props.onProjectToolApprovalChange ? (
+                  <McpProjectToolApprovals
+                    connectionName={connection.displayName}
+                    desktopApi={props.desktopApi}
+                    disabled={disabled || !props.gatewayEnabled}
+                    entries={connection.projectToolApprovals ?? []}
+                    options={TOOL_APPROVAL_OPTIONS}
+                    onChange={props.onProjectToolApprovalChange}
+                  />
+                ) : null}
               </span>
             </div>
           ) : null}

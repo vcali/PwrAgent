@@ -20,7 +20,8 @@ import type {
   SubthreadLaunchpadDraft,
 } from "../../lib/useThreadNavigation";
 import type { PendingSidebarRow } from "./StartingThreadRow";
-import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ThreadMaintenanceLauncherContext } from "../maintenance/thread-maintenance-launcher";
 import type {
   ComponentType,
   KeyboardEvent as ReactKeyboardEvent,
@@ -46,6 +47,7 @@ import type {
 import {
   buildThreadUrl,
   comparePinnedDirectories,
+  toolWorktreeRootOwner,
   comparePinnedThreads,
   isKeptAtTopThread,
   isPinnedDirectory,
@@ -234,7 +236,7 @@ function useRevealListChange<Args extends unknown[], Result>(
 import type { NavigationDirectoryDisclosure } from "../../lib/useNavigationDirectoryDisclosure";
 import { BrandLockup } from "../chrome/BrandLockup";
 import { ThreadLockDialog } from "../thread-lock/ThreadLockDialog";
-import { useThreadDependencyIndicatorsContext } from "../thread-dependencies/useThreadDependencyIndicators";
+import { readThreadDependencyIndicator, useThreadDependencyIndicatorsContext } from "../thread-dependencies/useThreadDependencyIndicators";
 
 type SidebarProps = {
   /** Director voice's mic, rendered first in the masthead; it subscribes to voice itself. */
@@ -434,6 +436,10 @@ type SidebarProps = {
     thread: NavigationThreadSummary,
     options?: ArchiveThreadOptions,
   ) => Promise<ArchivedThreadRef[] | void>;
+  onArchiveThreads?: (
+    threads: NavigationThreadSummary[],
+    options?: ArchiveThreadOptions,
+  ) => Promise<ArchivedThreadRef[]>;
   /**
    * Threads left the list through Archive. `reopenKey` is the thread that
    * was open, so an Undo can bring the operator back to it.
@@ -454,6 +460,11 @@ type SidebarProps = {
     present: boolean,
   ) => Promise<void>;
   /** Locks (or re-notes) the thread when `locked`, else unlocks it. */
+  /** Keep Checkout Awake, from the thread menu. */
+  onSetThreadCheckoutHibernation?: (
+    thread: NavigationThreadSummary,
+    change: { restore?: boolean; keepAwake?: boolean },
+  ) => Promise<unknown>;
   onSetThreadLock?: (
     thread: NavigationThreadSummary,
     locked: boolean,
@@ -696,6 +707,7 @@ export function Sidebar(props: SidebarProps) {
     : undefined;
   const federationLabel = readRendererFederationLabel();
   const federationTarget = readRendererFederationTarget();
+  const openThreadMaintenance = useContext(ThreadMaintenanceLauncherContext);
   const dependencyIndicators = useThreadDependencyIndicatorsContext();
   const contextMenuRef = useRef<HTMLDivElement>(null);
   // What had focus when the thread context menu opened: the row's ⋮ button,
@@ -828,7 +840,7 @@ export function Sidebar(props: SidebarProps) {
   const [pendingDetachPullRequest, setPendingDetachPullRequest] = useState<
     | {
         thread: NavigationThreadSummary;
-        pr: PrSummary;
+        prs: readonly PrSummary[];
       }
     | undefined
   >();
@@ -1173,7 +1185,7 @@ export function Sidebar(props: SidebarProps) {
       : undefined,
   );
   // The row callbacks this component only forwards. (`onDetachPullRequest`
-  // is absent: the rows get this component's own `detachPullRequest`, which
+  // is absent: the rows get this component's own `detachPullRequests`, which
   // owns the confirmation dialog and is already stable.) They are stable in the
   // app today because `App` happens to supply stable references, and that is
   // not a contract a memoized row should rest on — the row's bail-out must
@@ -1945,9 +1957,11 @@ export function Sidebar(props: SidebarProps) {
         );
     const archiveOptions: ArchiveThreadOptions | undefined =
       nextSelectionKey === undefined ? options : { ...options, nextSelectionKey };
-    const results = await Promise.all(threads.map((thread) =>
-      archiveOptions ? onArchiveThread(thread, archiveOptions) : onArchiveThread(thread)));
-    const archived = results.flatMap((result) => result ?? []);
+    const archived = props.onArchiveThreads
+      ? await props.onArchiveThreads(threads, archiveOptions)
+      : (await Promise.all(threads.map((thread) =>
+          archiveOptions ? onArchiveThread(thread, archiveOptions) : onArchiveThread(thread))))
+        .flatMap((result) => result ?? []);
     if (archived.length > 0) {
       props.onThreadsArchived?.(archived, {
         title: threads.length === 1 ? threads[0]!.title : undefined,
@@ -2010,6 +2024,13 @@ export function Sidebar(props: SidebarProps) {
         keepAtTop,
       });
     })();
+  };
+
+  // Checkable too: it toggles in place. Turning it on also restores a
+  // hibernated checkout, on the thread's owner.
+  const toggleKeepCheckoutAwakeFromContextMenu = (thread: NavigationThreadSummary): void => {
+    void props.onSetThreadCheckoutHibernation?.(thread, { keepAwake: !thread.keepCheckoutAwake })
+      .catch(() => {});
   };
 
   const markUnreadFromContextMenu = (thread: NavigationThreadSummary): void => {
@@ -2389,20 +2410,37 @@ export function Sidebar(props: SidebarProps) {
     void copyText(value);
   };
 
-  const detachPullRequest = useEventCallback((
+  // One confirmation covers every PR, then they detach one at a time: each
+  // detach rewrites the thread's PR list on its owner.
+  const detachPullRequests = useEventCallback((
     thread: NavigationThreadSummary,
-    pr: PrSummary,
+    prs: readonly PrSummary[],
   ): void => {
-    if (!props.onDetachPullRequest) {
+    if (!props.onDetachPullRequest || prs.length === 0) {
       return;
+    }
+    // From a chip or the PR list, not the menu: the dialog returns focus to
+    // what holds it now, never to an older menu's opener.
+    if (!contextMenu) {
+      const active = document.activeElement;
+      contextMenuOpenerRef.current =
+        active instanceof HTMLElement && active !== document.body ? active : null;
     }
     setContextMenu(undefined);
     if (shouldShowDetachPullRequestWarning()) {
-      setPendingDetachPullRequest({ thread, pr });
+      setPendingDetachPullRequest({ thread, prs });
       return;
     }
-    void props.onDetachPullRequest(thread, pr);
+    void detachEach(thread, prs);
   });
+  const detachEach = async (
+    thread: NavigationThreadSummary,
+    prs: readonly PrSummary[],
+  ): Promise<void> => {
+    for (const pr of prs) {
+      await props.onDetachPullRequest?.(thread, pr);
+    }
+  };
 
   // Per-thread versions of the context menu's gates, for the keyboard
   // shortcuts, which act without a menu open.
@@ -2660,14 +2698,10 @@ export function Sidebar(props: SidebarProps) {
   const contextMenuCanContinueAfter = Boolean(
     contextMenu &&
       !contextMenuIsBulk &&
-      props.onContinueAfter &&
-      !contextMenu.thread.federation &&
-      readRendererFederationTarget()?.scope !== "remote",
+      props.onContinueAfter,
   );
   const contextMenuDependencyCount = contextMenu && contextMenuCanContinueAfter
-    ? dependencyIndicators?.byThreadKey.get(
-        threadSummaryIdentityKey(contextMenu.thread),
-      )?.count ?? 0
+    ? readThreadDependencyIndicator(dependencyIndicators, contextMenu.thread)?.count ?? 0
     : 0;
   // A collapsed parent's sub-threads are not loaded; its row still reports
   // how many it has, so the menu offers the same two archives either way.
@@ -2777,6 +2811,12 @@ export function Sidebar(props: SidebarProps) {
     contextMenuHasLocalWorkspace || contextMenuHasWorktreeWorkspace;
   const contextMenuBranchName = contextMenu?.thread.gitBranch;
   const contextMenuPullRequest = contextMenu?.pullRequest;
+  // Opened from the row, not a chip: one item detaches the thread's PRs.
+  // Minimal's single chip draws no ✕, so this is its visible way.
+  const contextMenuRowPullRequests =
+    contextMenu && !contextMenuIsBulk && !contextMenuPullRequest
+      ? contextMenu.thread.prs ?? []
+      : [];
   const contextMenuIsSubthread = Boolean(
     !contextMenuIsBulk && contextMenu?.thread.parentThreadId,
   );
@@ -3034,6 +3074,18 @@ export function Sidebar(props: SidebarProps) {
     contextMenuPinnedThreadIndex >= 0 &&
     (contextMenuPinnedThreadIndex < contextMenuPinnedThreadCount - 1 || !completeThreadPinOrder);
   const contextMenuHasPinAction = contextMenuCanPin;
+  // Keep Checkout Awake: only a PwrAgent worktree can hibernate. A remote
+  // row needs the grant a restore on its owner does.
+  const contextMenuCanKeepAwake = Boolean(
+    contextMenuPinThread
+      && !contextMenuIsBulk
+      && props.onSetThreadCheckoutHibernation
+      && contextMenuCanRouteRemoteCapability("turn_control")
+      && contextMenuPinThread.linkedDirectories.some((directory) =>
+        directory.kind === "worktree" && toolWorktreeRootOwner(directory.worktreePath) === "pwragent"),
+  );
+  // The checkable items share one section and the check column.
+  const contextMenuHasCheckSection = contextMenuHasPinAction || contextMenuCanKeepAwake;
   // Keep at Top only means something where pin order is visible.
   const contextMenuCanKeepAtTop = Boolean(
     contextMenuHasPinAction
@@ -3054,7 +3106,7 @@ export function Sidebar(props: SidebarProps) {
     contextMenuCanSendToMachine ||
     contextMenuCanArchive;
   const contextMenuHasTopActions =
-    contextMenuHasPinAction ||
+    contextMenuHasCheckSection ||
     contextMenuHasCreationActions ||
     contextMenuHasManagementActions ||
     contextMenuCanRemoveRemotePin;
@@ -3120,6 +3172,13 @@ export function Sidebar(props: SidebarProps) {
   const directoryMenuIsPlaceholder =
     directoryContextMenu?.directory.localAvailability === "unconfigured";
   const directoryMenuCanMarkRead = Boolean(props.onMarkDirectoriesSeen && !directoryMenuIsPlaceholder);
+  // Thread maintenance runs on this machine only; a placeholder or a peer
+  // window has no provider, so the item hides itself there.
+  const directoryMenuCleanUpPath = !directoryContextMenuIsBulk && !directoryMenuIsPlaceholder
+    && directoryContextMenu?.directory.kind === "directory"
+    ? directoryContextMenu.directory.path
+    : undefined;
+  const directoryMenuCanCleanUp = Boolean(openThreadMaintenance && directoryMenuCleanUpPath);
   const directoryMenuCanArchive = Boolean(props.onArchiveDirectories
     && !directoryMenuIsPlaceholder
     && directoryContextMenuDirectories.some((directory) => directory.kind === "directory" || directory.kind === "workspace"));
@@ -3553,7 +3612,7 @@ export function Sidebar(props: SidebarProps) {
               onRevealSelectedThreadComplete={
                 forwardedRevealSelectedThreadComplete
               }
-              onDetachPullRequest={detachPullRequest}
+              onDetachPullRequests={detachPullRequests}
               onReorderThreadPins={
                 hoverReleasedListHandlers.reorderThreadPins
               }
@@ -3634,7 +3693,7 @@ export function Sidebar(props: SidebarProps) {
                 onRevealSelectedThreadComplete={
                   forwardedRevealSelectedThreadComplete
                 }
-                onDetachPullRequest={detachPullRequest}
+                onDetachPullRequests={detachPullRequests}
                 onUpdateSubthreadOrder={
                   hoverReleasedListHandlers.updateSubthreadOrder
                 }
@@ -3656,7 +3715,7 @@ export function Sidebar(props: SidebarProps) {
         <div
           ref={contextMenuRef}
           className={`thread-context-menu${
-            contextMenuHasPinAction ? " thread-context-menu--check-column" : ""
+            contextMenuHasCheckSection ? " thread-context-menu--check-column" : ""
           }`}
           role="menu"
           aria-label={
@@ -3786,11 +3845,12 @@ export function Sidebar(props: SidebarProps) {
                   </button>
                 </div>
               ) : null}
-              {contextMenuCanRemoveRemotePin && contextMenuHasPinAction ? (
+              {contextMenuCanRemoveRemotePin && contextMenuHasCheckSection ? (
                 <div className="thread-context-menu__separator" role="separator" />
               ) : null}
-              {contextMenuHasPinAction ? (
+              {contextMenuHasCheckSection ? (
                 <div className="thread-context-menu__section">
+                  {contextMenuHasPinAction ? (
                   <button
                     role="menuitemcheckbox"
                     aria-checked={Boolean(contextMenuPinThread!.pinnedRank)}
@@ -3805,6 +3865,7 @@ export function Sidebar(props: SidebarProps) {
                     <span>Pinned</span>
                     {menuShortcut("threads.toggle_pin")}
                   </button>
+                  ) : null}
                   {contextMenuCanKeepAtTop ? (
                     <button
                       role="menuitemcheckbox"
@@ -3821,9 +3882,23 @@ export function Sidebar(props: SidebarProps) {
                       {menuShortcut("threads.toggle_keep_at_top")}
                     </button>
                   ) : null}
+                  {contextMenuCanKeepAwake ? (
+                    <button
+                      role="menuitemcheckbox"
+                      aria-checked={Boolean(contextMenuPinThread!.keepCheckoutAwake)}
+                      type="button"
+                      onClick={() => toggleKeepCheckoutAwakeFromContextMenu(contextMenuPinThread!)}
+                      onKeyDown={closeContextMenuOnEnter}
+                    >
+                      <span className="thread-context-menu__check" aria-hidden="true">
+                        <CheckIcon size={12} strokeWidth={3} />
+                      </span>
+                      <span>Keep Checkout Awake</span>
+                    </button>
+                  ) : null}
                 </div>
               ) : null}
-              {contextMenuHasPinAction &&
+              {contextMenuHasCheckSection &&
               (contextMenuHasCreationActions || contextMenuHasManagementActions) ? (
                 <div className="thread-context-menu__separator" role="separator" />
               ) : null}
@@ -4178,13 +4253,26 @@ export function Sidebar(props: SidebarProps) {
                         role="menuitem"
                         type="button"
                         onClick={() =>
-                          detachPullRequest(contextMenu.thread, contextMenuPullRequest)
+                          detachPullRequests(contextMenu.thread, [contextMenuPullRequest])
                         }
                       >
                         Detach Pull Request
                       </button>
                     ) : null}
                   </>
+                ) : null}
+                {contextMenuRowPullRequests.length > 0 && props.onDetachPullRequest ? (
+                  <button
+                    role="menuitem"
+                    type="button"
+                    onClick={() =>
+                      detachPullRequests(contextMenu.thread, contextMenuRowPullRequests)
+                    }
+                  >
+                    {contextMenuRowPullRequests.length === 1
+                      ? `Detach Pull Request #${contextMenuRowPullRequests[0]!.number}`
+                      : "Detach All Pull Requests"}
+                  </button>
                 ) : null}
                 <button
                   role="menuitem"
@@ -4257,13 +4345,13 @@ export function Sidebar(props: SidebarProps) {
 
       {pendingDetachPullRequest ? (
         <DetachPullRequestWarning
-          pr={pendingDetachPullRequest.pr}
+          prs={pendingDetachPullRequest.prs}
           returnFocus={contextMenuOpenerRef}
           onCancel={() => setPendingDetachPullRequest(undefined)}
           onConfirm={() => {
             const pending = pendingDetachPullRequest;
             setPendingDetachPullRequest(undefined);
-            void props.onDetachPullRequest?.(pending.thread, pending.pr);
+            void detachEach(pending.thread, pending.prs);
           }}
         />
       ) : null}
@@ -4482,26 +4570,41 @@ export function Sidebar(props: SidebarProps) {
               ) : null}
             </div>
           ) : null}
-          {directoryMenuHasForgeSection && directoryMenuCanArchive ? (
+          {directoryMenuHasForgeSection && (directoryMenuCanArchive || directoryMenuCanCleanUp) ? (
             <div className="thread-context-menu__separator" role="separator" />
           ) : null}
-          {directoryMenuCanArchive ? (
+          {directoryMenuCanCleanUp || directoryMenuCanArchive ? (
             <div className="thread-context-menu__section">
-              <button
-                role="menuitem"
-                type="button"
-                onClick={() => {
-                  const keys = directoryContextMenuDirectories
-                    .filter((directory) => directory.kind === "directory" || directory.kind === "workspace")
-                    .map((directory) => directory.key);
-                  setDirectoryContextMenu(undefined);
-                  void revealHoverStableSnapshot(() => props.onArchiveDirectories?.(keys));
-                }}
-              >
-                {directoryContextMenuDirectories.some((directory) => directory.kind === "directory")
-                  ? `Archive Threads and Remove ${directoryContextMenuIsBulk ? "Projects" : "Project"}`
-                  : "Archive Threads"}
-              </button>
+              {directoryMenuCanCleanUp ? (
+                <button
+                  role="menuitem"
+                  type="button"
+                  onClick={() => {
+                    const projectKey = directoryMenuCleanUpPath!;
+                    setDirectoryContextMenu(undefined);
+                    openThreadMaintenance?.({ projectKey });
+                  }}
+                >
+                  Clean Up Project…
+                </button>
+              ) : null}
+              {directoryMenuCanArchive ? (
+                <button
+                  role="menuitem"
+                  type="button"
+                  onClick={() => {
+                    const keys = directoryContextMenuDirectories
+                      .filter((directory) => directory.kind === "directory" || directory.kind === "workspace")
+                      .map((directory) => directory.key);
+                    setDirectoryContextMenu(undefined);
+                    void revealHoverStableSnapshot(() => props.onArchiveDirectories?.(keys));
+                  }}
+                >
+                  {directoryContextMenuDirectories.some((directory) => directory.kind === "directory")
+                    ? `Archive Threads and Remove ${directoryContextMenuIsBulk ? "Projects" : "Project"}`
+                    : "Archive Threads"}
+                </button>
+              ) : null}
             </div>
           ) : null}
           {directoryMenuCanRemove
