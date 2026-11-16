@@ -1880,7 +1880,7 @@ Implementation notes remain in a readable bubble.`;
     });
   });
 
-  it("draws a Codex visualize directive as a link that opens the file preview", async () => {
+  it("draws the page a Codex visualize directive names in the message, under a link that opens the file preview", async () => {
     const filePath = "/Users/example/.pwragent/profiles/dev/projects/audit/ctr-sources.html";
     const readMarkdownFile = vi.fn(async () => ({
       path: filePath,
@@ -1908,13 +1908,19 @@ Implementation notes remain in a readable bubble.`;
     expect(screen.queryByText(/visualize/)).not.toBeInTheDocument();
     expect(screen.queryByText(/[\ue000-\uf8ff]/)).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("link", { name: "ctr-sources.html" }));
+    // The page is drawn in the message, offline and with scripts off.
+    const page = await screen.findByTitle("HTML preview: ctr-sources.html");
+    expect(page).toHaveAttribute("sandbox", "");
+    expect(page.getAttribute("srcdoc")).toContain("Sources");
+    expect(readMarkdownFile).toHaveBeenCalledWith(
+      expect.objectContaining({ path: filePath }),
+    );
 
-    await waitFor(() => {
-      expect(readMarkdownFile).toHaveBeenCalledWith(
-        expect.objectContaining({ path: filePath }),
-      );
-    });
+    // Its link still opens the full viewer.
+    fireEvent.click(screen.getByRole("link", { name: "ctr-sources.html" }));
+    expect(
+      await screen.findByRole("dialog", { name: "HTML document: ctr-sources.html" }),
+    ).toBeInTheDocument();
   });
 
   it("copies both markdown text and rendered HTML when the rich clipboard bridge exists", async () => {

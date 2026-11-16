@@ -28531,6 +28531,28 @@ a.transcript-message__messaging-origin:focus-visible {
   display: inline;
 }
 
+/* A page Codex asked to show: its file link, then the page in the message. */
+.thread-markdown__visualization {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.thread-markdown__visualization-page {
+  display: flex;
+  flex-direction: column;
+  height: min(60vh, 520px);
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+}
+
+.thread-markdown__visualization-status {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
 /* A previewable file named in inline code. The glyph and accent set it apart
    from plain inline code, which copies on click. */
 /* Inline, not inline-block: a long path wraps with the sentence, and each

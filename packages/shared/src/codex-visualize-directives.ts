@@ -3,7 +3,7 @@
 const MARKER = "[\\ue000-\\uf8ff]";
 
 const COMPLETE_CODEX_VISUALIZE_DIRECTIVE = new RegExp(
-  `^ {0,3}(?:::|${MARKER})?visualize${MARKER}?(\\{.*\\})${MARKER}?\\s*$`,
+  `^ {0,3}(?:::|${MARKER})?visualize${MARKER}?(\\{[^]*\\})${MARKER}?\\s*$`,
 );
 
 const INLINE_CODEX_VISUALIZE_DIRECTIVE = new RegExp(
@@ -12,9 +12,15 @@ const INLINE_CODEX_VISUALIZE_DIRECTIVE = new RegExp(
 );
 
 /**
+ * The link title the rewrite puts on a directive's link, so the transcript
+ * can tell the file Codex asked to show from one it only mentioned.
+ */
+export const CODEX_VISUALIZE_LINK_TITLE = "pwragent-visualize";
+
+/**
  * Rewrites Codex's assistant-authored `visualize{"path":"…"}` lines into
- * Markdown links to the named local file, so the transcript draws the file
- * chip that opens the preview instead of the raw directive. Codex emits the
+ * Markdown links to the named local file, titled CODEX_VISUALIZE_LINK_TITLE,
+ * so the transcript draws the file in place instead of the raw directive. Codex emits the
  * line for a tool PwrAgent does not host. Ordinary Markdown, including a
  * literal example inside a code fence, is preserved. A directive whose
  * payload is not an absolute POSIX path is left as written.
@@ -128,7 +134,7 @@ function visualizeDirectiveLink(payload: string | undefined): string | undefined
         (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`,
       ))
     .join("/");
-  return `[${label}](file://${destination})`;
+  return `[${label}](file://${destination} "${CODEX_VISUALIZE_LINK_TITLE}")`;
 }
 
 function isPartialVisualizeDirective(line: string): boolean {

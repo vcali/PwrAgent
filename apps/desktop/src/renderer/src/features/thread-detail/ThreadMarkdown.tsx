@@ -1,4 +1,5 @@
 import {
+  CODEX_VISUALIZE_LINK_TITLE,
   filePreviewKind,
   findSharedSkillNames,
   isFilePreviewPath,
@@ -115,6 +116,8 @@ type EditorApplication = DesktopApplicationsSnapshot["editors"][number];
  */
 const CodeBlockContext = createContext(false);
 const MarkdownLinkContext = createContext(false);
+// True inside a paragraph that holds only a file Codex asked to show.
+const VisualizationBlockContext = createContext(false);
 
 const MarkdownCodeApiContext = createContext<Pick<DesktopApi, "copyText"> | undefined>(undefined);
 
@@ -437,6 +440,7 @@ const markdownComponents: Components = {
     // Subscribe in the leaf so unchanged Markdown is not parsed again.
     const threadLinks = useThreadLinks();
     const pullRequestLinks = usePullRequestLinks();
+    const visualizationBlock = useContext(VisualizationBlockContext);
     const href = typeof anchorProps.href === "string" ? anchorProps.href : "";
     const localTarget = localFileTargetFromHref(href);
     const isLocalPreviewFile = Boolean(
@@ -592,7 +596,7 @@ const markdownComponents: Components = {
     );
 
     if (isLocalPreviewFile && localTarget) {
-      return (
+      const fileLink = (
         <span className="thread-markdown__file-link">
           {link}
           {editorApplication && props.desktopApi?.openApplication ? (
@@ -618,6 +622,22 @@ const markdownComponents: Components = {
           ) : null}
         </span>
       );
+      // The page itself, under its link. A directive in the middle of a
+      // sentence, or one naming another kind of file, keeps the link alone.
+      return visualizationBlock
+        && anchorProps.title === CODEX_VISUALIZE_LINK_TITLE
+        && filePreviewKind(localTarget.path) === "html"
+        && props.desktopApi?.readMarkdownFile ? (
+          <>
+            {fileLink}
+            <InlineHtmlVisualization
+              desktopApi={props.desktopApi}
+              fileViewerContext={props.fileViewerContext}
+              label={label || fileNameFromPath(localTarget.path)}
+              path={localTarget.path}
+            />
+          </>
+        ) : fileLink;
     }
 
     return link;
@@ -718,6 +738,22 @@ const markdownComponents: Components = {
     return <ol className="transcript-message__list" start={listProps.start}>{listProps.children}</ol>;
   },
   p(paragraphProps) {
+    const children = paragraphProps.node?.children ?? [];
+    const only = children.length === 1 ? children[0] : undefined;
+    if (
+      only?.type === "element"
+      && only.tagName === "a"
+      && only.properties.title === CODEX_VISUALIZE_LINK_TITLE
+    ) {
+      // A page cannot sit inside a paragraph element.
+      return (
+        <div className="thread-markdown__visualization">
+          <VisualizationBlockContext.Provider value={true}>
+            {paragraphProps.children}
+          </VisualizationBlockContext.Provider>
+        </div>
+      );
+    }
     return (
       <p className="transcript-message__paragraph">
         {paragraphProps.children}
@@ -1356,6 +1392,74 @@ function skillNameFromPath(filePath: string, label: string): string {
     return segments.at(-2) ?? "skill";
   }
   return label.replace(/^\$/, "") || segments.at(-1) || "skill";
+}
+
+/**
+ * A page Codex asked to show, drawn in the message. It is the same offline
+ * frame as the file viewer. Links in it are not followed here; the file link
+ * above it opens the viewer, which offers them.
+ */
+function InlineHtmlVisualization(props: {
+  desktopApi: Pick<DesktopApi, "readConfigBootstrap" | "readHtmlPreviewAssets" | "readMarkdownFile">;
+  fileViewerContext?: MarkdownFileViewerContext;
+  label: string;
+  path: string;
+}) {
+  const [loadState, setLoadState] = useState<
+    | { status: "loading" }
+    | { status: "loaded"; content: string }
+    | { status: "error"; error: string }
+  >({ status: "loading" });
+  const { readConfigBootstrap, readHtmlPreviewAssets, readMarkdownFile } = props.desktopApi;
+  const { thread, federationTarget } = useMarkdownFileSource(props.fileViewerContext);
+  const previewApi = useMemo(
+    () => ({ readConfigBootstrap, readHtmlPreviewAssets }),
+    [readConfigBootstrap, readHtmlPreviewAssets],
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoadState({ status: "loading" });
+    if (!readMarkdownFile) {
+      setLoadState({ status: "error", error: "File preview is unavailable." });
+      return undefined;
+    }
+    void readMarkdownFile({ path: props.path, thread, federationTarget })
+      .then((response) => {
+        if (cancelled) return;
+        setLoadState(response.error || response.content === undefined
+          ? { status: "error", error: response.error ?? "File could not be read." }
+          : { status: "loaded", content: response.content });
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setLoadState({
+          status: "error",
+          error: error instanceof Error ? error.message : "File could not be read.",
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [readMarkdownFile, props.path, thread, federationTarget]);
+
+  if (loadState.status === "error") {
+    return <p className="thread-markdown__visualization-status">{loadState.error}</p>;
+  }
+  if (loadState.status === "loading") {
+    return <p className="thread-markdown__visualization-status">Loading page…</p>;
+  }
+  return (
+    <div className="thread-markdown__visualization-page">
+      <HtmlFilePreview
+        content={loadState.content}
+        desktopApi={previewApi}
+        federationTarget={federationTarget}
+        label={props.label}
+        path={props.path}
+      />
+    </div>
+  );
 }
 
 function localFileTargetFromHref(

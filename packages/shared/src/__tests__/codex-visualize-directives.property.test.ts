@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { renderCodexVisualizeDirectives } from "../codex-visualize-directives";
 
 // The link the transcript turns into a file chip: `[label](file://…)`.
-const LINK_LINE = /^\[((?:\\.|[^\]\\])*)\]\(file:\/\/([^()\s]+)\)$/;
+const LINK_LINE = /^\[((?:\\.|[^\]\\])*)\]\(file:\/\/([^()\s]+) "pwragent-visualize"\)$/;
 
 function linkedPath(line: string): string | undefined {
   const destination = LINK_LINE.exec(line)?.[2];
@@ -29,14 +29,19 @@ describe("Codex visualize directives", () => {
     const path =
       "/Users/vpereira/.pwragent/profiles/dev/projects/2026-11-10-08612d/ctr_audit/ctr-sources.html";
     expect(renderCodexVisualizeDirectives(`visualize{"path":"${path}"}`)).toBe(
-      `[ctr\\-sources\\.html](file://${path})`,
+      `[ctr\\-sources\\.html](file://${path} "pwragent-visualize")`,
     );
+  });
+
+  it("links a path that holds a Unicode line separator", () => {
+    const rendered = renderCodexVisualizeDirectives('visualize{"path":"/tmp/a\u2028b.html"}');
+    expect(linkedPath(rendered)).toBe("/tmp/a\u2028b.html");
   });
 
   it("links the marked form Codex streams, whose markers draw as empty boxes", () => {
     const path = "/Users/example/projects/ctr_audit/platform-adjusted-ctr.html";
     const marked = `\ue200visualize\ue202{"path":"${path}"}\ue201`;
-    const link = `[platform\\-adjusted\\-ctr\\.html](file://${path})`;
+    const link = `[platform\\-adjusted\\-ctr\\.html](file://${path} "pwragent-visualize")`;
     expect(renderCodexVisualizeDirectives(`Android has the largest drop.\n\n${marked}`))
       .toBe(`Android has the largest drop.\n\n${link}`);
     expect(renderCodexVisualizeDirectives(`See ${marked} for detail.`))
