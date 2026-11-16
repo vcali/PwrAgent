@@ -20,6 +20,7 @@ import {
   within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { HtmlPreviewPreferencesProvider } from "../../../lib/html-preview-preferences";
 import { ThreadLinkProvider } from "../../../lib/thread-links";
 import { withRendererSequence } from "../live-transcript-activity";
 import { TranscriptList } from "../TranscriptList";
@@ -1917,6 +1918,41 @@ Implementation notes remain in a readable bubble.`;
     );
 
     // Its link still opens the full viewer.
+    fireEvent.click(screen.getByRole("link", { name: "ctr-sources.html" }));
+    expect(
+      await screen.findByRole("dialog", { name: "HTML document: ctr-sources.html" }),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps a Codex visualize directive to its link when drawing in chat is off", async () => {
+    const filePath = "/Users/example/.pwragent/profiles/dev/projects/audit/ctr-sources.html";
+    const readMarkdownFile = vi.fn(async () => ({ path: filePath, content: "<p>Sources</p>" }));
+
+    render(
+      <HtmlPreviewPreferencesProvider runScripts={false} visualizeDrawInChat={false}>
+        <TranscriptList
+          desktopApi={{ readMarkdownFile }}
+          entries={[
+            {
+              type: "message",
+              id: "message-visualize-link-only",
+              role: "assistant",
+              text: `Here is the audit.\n\n\ue200visualize\ue202{"path":"${filePath}"}\ue201`,
+            },
+          ]}
+          loading={false}
+          loadingMore={false}
+          onLoadOlder={async () => undefined}
+        />
+      </HtmlPreviewPreferencesProvider>
+    );
+
+    expect(screen.getByRole("link", { name: "ctr-sources.html" })).toBeInTheDocument();
+    expect(screen.queryByText(/visualize/)).not.toBeInTheDocument();
+    expect(screen.queryByTitle("HTML preview: ctr-sources.html")).not.toBeInTheDocument();
+    // The page is not read until the operator opens it.
+    expect(readMarkdownFile).not.toHaveBeenCalled();
+
     fireEvent.click(screen.getByRole("link", { name: "ctr-sources.html" }));
     expect(
       await screen.findByRole("dialog", { name: "HTML document: ctr-sources.html" }),

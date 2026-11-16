@@ -1009,6 +1009,11 @@ function SettingsSectionBody(props: {
             general: { htmlPreviewRunScripts },
           });
         }}
+        onVisualizeDrawInChatChange={async (visualizeDrawInChat) => {
+          await props.settings.writeConfig({
+            general: { visualizeDrawInChat },
+          });
+        }}
         onPdfAnalysisEnabledChange={async (pdfAnalysisEnabled) => {
           await props.settings.writeConfig({
             general: { pdfAnalysisEnabled },

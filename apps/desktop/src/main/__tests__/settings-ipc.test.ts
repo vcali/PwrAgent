@@ -369,6 +369,7 @@ describe("settings ipc", () => {
         configRevision: "config-revision",
         onboarding: { completed: true },
         htmlPreviewRunScripts: true,
+        visualizeDrawInChat: true,
       },
     });
     expect(readSettings).not.toHaveBeenCalled();

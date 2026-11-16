@@ -2628,6 +2628,7 @@ describe("App", () => {
         interactiveSvgSkipNotice: { value: false, source: "default" },
         interactiveSvgAutoOpen: { value: false, source: "default" },
         htmlPreviewRunScripts: { value: false, source: "default" },
+        visualizeDrawInChat: { value: true, source: "default" },
       },
       onboarding: {
         completed: { value: true, source: "default" },

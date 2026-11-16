@@ -137,6 +137,7 @@ export type DesktopSettingsConfig = {
     interactiveSvgSkipNotice?: boolean;
     interactiveSvgAutoOpen?: boolean;
     htmlPreviewRunScripts?: boolean;
+    visualizeDrawInChat?: boolean;
     mcpGatewayEnabled?: boolean;
     pdfAnalysisEnabled?: boolean;
     developerMode?: boolean;
@@ -752,6 +753,12 @@ export function desktopSettingsPatchToEdits(
     set(
       ["general", "html_preview_run_scripts"],
       patch.general.htmlPreviewRunScripts,
+    );
+  }
+  if (patch.general?.visualizeDrawInChat !== undefined) {
+    set(
+      ["general", "visualize_draw_in_chat"],
+      patch.general.visualizeDrawInChat,
     );
   }
   if (patch.general?.mcpGatewayEnabled !== undefined) {
@@ -2273,6 +2280,7 @@ function normalizeDesktopConfig(
       ),
       interactiveSvgAutoOpen: readBoolean(general?.interactive_svg_auto_open),
       htmlPreviewRunScripts: readBoolean(general?.html_preview_run_scripts),
+      visualizeDrawInChat: readBoolean(general?.visualize_draw_in_chat),
       mcpGatewayEnabled: readBoolean(general?.mcp_gateway_enabled),
       pdfAnalysisEnabled: readBoolean(general?.pdf_analysis_enabled),
       developerMode: readBoolean(general?.developer_mode),
@@ -2777,6 +2785,7 @@ function pruneEmptyConfig(config: DesktopSettingsConfig): DesktopSettingsConfig 
   const interactiveSvgSkipNotice = config.general?.interactiveSvgSkipNotice;
   const interactiveSvgAutoOpen = config.general?.interactiveSvgAutoOpen;
   const htmlPreviewRunScripts = config.general?.htmlPreviewRunScripts;
+  const visualizeDrawInChat = config.general?.visualizeDrawInChat;
   const pdfAnalysisEnabled = config.general?.pdfAnalysisEnabled;
   const notificationsEnabled = config.general?.notificationsEnabled;
   const toolOutputAlerts = config.general?.toolOutputAlerts;
@@ -2804,6 +2813,7 @@ function pruneEmptyConfig(config: DesktopSettingsConfig): DesktopSettingsConfig 
     interactiveSvgSkipNotice !== undefined ||
     interactiveSvgAutoOpen !== undefined ||
     htmlPreviewRunScripts !== undefined ||
+    visualizeDrawInChat !== undefined ||
     pdfAnalysisEnabled !== undefined ||
     notificationsEnabled !== undefined ||
     toolOutputAlertsDefined ||
@@ -2861,6 +2871,9 @@ function pruneEmptyConfig(config: DesktopSettingsConfig): DesktopSettingsConfig 
     }
     if (htmlPreviewRunScripts !== undefined) {
       pruned.general.htmlPreviewRunScripts = htmlPreviewRunScripts;
+    }
+    if (visualizeDrawInChat !== undefined) {
+      pruned.general.visualizeDrawInChat = visualizeDrawInChat;
     }
     if (pdfAnalysisEnabled !== undefined) {
       pruned.general.pdfAnalysisEnabled = pdfAnalysisEnabled;

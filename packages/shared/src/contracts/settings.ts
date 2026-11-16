@@ -884,6 +884,11 @@ export type DesktopGeneralSettingsSnapshot = {
    */
   htmlPreviewRunScripts: DesktopSettingsValue<boolean>;
   /**
+   * Draw the page a Codex visualize directive names in the message. Off
+   * leaves the file link alone, which opens the page in the file viewer.
+   */
+  visualizeDrawInChat: DesktopSettingsValue<boolean>;
+  /**
    * Whether the profile runs the PwrAgent-managed MCP connection gateway.
    *
    * Off stops the gateway, withholds every managed connection from new
@@ -1746,6 +1751,7 @@ export type DesktopSettingsConfigPatch = {
     interactiveSvgSkipNotice?: boolean;
     interactiveSvgAutoOpen?: boolean;
     htmlPreviewRunScripts?: boolean;
+    visualizeDrawInChat?: boolean;
     mcpGatewayEnabled?: boolean;
     pdfAnalysisEnabled?: boolean;
     developerMode?: boolean;
@@ -2094,6 +2100,8 @@ export type DesktopConfigBootstrapSnapshot = {
   logs: DesktopLogsViewerPreferences;
   /** `general.html_preview_run_scripts`, for windows without the full snapshot. */
   htmlPreviewRunScripts: boolean;
+  /** `general.visualize_draw_in_chat`, for windows without the full snapshot. */
+  visualizeDrawInChat: boolean;
 };
 
 export type ReadDesktopConfigBootstrapResponse = {

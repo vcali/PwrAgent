@@ -252,6 +252,7 @@ export function GeneralSettings(props: {
     interactiveSvgAutoOpen?: boolean;
   }) => Promise<void>;
   onHtmlPreviewRunScriptsChange: (value: boolean) => Promise<void>;
+  onVisualizeDrawInChatChange: (value: boolean) => Promise<void>;
   onPdfAnalysisEnabledChange: (value: boolean) => Promise<void>;
   onPastedImageMaxPatchesChange: (value: number) => Promise<void>;
   onNotificationsEnabledChange: (value: boolean) => Promise<void>;
@@ -280,6 +281,7 @@ export function GeneralSettings(props: {
       ? interactiveSvgSkipNotice
       : interactiveSvgAutoOpen;
   const htmlPreviewRunScripts = props.snapshot.general.htmlPreviewRunScripts;
+  const visualizeDrawInChat = props.snapshot.general.visualizeDrawInChat;
   const pdfAnalysisEnabled = props.snapshot.general.pdfAnalysisEnabled;
   const notificationsEnabled = props.snapshot.general.notificationsEnabled;
   const themedDockIcon = props.snapshot.general.appearance.themedDockIcon;
@@ -574,6 +576,16 @@ export function GeneralSettings(props: {
             source={sourceBadge(htmlPreviewRunScripts)}
             onChange={(next) => {
               return props.onHtmlPreviewRunScriptsChange(next);
+            }}
+          />
+          <ToggleField
+            checked={visualizeDrawInChat.value}
+            disabled={props.saving}
+            label="Draw visualizations in chat"
+            sub="A page an Agent asks to show is drawn in its message, under a link to the file. Off, the message shows the link alone, and the link opens the page in the file viewer."
+            source={sourceBadge(visualizeDrawInChat)}
+            onChange={(next) => {
+              return props.onVisualizeDrawInChatChange(next);
             }}
           />
         </div>

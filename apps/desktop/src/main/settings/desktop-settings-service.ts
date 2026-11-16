@@ -1048,6 +1048,12 @@ export class DesktopSettingsService {
           config.general?.htmlPreviewRunScripts,
           false,
         ),
+        // Default on: the directive asks for the page to be shown, and the
+        // frame it is drawn in is the file viewer's offline one.
+        visualizeDrawInChat: this.resolveConfigBoolean(
+          config.general?.visualizeDrawInChat,
+          true,
+        ),
         // Default on: the gateway only does work for connections the
         // operator explicitly added and authorized, so an empty registry
         // costs nothing. The switch exists to revoke thread access

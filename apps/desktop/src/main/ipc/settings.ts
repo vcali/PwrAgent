@@ -1755,6 +1755,8 @@ export function registerSettingsIpcHandlers(
           logs: resolveDesktopLogsViewerPreferences(store.read("ui").logs),
           htmlPreviewRunScripts:
             store.read("general").settings.htmlPreviewRunScripts ?? false,
+          visualizeDrawInChat:
+            store.read("general").settings.visualizeDrawInChat ?? true,
         },
       };
     },

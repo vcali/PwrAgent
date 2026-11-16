@@ -11,15 +11,50 @@ import type { DesktopApi } from "./desktop-api";
  */
 const HtmlPreviewRunScriptsContext = createContext<boolean | undefined>(undefined);
 
+/**
+ * Whether the page a Codex visualize directive names is drawn in the message.
+ * Off leaves its file link alone. Provided and read like the setting above.
+ */
+const VisualizeDrawInChatContext = createContext<boolean | undefined>(undefined);
+
 export function HtmlPreviewPreferencesProvider(props: {
   children: ReactNode;
   runScripts: boolean;
+  /** Left out, the setting's default stands: drawn. */
+  visualizeDrawInChat?: boolean;
 }) {
   return (
     <HtmlPreviewRunScriptsContext.Provider value={props.runScripts}>
-      {props.children}
+      <VisualizeDrawInChatContext.Provider value={props.visualizeDrawInChat ?? true}>
+        {props.children}
+      </VisualizeDrawInChatContext.Provider>
     </HtmlPreviewRunScriptsContext.Provider>
   );
+}
+
+/** The setting, or undefined until a window without a provider has read it. */
+export function useVisualizeDrawInChat(
+  desktopApi?: Pick<DesktopApi, "readConfigBootstrap">,
+): boolean | undefined {
+  const provided = useContext(VisualizeDrawInChatContext);
+  const readConfigBootstrap = provided === undefined ? desktopApi?.readConfigBootstrap : undefined;
+  // With nothing to read the setting from, its default stands.
+  const [read, setRead] = useState<boolean | undefined>(readConfigBootstrap ? undefined : true);
+  useEffect(() => {
+    if (!readConfigBootstrap) return undefined;
+    let cancelled = false;
+    void readConfigBootstrap()
+      .then((response) => {
+        if (!cancelled) setRead(response.snapshot.visualizeDrawInChat ?? true);
+      })
+      .catch(() => {
+        if (!cancelled) setRead(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [readConfigBootstrap]);
+  return provided ?? read;
 }
 
 /** The setting, or false until a window without a provider has read it. */

@@ -70,6 +70,7 @@ import { MermaidDiagram } from "./MermaidDiagram";
 import { useMarkdownFileSource } from "./useMarkdownFileSource";
 import { FileViewerHeader, splitFilePath } from "./FileViewerHeader";
 import { HtmlFilePreview } from "./HtmlFilePreview";
+import { useVisualizeDrawInChat } from "../../lib/html-preview-preferences";
 import { isLoopbackHost } from "../../lib/loopback-host";
 import {
   TranscriptFileRegistrationContext,
@@ -1405,6 +1406,8 @@ function InlineHtmlVisualization(props: {
   label: string;
   path: string;
 }) {
+  // Read here, not in every link: a window without the provider asks main.
+  const draw = useVisualizeDrawInChat(props.desktopApi) === true;
   const [loadState, setLoadState] = useState<
     | { status: "loading" }
     | { status: "loaded"; content: string }
@@ -1420,6 +1423,9 @@ function InlineHtmlVisualization(props: {
   useEffect(() => {
     let cancelled = false;
     setLoadState({ status: "loading" });
+    if (!draw) {
+      return undefined;
+    }
     if (!readMarkdownFile) {
       setLoadState({ status: "error", error: "File preview is unavailable." });
       return undefined;
@@ -1441,8 +1447,11 @@ function InlineHtmlVisualization(props: {
     return () => {
       cancelled = true;
     };
-  }, [readMarkdownFile, props.path, thread, federationTarget]);
+  }, [draw, readMarkdownFile, props.path, thread, federationTarget]);
 
+  if (!draw) {
+    return null;
+  }
   if (loadState.status === "error") {
     return <p className="thread-markdown__visualization-status">{loadState.error}</p>;
   }

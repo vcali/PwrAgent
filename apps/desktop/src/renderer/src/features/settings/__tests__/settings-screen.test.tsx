@@ -197,6 +197,7 @@ function createSnapshot(
       interactiveSvgSkipNotice: { value: false, source: "default" },
       interactiveSvgAutoOpen: { value: false, source: "default" },
       htmlPreviewRunScripts: { value: false, source: "default" },
+      visualizeDrawInChat: { value: true, source: "default" },
     },
     onboarding: {
       completed: { value: true, source: "default" },
@@ -1793,6 +1794,26 @@ describe("SettingsScreen", () => {
     await waitFor(() => {
       expect(settings.writeConfig).toHaveBeenCalledWith({
         general: { htmlPreviewRunScripts: true },
+      });
+    });
+  });
+
+  it("saves the setting that draws visualizations in chat", async () => {
+    const settings = createSettingsState();
+    render(
+      <SettingsScreen
+        initialSection="general"
+        settings={settings}
+        onClose={() => undefined}
+      />,
+    );
+
+    const toggle = screen.getByRole("switch", { name: "Draw visualizations in chat" });
+    expect(toggle).toBeChecked();
+    fireEvent.click(toggle);
+    await waitFor(() => {
+      expect(settings.writeConfig).toHaveBeenCalledWith({
+        general: { visualizeDrawInChat: false },
       });
     });
   });

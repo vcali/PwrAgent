@@ -3245,6 +3245,31 @@ describe("DesktopSettingsService", () => {
     });
   });
 
+  it("defaults drawing visualizations in chat on and persists turning it off", async () => {
+    const root = createTempRoot();
+    const configPath = path.join(root, "config.toml");
+    const service = new DesktopSettingsService({
+      configPath,
+      env: {},
+      secretStore: new MemoryDesktopSecretStore(),
+    });
+
+    expect((await service.readSettingsProjection()).general.visualizeDrawInChat).toEqual({
+      value: true,
+      source: "default",
+    });
+
+    await service.writeConfigPatchTargeted({
+      general: { visualizeDrawInChat: false },
+    });
+
+    expect(fs.readFileSync(configPath, "utf8")).toContain("visualize_draw_in_chat = false");
+    expect((await service.readSettingsProjection()).general.visualizeDrawInChat).toEqual({
+      value: false,
+      source: "config",
+    });
+  });
+
   it("defaults both interactive SVG preferences off and persists overrides", async () => {
     const root = createTempRoot();
     const configPath = path.join(root, "config.toml");

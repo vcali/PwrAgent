@@ -5171,6 +5171,9 @@ function DesktopAppShell(props: {
                   runScripts={
                     settings.snapshot?.general.htmlPreviewRunScripts?.value ?? false
                   }
+                  visualizeDrawInChat={
+                    settings.snapshot?.general.visualizeDrawInChat?.value ?? true
+                  }
                 >
                   <TerminalPreferencesProvider
                     minimumContrast={
