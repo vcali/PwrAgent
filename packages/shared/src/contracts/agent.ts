@@ -439,7 +439,20 @@ export type ReleaseQueuedTurnResponse = {
 /** Product execution modes; independent of native protocol delivery. */
 export type ReviewRunMode = "codex-sub-agent" | "pwragent-sub-agent";
 
+/**
+ * What the thread does once the review lands. `auto-fix` sends the review's
+ * findings to the thread's own agent, which fixes, defers or declines each.
+ * `wait` leaves them on the To-do card for the operator.
+ */
+export type ReviewAfterAction = "auto-fix" | "wait";
+
 export type StartReviewRequest = {
+  /**
+   * Omitted means `wait`, so an owner never starts fixing for a viewer that
+   * did not ask. Viewers send it only to an owner whose backend advertises
+   * the `reviewAutoFix` capability.
+   */
+  afterReview?: ReviewAfterAction;
   /** Omitted legacy requests use native review unless provider/workspace constraints require managed review. */
   runMode?: ReviewRunMode;
   backend: AppServerBackendKind;
@@ -680,7 +693,8 @@ export type SteerTurnRequest = {
   delivery?: SteerTurnDelivery;
   /**
    * Durable fallback accepted by main together with the steer request. Main
-   * schedules it when the expected target is already stale.
+   * schedules it when the expected target is already stale or a native
+   * review cannot accept steering.
    */
   fallback?: {
     displayText: string;
@@ -694,10 +708,12 @@ export type SteerTurnResponse = {
   backend: AppServerBackendKind;
   threadId: ThreadIdentifier;
   turnId: string;
-  disposition?: "held" | "queued" | "steered" | "scheduled";
+  disposition?: "held" | "queued" | "steered" | "scheduled" | "started";
   queueEntryId?: string;
   queueEntryCreatedAt?: number;
   holdReason?: string;
+  /** Why this steer was accepted as an automatic follow-up instead. */
+  fallbackReason?: "native-review";
   scheduledAction?: ScheduledThreadAction;
 };
 
@@ -1511,6 +1527,13 @@ export type AgentEvent = {
   backend: AppServerBackendKind;
   federationTarget?: FederationTarget;
   notification: AppServerNotification;
+  /**
+   * Complete all-provider owner-local directory dependencies for this row-only event,
+   * including off-page descendants. Absence (or an unknown version) grants
+   * no exclusion authority. Never applies to another owner's viewer mounts
+   * or to membership changes. Owners omit the field when it exceeds bounds.
+   */
+  navigationDirectoryScope?: { version: 1; directoryKeys: string[] };
   /** Navigable owner of a failure, captured before a private helper is finalized. */
   errorNoticeContext?: {
     backend: AppServerBackendKind;

@@ -1,5 +1,5 @@
 import { memo, useState } from "react";
-import type { NavigationThreadSummary } from "@pwragent/shared";
+import type { NavigationThreadSummary, WorktreeSnapshotSummary } from "@pwragent/shared";
 import { FolderIcon, WorktreeIcon } from "../../../icons";
 import type { DesktopApi } from "../../../lib/desktop-api";
 import { PrChip } from "../../pr-status/PrChip";
@@ -152,14 +152,14 @@ export const LinkedProjectsPanel = memo(function LinkedProjectsPanel(props: Link
                   <div className="context-list__label">
                     <CopyValueButton
                       label={`Copy path for ${directory.label}`}
-                      value={directory.path}
+                      value={worktreePath}
                       onBlur={props.hideTooltip}
                       onCopy={handleCopyPath}
                       onShowTooltip={props.showTooltip}
                     />
                     <TooltipValue
                       label={`Path for ${directory.label}`}
-                      value={directory.path}
+                      value={worktreePath}
                       onBlur={props.hideTooltip}
                       onShowTooltip={props.showTooltip}
                     >
@@ -189,6 +189,10 @@ export const LinkedProjectsPanel = memo(function LinkedProjectsPanel(props: Link
                 <dl className="linked-project__facts">
                   <div>
                     <dt>Kind</dt>
+                    <dd>{directory.kind === "worktree" ? "Worktree" : "Directory"}</dd>
+                  </div>
+                  <div>
+                    <dt>Path</dt>
                     <dd className="context-value-row">
                       <CopyValueButton
                         label={`Copy path for ${directory.kind} ${directory.label}`}
@@ -203,7 +207,7 @@ export const LinkedProjectsPanel = memo(function LinkedProjectsPanel(props: Link
                         onBlur={props.hideTooltip}
                         onShowTooltip={props.showTooltip}
                       >
-                        {directory.kind === "worktree" ? "Worktree" : "Directory"}
+                        <span className="context-grid__mono">{worktreePath}</span>
                       </TooltipValue>
                     </dd>
                   </div>
@@ -290,14 +294,12 @@ export const LinkedProjectsPanel = memo(function LinkedProjectsPanel(props: Link
         </div>
       ) : null}
 
-      {props.thread.worktreeSnapshots?.some(
-        (snapshot) => snapshot.state === "archived",
-      ) ? (
+      {props.thread.worktreeSnapshots?.some(isRestorableSnapshot) ? (
         <div className="linked-projects__snapshots">
           <h4 className="context-subheading">Worktree snapshots</h4>
           <ul className="context-list">
             {props.thread.worktreeSnapshots
-              .filter((snapshot) => snapshot.state === "archived")
+              .filter(isRestorableSnapshot)
               .map((snapshot) => (
                 <li key={snapshot.id} className="context-list__item">
                   <button
@@ -334,9 +336,13 @@ export const LinkedProjectsPanel = memo(function LinkedProjectsPanel(props: Link
                       </button>
                     ) : null}
                     <span className="context-list__meta">
-                      {snapshot.archivedAt
-                        ? formatTimestamp(snapshot.archivedAt)
-                        : "archived"}
+                      {snapshot.state === "hibernated"
+                        ? snapshot.hibernatedAt
+                          ? `Hibernated ${formatTimestamp(snapshot.hibernatedAt)}`
+                          : "hibernated"
+                        : snapshot.archivedAt
+                          ? formatTimestamp(snapshot.archivedAt)
+                          : "archived"}
                     </span>
                   </div>
                 </li>
@@ -352,6 +358,11 @@ export const LinkedProjectsPanel = memo(function LinkedProjectsPanel(props: Link
     </section>
   );
 });
+
+/** Snapshots whose checkout is gone and can come back from them. */
+function isRestorableSnapshot(snapshot: WorktreeSnapshotSummary): boolean {
+  return snapshot.state === "archived" || snapshot.state === "hibernated";
+}
 
 function dedupeLinkedProjectDirectories(
   directories: NavigationThreadSummary["linkedDirectories"],

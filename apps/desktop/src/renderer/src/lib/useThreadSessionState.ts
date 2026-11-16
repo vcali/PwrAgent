@@ -218,6 +218,8 @@ type ThreadSessionEntry = ThreadActiveTurnState & ThreadPendingInteractionState 
   transientMessage?: AppServerTransientThreadMessageEntry;
   pendingTurnUsage?: TurnUsageAccumulator;
   response?: AppServerReadThreadResponse;
+  // Compaction resets pages, but a matching row must keep its observed order.
+  compactionOrderSources?: AppServerThreadEntry[];
   // Lightweight reading state belongs beside the bounded transcript cache.
   // ThreadView is allowed to unmount while thread navigation resolves.
   expandedTranscriptActivityIds?: string[];
@@ -507,8 +509,8 @@ function mergeTranscriptEntries(
   let greatestCreatedAtByTurn = new Map<string, number>();
   let greatestSequenceByTurn = new Map<string, number>();
   let terminalTurnIds = new Set<string>();
-  // Turns on the list, and the turn of its last entry that has one. Only the
-  // newest turn can take a row at the end.
+  // Only the turn of the last row can take another row at the end. An unbound
+  // user message is an ordering boundary too, even before its provider id lands.
   let mergedTurnIds = new Set<string>();
   let lastMergedTurnId: string | undefined;
   const rebuildAppendIndexes = (): void => {
@@ -524,8 +526,8 @@ function mergeTranscriptEntries(
       mergedEntryIndexById.set(entry.id, index);
       if (entry.turn?.id) {
         mergedTurnIds.add(entry.turn.id);
-        lastMergedTurnId = entry.turn.id;
       }
+      lastMergedTurnId = entry.turn?.id;
       if (entry.type === "review") {
         const indexes = reviewIndexesByTurn.get(entry.turn?.id) ?? [];
         indexes.push(index);
@@ -571,8 +573,8 @@ function mergeTranscriptEntries(
     merged.push(entry);
     if (entry.turn?.id) {
       mergedTurnIds.add(entry.turn.id);
-      lastMergedTurnId = entry.turn.id;
     }
+    lastMergedTurnId = entry.turn?.id;
     if (typeof entry.createdAt === "number") {
       greatestCreatedAt = Math.max(
         greatestCreatedAt ?? entry.createdAt,
@@ -1049,6 +1051,7 @@ function reconcileRetainedTranscriptTail(
   >();
   let pendingRetainedEntries: AppServerThreadEntry[] = [];
   let lastMatchedFreshEntry: AppServerThreadEntry | undefined;
+  const freshTurnIds = new Set(freshEntries.flatMap((entry) => entry.turn?.id ? [entry.turn.id] : []));
 
   for (const retainedEntry of retainedEntries) {
     const freshEntry = freshEntryByRetainedEntry.get(retainedEntry);
@@ -1057,8 +1060,22 @@ function reconcileRetainedTranscriptTail(
       continue;
     }
 
+    if (pendingRetainedEntries.length > 0 && !lastMatchedFreshEntry && freshEntries[0]) {
+      // The newest window can advance past whole retained turns while an
+      // older page is in flight. Keep that prefix above the new window,
+      // rather than immediately above a later matching turn inside it.
+      const firstSharedTurn = pendingRetainedEntries.findIndex((entry) =>
+        !entry.turn?.id || freshTurnIds.has(entry.turn.id));
+      const prefixLength = firstSharedTurn === -1 ? pendingRetainedEntries.length : firstSharedTurn;
+      if (prefixLength > 0) {
+        retainedEntriesBeforeFresh.set(freshEntries[0], pendingRetainedEntries.slice(0, prefixLength));
+        pendingRetainedEntries = pendingRetainedEntries.slice(prefixLength);
+      }
+    }
     if (pendingRetainedEntries.length > 0) {
-      retainedEntriesBeforeFresh.set(freshEntry, pendingRetainedEntries);
+      retainedEntriesBeforeFresh.set(freshEntry, [
+        ...(retainedEntriesBeforeFresh.get(freshEntry) ?? []), ...pendingRetainedEntries,
+      ]);
       pendingRetainedEntries = [];
     }
     lastMatchedFreshEntry = freshEntry;
@@ -1553,7 +1570,28 @@ function pruneOptimisticEntries(
 
   const latestResponseTurnId = latestTranscriptTurnId(response.replay.entries);
   const latestResponseCreatedAt = latestTranscriptCreatedAt(response.replay.entries);
-  return optimisticEntries.filter((entry) => {
+  return optimisticEntries.map((entry) => {
+    if (entry.type !== "activity" || !entry.id.startsWith("live-tools-")) {
+      return entry;
+    }
+    // A read can acknowledge only the first commands of a live bucket. Keep
+    // its unseen suffix, rather than rendering the acknowledged commands in
+    // both the replay row and the live row.
+    const acknowledged = completedReplayToolDetails(response.replay.entries)
+      .get(entry.turn?.id ?? "");
+    if (!acknowledged) {
+      return entry;
+    }
+    const details = entry.details.filter((detail) =>
+      detail.status !== "completed" || !acknowledged.has(detail.id)
+    );
+    return details.length === entry.details.length ? entry : {
+      ...entry,
+      details,
+      summary: summarizeLiveActivity(details),
+      status: summarizeActivityStatus(details),
+    };
+  }).filter((entry) => {
     if (entry.type === "message") {
       const isLaunchpadPlaceholder =
         entry.id === launchpadMessageCandidate?.entry.id;
@@ -1589,6 +1627,9 @@ function pruneOptimisticEntries(
     }
 
     if (entry.type === "activity") {
+      if (entry.id.startsWith("live-tools-") && entry.details.length === 0) {
+        return false;
+      }
       if (
         latestResponseTurnId &&
         entry.turn?.id !== latestResponseTurnId &&
@@ -1607,6 +1648,27 @@ function pruneOptimisticEntries(
 
     return !response.replay.entries.some((candidate) => candidate.id === entry.id);
   });
+}
+
+const completedReplayToolDetailCache = new WeakMap<AppServerThreadEntry[], Map<string, Set<string>>>();
+
+function completedReplayToolDetails(entries: AppServerThreadEntry[]): Map<string, Set<string>> {
+  const cached = completedReplayToolDetailCache.get(entries);
+  if (cached) {
+    return cached;
+  }
+  const byTurn = new Map<string, Set<string>>();
+  for (const entry of entries) {
+    if (entry.type !== "activity" || !entry.turn?.id) continue;
+    for (const detail of entry.details) {
+      if (detail.status !== "completed") continue;
+      const ids = byTurn.get(entry.turn.id) ?? new Set<string>();
+      ids.add(detail.id);
+      byTurn.set(entry.turn.id, ids);
+    }
+  }
+  completedReplayToolDetailCache.set(entries, byTurn);
+  return byTurn;
 }
 
 // Keyed by the immutable replay array, like `replayActivityMatches` below:
@@ -2120,18 +2182,28 @@ function carryForwardTranscriptEntryOrder(
     const createdAt = source.createdAt !== entry.createdAt
       ? source.createdAt
       : undefined;
-    if (!origin && !turn && createdAt === undefined) {
+    // Acknowledging a live row must keep its observed position. A later
+    // redelivery reuses this sequence instead of placing the row after newer
+    // optimistic work that the read has not acknowledged yet.
+    const sequence = readRendererSequence(source);
+    if (
+      !origin && !turn && createdAt === undefined
+      && (sequence === undefined || sequence === readRendererSequence(entry))
+    ) {
       sourceByHydratedEntry.set(entry, source);
       return entry;
     }
 
     changed = true;
-    const hydratedEntry = {
+    let hydratedEntry = {
       ...entry,
       ...(createdAt !== undefined ? { createdAt } : {}),
       ...(turn ? { turn } : {}),
       ...(origin ? { origin } : {}),
     };
+    if (sequence !== undefined) {
+      hydratedEntry = withRendererSequence(hydratedEntry, sequence);
+    }
     sourceByHydratedEntry.set(hydratedEntry, source);
     return hydratedEntry;
   });
@@ -4428,6 +4500,10 @@ function threadMessageOriginFromUnknown(
     record.kind === "pwragent"
       ? threadMessagePrAutomationOriginFromUnknown(record.prAutomation)
       : undefined;
+  const reviewAutoFix =
+    record.kind === "pwragent"
+      ? threadMessageReviewAutoFixOriginFromUnknown(record.reviewAutoFix)
+      : undefined;
   const source = record.sourceThread;
   if (!source || typeof source !== "object" || Array.isArray(source)) {
     return {
@@ -4437,6 +4513,7 @@ function threadMessageOriginFromUnknown(
       ...(messaging ? { messaging } : {}),
       ...(subAgent ? { subAgent } : {}),
       ...(prAutomation ? { prAutomation } : {}),
+      ...(reviewAutoFix ? { reviewAutoFix } : {}),
     };
   }
   const sourceRecord = source as Record<string, unknown>;
@@ -4450,6 +4527,7 @@ function threadMessageOriginFromUnknown(
       ...(systemReason ? { systemReason } : {}),
       ...(messaging ? { messaging } : {}),
       ...(prAutomation ? { prAutomation } : {}),
+      ...(reviewAutoFix ? { reviewAutoFix } : {}),
     };
   }
   // A to-do marker names the thread that raised the card, so it needs one.
@@ -4484,6 +4562,28 @@ function threadMessageOriginFromUnknown(
     ...(messaging ? { messaging } : {}),
     ...(subAgent ? { subAgent } : {}),
     ...(prAutomation ? { prAutomation } : {}),
+    ...(reviewAutoFix ? { reviewAutoFix } : {}),
+  };
+}
+
+function threadMessageReviewAutoFixOriginFromUnknown(
+  value: unknown,
+): AppServerThreadMessageOrigin["reviewAutoFix"] | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.reviewId !== "string"
+    || typeof record.findingCount !== "number"
+    || !Number.isFinite(record.findingCount)
+  ) {
+    return undefined;
+  }
+  return {
+    reviewId: record.reviewId,
+    findingCount: record.findingCount,
+    ...(typeof record.title === "string" ? { title: record.title } : {}),
   };
 }
 
@@ -5411,7 +5511,9 @@ export function useThreadSessionState(params: {
             ...(current.pendingAssistantMessage ? [current.pendingAssistantMessage] : []),
           ];
           const transcriptOrderSources = mergeTranscriptEntries(
-            current.response?.replay.entries ?? [],
+            current.compactionOrderSources
+              ? mergeTranscriptEntries(current.compactionOrderSources, current.response?.replay.entries ?? [])
+              : current.response?.replay.entries ?? [],
             liveTranscriptSources
           );
           const orderedResponse = carryForwardTranscriptEntryOrder(
@@ -5422,7 +5524,9 @@ export function useThreadSessionState(params: {
           const responseWithRetainedTail = preserveRetainedTranscriptTail(
             orderedResponse,
             current.response,
-            Boolean(current.loadedHistory),
+            // Keep the cursor bridge for an in-flight older page, and the
+            // observed live tail when a lifecycle event overtook this read.
+            Boolean(current.loadedHistory) || current.loadingMore || lifecycleChangedDuringRead,
           );
           const hydratedPendingRequest = lifecycleChangedDuringRead
             ? undefined
@@ -5587,6 +5691,7 @@ export function useThreadSessionState(params: {
                 : undefined,
             loading: false,
             completionHydrationRetries,
+            compactionOrderSources: undefined,
             needsHydrationAfterCompletion,
             retainedLiveEntryCount: nextRetainedLiveEntries.length,
             retainedLiveEntryVersion:
@@ -6244,6 +6349,18 @@ export function useThreadSessionState(params: {
         });
       }
 
+      if (
+        event.notification.method === "thread/compacted"
+        || event.notification.method === "thread/rewound"
+      ) {
+        // Reads and pagination cursors from before the reset cannot rebuild
+        // the new history. Invalidate them before scheduling a fresh read.
+        hydrationsRef.current.set(targetThreadKey, transitionThreadHydration(
+          hydrationsRef.current.get(targetThreadKey), { type: "invalidate" },
+        ));
+        conditionalReadsRef.current.delete(targetThreadKey);
+      }
+
       updateSession(targetThreadKey, (session) => {
         const current = transitionTransientMessagesAtBoundary(
           session,
@@ -6723,6 +6840,12 @@ export function useThreadSessionState(params: {
               })
             : undefined;
           if (assistantMessageEntry) {
+            const observedMessage = current.pendingAssistantMessage?.id === assistantMessageEntry.id
+              ? current.pendingAssistantMessage
+              : current.optimisticEntries.find((entry) => entry.id === assistantMessageEntry.id)
+                ?? current.response?.replay.entries.find((entry) => entry.id === assistantMessageEntry.id);
+            const sequence = readRendererSequence(observedMessage) ?? current.nextLiveEntrySequence;
+            const completedEntry = withRendererSequence(assistantMessageEntry, sequence);
             const responseWithUsage = taskMonitorUsageEntry
               ? appendThreadEntries(
                   current.response,
@@ -6743,7 +6866,7 @@ export function useThreadSessionState(params: {
                 ...current.optimisticEntries.filter(
                   (entry): entry is AppServerThreadMessageEntry => entry.type === "message"
                 ),
-                assistantMessageEntry,
+                completedEntry,
               ]
             );
 
@@ -6755,6 +6878,7 @@ export function useThreadSessionState(params: {
               optimisticEntries: current.optimisticEntries.filter(
                 (entry) => entry.type !== "message"
               ),
+              nextLiveEntrySequence: Math.max(current.nextLiveEntrySequence, sequence + 1),
               pendingAssistantMessage:
                 current.pendingAssistantMessage?.id === assistantMessageEntry.id
                   ? undefined
@@ -7307,6 +7431,18 @@ export function useThreadSessionState(params: {
           delete loadedHistoryIndexesRef.current[targetThreadKey];
           return {
             ...current,
+            compactionOrderSources: event.notification.method === "thread/compacted"
+              ? mergeTranscriptEntries(
+                  current.compactionOrderSources
+                    ? mergeTranscriptEntries(current.compactionOrderSources, current.response?.replay.entries ?? [])
+                    : current.response?.replay.entries ?? [],
+                  [
+                    ...current.optimisticEntries,
+                    ...(retainedLiveEntriesRef.current[targetThreadKey]?.values() ?? []),
+                    ...(current.pendingAssistantMessage ? [current.pendingAssistantMessage] : []),
+                  ],
+                )
+              : undefined,
             activeTurnId: undefined,
             activeTurnStartedAt: undefined,
             contextWindow: undefined,
@@ -7314,6 +7450,8 @@ export function useThreadSessionState(params: {
             hydratedUpdatedAt: undefined,
             lastTouchedAt: nextLastTouchedAt,
             loadedHistory: undefined,
+            loading: false,
+            loadingMore: false,
             pendingUsageActivityEntry: undefined,
             pendingTurnUsage: undefined,
             pendingStatusText: undefined,

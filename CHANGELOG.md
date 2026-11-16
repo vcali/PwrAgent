@@ -1,5 +1,53 @@
 # Changelog
 
+## v1.3.16 - 2026-11-08
+
+- Thread Maintenance: Reclaim Disk Space - Find the checkouts actually used by this profile's threads, not just those in default worktree folders. See their disk usage, largest contents, owning threads, and exactly why a checkout is being kept, with links to the threads so you can resolve the blocker and scan again.
+- Hibernation That Can Finish - Stop treating merely viewing a thread as checkout activity, and stop completed PR watches from holding idle checkouts indefinitely. Include eligible archived checkouts and remove the ignored-file blocker. Ignored files are not saved in recovery snapshots and are removed with a hibernated checkout.
+- Build Output Cleanup - Review and remove verified Cargo build artifacts independently, even when the checkout itself must stay. Check native build locks and repository ownership before removal, preserving tracked files and unrelated user files.
+- Maintenance You Can Follow - Show scan coverage, current work, elapsed time, kept reasons, and cleanup progress instead of leaving a long operation looking stuck. Minimize to a progress notice and reopen with your plan and selections intact. Disk allocation is shown separately from recovery-snapshot size and is not a promise of freed space.
+- Continue After - Bring Wait Until Done into one dependency workflow. Wait for work on this machine, a connected machine, or outside PwrAgent to be explicitly marked done, optionally hold merging, and choose an agent continuation or an operator reminder with follow-up steps. Existing Wait Until Done registrations are not migrated; recreate them in Continue After.
+- Merge Holds - Show holds belonging to other threads attached to the same PR, so a different thread cannot overlook work that still blocks the merge.
+- Messaging - Unblock queued replies and preserve the owning thread's FIFO across messaging and desktop. Bind MCP approvals to the exact displayed proposal; stale buttons and a bare "yes" do not authorize another request.
+- Projects and Navigation - Persist remote project pins on their owning machine, preserve navigation resume across metadata refreshes, retain child ordering when selected, reject deep sub-thread cycles, and show linked checkout paths.
+- Archive Retention - Include PwrAgent's archived Claude threads in the configured retention policy and reduce background cleanup notifications.
+
+## v1.3.15 - 2026-11-07
+
+- Thread Maintenance - Keep the dialog's size steady through scans, review, and cleanup, with visible scan steps and progress. Make archiving an explicit opt-in step in Combined mode and allow a scan-specific hibernation idle-day threshold without changing Settings or the automatic sweep.
+- Checkout Hibernation - Include eligible Codex-managed worktree checkouts as well as PwrAgent checkouts, while preserving externally owned checkouts. Restore hibernated checkouts at their original paths and distinguish not-yet-idle, kept, and already-hibernated results.
+- Claude Tool Calls - Keep long-running PwrAgent tool calls open with streamed responses and progress notifications instead of hitting Claude's response-header timeout. Maintenance scans can report that they are still running and be read again by scan ID without starting duplicate scans.
+- Plan Mode Safety - Block GitHub and GitLab writes during Codex and Claude plan turns. Keep Claude's managed MCP calls read-only in Plan mode while honoring connection policies and explicit approval rules.
+- PwrSnap Connections - Repair OAuth import and authorization-rejection handling for the PwrSnap MCP connection.
+- Projects and Archiving - Include descendant threads in directory counts and check sub-threads on connected machines before archiving a parent. Resolve a thread's primary PR repository from its current checkout after remote changes or workspace moves.
+- Minor - Isolate ACP, scheduled-action, search, Token Miser, To-do, review, and PR-status storage behind their owning services.
+
+## v1.3.14 - 2026-11-06
+
+- Checkout Hibernation - Reclaim disk space from eligible idle PwrAgent worktree checkouts while keeping their threads visible. Save uncommitted changes to recovery snapshots and restore the checkout on the next send. Hibernation defaults to on after seven idle days unless explicitly disabled; ignored, rebuildable output such as node_modules may be removed. Use Restore now or Keep Checkout Awake from the thread.
+- Archiving and Maintenance - Stop automatically archiving threads: archiving now requires an explicit request. Thread maintenance can review idle checkouts for hibernation, include Claude threads, and list unreferenced PwrAgent checkouts without selecting them by default. Add Clean Up Project, protect sub-thread parents, and show bounded cleanup progress and Open thread links.
+- Review Auto-fix - Let a finished review queue the thread's agent to fix, defer, or decline its findings. Configure the default in Settings or change it for an individual review, including from messaging. Show whether Auto-fix is armed or running, and clear stale failures when someone takes over.
+- Claude Session Recovery - Continue a thread in a new Claude session after Claude Code has deleted the old session. Seed the new session with PwrAgent's retained user and assistant conversation, not tool output, and explain the rewind boundary. Offer recovery in desktop and messaging, and support rewind with a custom CLAUDE_CONFIG_DIR.
+- Project MCP Approvals - Give each project its own tool-approval policy for an MCP connection. Allow a connection's tools for the current project from an approval card or manage project rules in Settings.
+- Merge Approvals - Show the proposed merge method and let the operator choose another method when approving an agent's merge request, with a project-specific remembered choice.
+- Claude Commands - Display slash commands as composer chips with argument hints.
+- Reviews and Pull Requests - Show reviews on mounted remote threads, keep already-viewed open reviews from becoming unread again after retention cleanup, order PR rollups newest first, keep rollups open during transcript updates, and allow detaching PRs from Minimal's PR chip and list.
+- Navigation and Workspaces - Fold Recents beneath Pinned, preserve directory pins during pending writes, and keep cross-project sub-threads in their own directories.
+- Message Safety - Reject sends to archived threads, queue steering messages during native Codex reviews, and prevent submitted content from returning as a startup draft.
+- Minor - Improve shutdown discovery ownership, profile-scoped settings, and internal state-service boundaries.
+
+## v1.3.13 - 2026-11-05
+
+- Wait Until Done - Hold a thread's merge while replies, rebases, and CI repairs continue. Record prerequisite work and follow-up steps, including work on another machine, then receive a reminder when it is marked done without automatically starting a new turn.
+- Thread Maintenance - Review idle threads and archived checkouts together, choose what to archive or keep, and save changes before removing checkouts. Continue archive sweeps past individual failures rather than stopping the whole sweep.
+- Handoff Progress - See the steps, transferred bytes, rate, and time remaining when sending a thread to another machine. Minimize the dialog to a progress toast, or cancel before the receiver starts creating the thread.
+- Remote Transfers - Transfer files and images using resumable binary transport, preserving progress across connection drops and keeping cancellation scoped to the intended transfer.
+- Claude Sub-agents - Show Claude's sub-agents in the Sub-agents panel and beneath their parent in the thread list, with their current activity and status.
+- Local MCP Connections - Connect to HTTP MCP servers over Unix sockets on macOS/Linux and local named pipes on Windows. Verify the connected OS user before sending requests, with support for server-issued session bearer tokens.
+- Archive Performance - Reduce repeated Git checks during bulk archive and cleanup, and keep navigation refreshes scoped to affected resources and directory membership.
+- Settings - Preserve full custom Codex home paths instead of displaying a misleading abbreviation, and prevent automation action menus from being clipped.
+- Git Updates - Download and verify newer PwrDrvr Git runtimes from Settings, then explicitly choose which version to use or roll back to the previous selection. Show download and verification progress, with cancellation. The bundled macOS and Linux runtime is updated to 2.56.0-dev-pwrgit.4.
+
 ## v1.3.12 - 2026-11-04
 
 - Quiet Restart - Add "Quiet & Continue After Restart" when quitting with running threads. Stop their turns and continue them a few at a time after the next launch, holding other queued messages and automatic work until those continuations start. A restart notice shows progress and offers "Start everything now."

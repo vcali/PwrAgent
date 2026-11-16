@@ -9,7 +9,7 @@ import type {
 } from "@pwragent/shared";
 import { formatFederationPeerDisplayLabel } from "@pwragent/shared";
 import { getMainLogger } from "../log";
-import type { RemoteThreadTargetStore } from "../state/remote-thread-target-store";
+import type { RemoteThreadTargetStore } from "../storage/remote-thread-target-store";
 import type { FederationBackendOperations } from "./federation-backend-bridge";
 import { hasFederationErrorCode } from "./federation-rpc";
 import { lookupFederationArchivedThreads } from "./federation-collection-client";
@@ -41,6 +41,7 @@ export type ResolvedFederatedThreadTarget = {
     capabilities: FederationCapability[];
   };
   thread: AppServerThreadSummary;
+  archived: boolean;
 };
 
 export class FederatedThreadTargetError extends Error {
@@ -191,6 +192,7 @@ async function resolveThreadOnPeer(
     }
     throw new Error("Upgrade this PwrAgent peer and its gateways: bounded exact thread resolution is required.");
   }
+  let archived = false;
   if (!thread) {
     checkDeadline();
     thread = (await lookupFederationArchivedThreads(
@@ -199,8 +201,9 @@ async function resolveThreadOnPeer(
       [request.threadId],
       rpcOptions,
     )).find((candidate) => candidate.id === request.threadId);
+    archived = thread !== undefined;
   }
-  return thread ? { backend, peer, thread } : undefined;
+  return thread ? { backend, peer, thread, archived } : undefined;
 }
 
 async function readRememberedTargets(

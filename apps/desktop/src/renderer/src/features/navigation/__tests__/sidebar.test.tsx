@@ -23,6 +23,7 @@ import {
   type NavigationThreadSummary,
   type ProjectForgeAutomation,
   type ProjectHeldWakeup,
+  type PrSummary,
   type ThreadPullRequestWatchSummary,
 } from "@pwragent/shared";
 import type { FederationThreadTarget } from "../../chrome/federation-thread-targets";
@@ -34,6 +35,7 @@ import type {
 import { HOVER_TRANSITION_GRACE_MS } from "../../../lib/useHoverTransitionGrace";
 import { threadSummaryIdentityKey } from "../../../lib/federated-thread-events";
 import { ThreadDependencyIndicatorsContext } from "../../thread-dependencies/useThreadDependencyIndicators";
+import { ThreadMaintenanceLauncherContext } from "../../maintenance/thread-maintenance-launcher";
 import {
   summarizeThreadPrWatches,
   ThreadPrWatchIndicatorsContext,
@@ -1942,6 +1944,61 @@ describe("Sidebar", () => {
       threadId: "thread-native-worker-child",
       title: "link-checker",
     });
+
+    delete (window as Window & { pwragent?: unknown }).pwragent;
+  });
+
+  it("lists Claude's own sub-agents in the same disclosure, without a transcript to open", () => {
+    const openSubAgentTranscriptWindow = vi.fn(async () => ({ opened: true }));
+    Object.defineProperty(window, "pwragent", {
+      configurable: true,
+      value: { openSubAgentTranscriptWindow },
+    });
+    const parentThread: NavigationThreadSummary = {
+      ...sharedThread,
+      source: "claude",
+      id: "thread-claude-parent",
+      title: "Audit the router",
+      codexNativeSubAgents: [
+        {
+          threadId: "claude-native:agent-1",
+          title: "Cluster: rules & matching",
+          agentNickname: "general-purpose",
+          threadStatus: "active",
+        },
+        {
+          threadId: "claude-native:agent-2",
+          title: "Cluster: browser launch",
+          agentNickname: "general-purpose",
+          threadStatus: "idle",
+        },
+      ],
+    };
+    const { container } = render(
+      <Sidebar
+        backends={backends}
+        browseMode="inbox"
+        directories={directories}
+        inboxThreads={[parentThread]}
+        loading={false}
+        selectedItemKey="claude:thread-claude-parent"
+        threads={[parentThread]}
+        onBrowseModeChange={() => undefined}
+        onCreateThread={async () => undefined}
+        onOpenLaunchpad={async () => undefined}
+        onSelectThread={() => undefined}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand 2 Claude sub-agents for Audit the router" }));
+
+    const workerList = screen.getByRole("list", { name: "Claude sub-agents for Audit the router" });
+    expect(within(workerList).getAllByRole("listitem")).toHaveLength(2);
+    expect(container.querySelectorAll(".native-subagents__agent")).toHaveLength(2);
+    expect(screen.getByText("1 working")).toBeInTheDocument();
+    // A Claude sub-agent is a task in the parent's session, not a thread.
+    expect(screen.queryByRole("button", { name: /^Open transcript for/ })).not.toBeInTheDocument();
+    expect(openSubAgentTranscriptWindow).not.toHaveBeenCalled();
 
     delete (window as Window & { pwragent?: unknown }).pwragent;
   });
@@ -5519,6 +5576,49 @@ describe("Sidebar", () => {
     expect(onArchiveDirectories).toHaveBeenCalledWith(projects.map((project) => project.key));
   });
 
+  it("offers Clean Up Project for one local project and opens maintenance scoped to its path", () => {
+    const openThreadMaintenance = vi.fn();
+    const projects = [0, 1].map((index) => ({ ...directories[0]!,
+      key: `directory:/project-${index}`, label: `Project ${index}`, path: `/project-${index}`, threadKeys: [],
+    }));
+    const placeholder = { ...projects[1]!, key: "directory:/placeholder", label: "Placeholder", path: "/placeholder",
+      localAvailability: "unconfigured" as const };
+    const sidebar = (launcher?: typeof openThreadMaintenance) => (
+      <ThreadMaintenanceLauncherContext.Provider value={launcher}>
+        <Sidebar backends={backends} browseMode="directories" directories={[...projects, placeholder]}
+          inboxThreads={[]} threads={[]} loading={false} onArchiveDirectories={async () => undefined}
+          onBrowseModeChange={() => undefined} onCreateThread={async () => undefined}
+          onOpenLaunchpad={async () => undefined}
+          onSelectThread={() => undefined} />
+      </ThreadMaintenanceLauncherContext.Provider>
+    );
+    const { rerender } = render(sidebar(openThreadMaintenance));
+
+    fireEvent.contextMenu(screen.getByRole("button", { name: /^Placeholder, not configured on this instance/ }));
+    expect(screen.queryByRole("menuitem", { name: "Clean Up Project…" })).toBeNull();
+    pressEscape();
+
+    const first = screen.getByRole("button", { name: "Project 0" });
+    const last = screen.getByRole("button", { name: "Project 1" });
+    fireEvent.click(first, { metaKey: true });
+    fireEvent.click(last, { shiftKey: true });
+    fireEvent.contextMenu(last);
+    expect(screen.getByRole("menuitem", { name: "Archive Threads and Remove Projects" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Clean Up Project…" })).toBeNull();
+    pressEscape();
+    fireEvent.click(first);
+
+    fireEvent.contextMenu(first);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Clean Up Project…" }));
+    expect(openThreadMaintenance).toHaveBeenCalledWith({ projectKey: "/project-0" });
+    expect(screen.queryByRole("menu")).toBeNull();
+
+    rerender(sidebar(undefined));
+    fireEvent.contextMenu(first);
+    expect(screen.getByRole("menuitem", { name: "Archive Threads and Remove Project" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Clean Up Project…" })).toBeNull();
+  });
+
   it("marks unread threads read across a Shift-selected range of collapsed directories", async () => {
     const onMarkThreadsSeen = vi.fn(async () => undefined);
     const onSetDirectoryPin = vi.fn(async () => undefined);
@@ -6007,6 +6107,53 @@ describe("Sidebar", () => {
       `codex:${pinnedBottom.id}`,
       `codex:${pinnedTop.id}`,
     ], { key: `codex:${pinnedTop.id}`, direction: "down" });
+  });
+
+  it("toggles Keep Checkout Awake in place for a PwrAgent worktree, and only there", async () => {
+    const onSetThreadCheckoutHibernation = vi.fn(async () => undefined);
+    const owned = {
+      ...sharedThread,
+      id: "thread-owned",
+      title: "Rebuild checkout flow",
+      keepCheckoutAwake: true,
+      linkedDirectories: [{
+        ...sharedThread.linkedDirectories[0]!,
+        worktreePath: "/Users/fixture-user/.pwragent/worktrees/k3m9q2/PwrAgent",
+      }],
+    };
+    const codexOwned = { ...sharedThread, id: "thread-codex", title: "Codex worktree" };
+    render(
+      <Sidebar
+        backends={backends}
+        browseMode="inbox"
+        directories={directories}
+        inboxThreads={[owned, codexOwned]}
+        loading={false}
+        creatingThread={undefined}
+        threads={[owned, codexOwned]}
+        onBrowseModeChange={() => undefined}
+        onCreateThread={async () => undefined}
+        onOpenLaunchpad={async () => undefined}
+        onSelectThread={() => undefined}
+        onSetThreadCheckoutHibernation={onSetThreadCheckoutHibernation}
+      />,
+    );
+    const row = (title: RegExp) => screen.getByRole("button", { name: title }).closest(".thread-row-shell") as HTMLElement;
+    fireEvent.click(row(/Rebuild checkout flow/).querySelector(".thread-row__overflow-button") as HTMLButtonElement);
+    const awake = await screen.findByRole("menuitemcheckbox", { name: "Keep Checkout Awake" });
+    expect(awake).toHaveAttribute("aria-checked", "true");
+    await clickElement(awake);
+    expect(onSetThreadCheckoutHibernation).toHaveBeenLastCalledWith(
+      expect.objectContaining({ id: "thread-owned" }), { keepAwake: false },
+    );
+    // A checkable item: the menu stays open after the toggle.
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    pressEscape();
+
+    // Codex's own worktrees never hibernate, so they offer no such item.
+    fireEvent.click(row(/Codex worktree/).querySelector(".thread-row__overflow-button") as HTMLButtonElement);
+    await screen.findByRole("menu");
+    expect(screen.queryByRole("menuitemcheckbox", { name: "Keep Checkout Awake" })).toBeNull();
   });
 
   it("keeps a pin at top from the context menu and moves only within its tier", async () => {
@@ -7682,7 +7829,7 @@ describe("Sidebar", () => {
     const onContinueAfter = vi.fn();
     render(
       <ThreadDependencyIndicatorsContext.Provider value={{
-        byThreadKey: new Map([[threadSummaryIdentityKey(sharedThread), { count: 2, label: "2 waiting", alert: false, tooltip: "" }]]),
+        byThreadKey: new Map([[threadSummaryIdentityKey(sharedThread), { count: 2, label: "2 waiting", alert: false, tooltip: "", mergeHeld: false }]]),
       }}>
         <Sidebar
           backends={backends}
@@ -7717,7 +7864,7 @@ describe("Sidebar", () => {
     expect(screen.queryByRole("menu")).not.toBeInTheDocument();
   });
 
-  it("omits Continue After without a dialog to open or for a peer's thread", () => {
+  it("omits Continue After without a dialog to open, and offers it for a peer's thread", () => {
     const peerThread: NavigationThreadSummary = {
       ...sharedThread,
       id: "thread-peer",
@@ -7772,7 +7919,8 @@ describe("Sidebar", () => {
     );
     fireEvent.contextMenu(screen.getByRole("button", { name: "Peer thread" }));
     expect(screen.getByRole("menu")).toBeInTheDocument();
-    expect(screen.queryByRole("menuitem", { name: /Continue After/ })).toBeNull();
+    // The owner keeps the wait; this window asks it.
+    expect(screen.getByRole("menuitem", { name: "Continue After…" })).toBeInTheDocument();
   });
 
   it("flips the thread actions menu above the overflow button near the viewport bottom", () => {
@@ -11145,6 +11293,77 @@ describe("Sidebar menus from the keyboard", () => {
     pressEscape();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(chip).toHaveFocus();
+  });
+
+  function renderRowMenu(
+    thread: NavigationThreadSummary,
+    onDetachPullRequest: (thread: NavigationThreadSummary, pr: PrSummary) => Promise<void>,
+  ) {
+    try {
+      window.localStorage.removeItem("pwragent.detachPrWarning.dismissed");
+    } catch {
+      // The warning shows when storage is unavailable too.
+    }
+    render(
+      <Sidebar
+        backends={backends}
+        browseMode="recents"
+        directories={directories}
+        inboxThreads={[thread]}
+        loading={false}
+        creatingThread={undefined}
+        selectedItemKey="codex:thread-1"
+        threads={[thread]}
+        onBrowseModeChange={() => undefined}
+        onCreateThread={async () => undefined}
+        onDetachPullRequest={onDetachPullRequest}
+        onOpenLaunchpad={async () => undefined}
+        onSelectThread={() => undefined}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Open thread actions" }));
+  }
+
+  it("offers the row menu's Detach Pull Request for a thread with one PR", () => {
+    const detach = vi.fn(async () => undefined);
+    renderRowMenu(pullRequestThread, detach);
+    act(() => screen.getByRole("menuitem", { name: "Detach Pull Request #202" }).click());
+    expect(screen.getByRole("dialog", { name: "Detach pull request?" })).toBeInTheDocument();
+    act(() => screen.getByRole("button", { name: "Detach PR" }).click());
+    expect(detach).toHaveBeenCalledWith(pullRequestThread, pullRequestThread.prs![0]);
+  });
+
+  it("detaches every PR from the row menu after one confirmation, one at a time", async () => {
+    const prs = [202, 203, 204].map((number) => ({
+      ...pullRequestThread.prs![0]!,
+      number,
+      url: `https://github.com/ExampleOrg/ExampleApp/pull/${number}`,
+    }));
+    const thread = { ...pullRequestThread, prs };
+    // Each detach rewrites the thread's PR list on its owner, so the next
+    // must not start until the last has finished.
+    const pending: Array<() => void> = [];
+    const detach = vi.fn(() => new Promise<void>((resolve) => pending.push(resolve)));
+    renderRowMenu(thread, detach);
+    expect(screen.queryByRole("menuitem", { name: /^Detach Pull Request #/ })).toBeNull();
+    act(() => screen.getByRole("menuitem", { name: "Detach All Pull Requests" }).click());
+
+    const dialog = screen.getByRole("dialog", { name: "Detach 3 pull requests?" });
+    expect(within(dialog).getAllByRole("listitem").map((item) => item.textContent)).toEqual([
+      "ExampleOrg/ExampleApp#202",
+      "ExampleOrg/ExampleApp#203",
+      "ExampleOrg/ExampleApp#204",
+    ]);
+    act(() => within(dialog).getByRole("button", { name: "Detach 3 PRs" }).click());
+
+    for (const [index, pr] of prs.entries()) {
+      expect(detach).toHaveBeenCalledTimes(index + 1);
+      expect(detach).toHaveBeenLastCalledWith(thread, pr);
+      await act(async () => {
+        pending.shift()!();
+      });
+    }
+    expect(detach).toHaveBeenCalledTimes(3);
   });
 });
 

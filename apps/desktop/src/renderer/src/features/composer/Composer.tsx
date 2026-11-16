@@ -1,6 +1,7 @@
 import { CODEX_SPEED_LABELS, codexSpeedOptions, codexSpeedSettings, selectedCodexSpeed, type CodexSpeed } from "@pwragent/shared";
 import { codexProviderIdOfModel, type BackendModelOption } from "@pwragent/shared";
 import { ModelDropdown } from "./ModelDropdown";
+import { ThreadHandoffComposerBand } from "../federation/ThreadHandoffProgress";
 import { mayContainLinearPastedImages } from "@pwragent/shared";
 import { NativeVoiceBar, isNativeVoiceApi, threadVoiceTarget } from "../native-voice/NativeVoice";
 import { ReviewLocationDropdown } from "./ReviewLocationDropdown";
@@ -118,7 +119,9 @@ import type {
   NavigationThreadSummary,
   PrSummary,
   RenderComposerPdfPreviewResponse,
+  ReviewAfterAction,
   ReviewRunMode,
+  ScheduledThreadAction,
   SteerTurnDelivery,
   ThreadWorkspaceHandoffStrategy,
   ThreadExecutionMode,
@@ -173,7 +176,9 @@ import type { DesktopApi } from "../../lib/desktop-api";
 import { LaunchpadStartupCancelledError } from "../../lib/launchpad-creation-client";
 import { BACKEND_SUMMARIES_REFRESH_EVENT } from "../../lib/useBackendSummaries";
 import { resolveReviewRunMode } from "../../lib/review-run-mode";
+import { ReviewAutoFixSwitch } from "./ReviewAutoFixSwitch";
 import { readRendererFederationTarget } from "../../lib/federation-window";
+import { isScheduledThreadAction } from "../../lib/useScheduledThreadActionProjection";
 import { useMenuNavigation } from "../../lib/useMenuNavigation";
 import {
   agentEventMatchesThread,
@@ -283,6 +288,10 @@ import {
   parseForkCommand,
   type ComposerForkCommand,
 } from "./composer-fork-command";
+import {
+  backendDrawsCommandChips,
+  describeLeadingCommand,
+} from "./composer-command-chip";
 import type { ThreadWorkspaceMode } from "../../lib/subthread-launchpads";
 import { ComposerTiptapInput } from "./ComposerTiptapInput";
 import { ProjectDestinationCombobox } from "./ProjectDestinationCombobox";
@@ -528,6 +537,8 @@ export type ComposerProps = {
   readThreadWorktreeAvailability?: (thread: NavigationThreadSummary) => Promise<boolean>;
   pastedImageMaxPatches?: number;
   pdfAnalysisEnabled?: boolean;
+  /** Settings -> General -> Reviews: whether a new review panel opens with Auto-fix on. */
+  reviewAutoFixDefault?: boolean;
   /** Token Miser experiment availability gate. */
   tokenMiserEnabled?: boolean;
   /** Inherited Token Miser state when a thread has no explicit override. */
@@ -829,6 +840,7 @@ type QueuedTurnDraft = {
     cwd?: string;
     displayText: string;
     runMode?: ReviewRunMode;
+    afterReview?: ReviewAfterAction;
     target: AppServerReviewTarget;
   };
   text: string;
@@ -882,6 +894,7 @@ type ModelOption = NonNullable<
 
 type SlashCommandSuggestion = {
   aliases?: string[];
+  argumentHint?: string;
   description: string;
   id: string;
   insertText: string;
@@ -925,6 +938,12 @@ type ReviewConfigState = {
   reviewer?: ModelSettingsRecent;
   runMode: ReviewRunMode;
   runModeChosen?: boolean;
+  /**
+   * The operator's Auto-fix findings choice for this review. Unset follows
+   * Settings -> General -> Reviews. Like a reviewer override, a choice lasts
+   * for this one review.
+   */
+  waitAfterReview?: boolean;
   target?: ReviewTargetChoice;
   workspaceCwd?: string;
 };
@@ -1054,6 +1073,7 @@ function providerCommandToSlashSuggestion(
     insertText: `/${commandName}`,
     description: command.description ?? "Provider command",
     aliases: command.aliases,
+    ...(command.argumentHint ? { argumentHint: command.argumentHint } : {}),
     source: "provider",
     sourceLabel,
   };
@@ -1357,6 +1377,7 @@ function createReviewConfig(params: {
   thread?: NavigationThreadSummary;
   reviewCommand?: {
     cwd?: string;
+    afterReview?: ReviewAfterAction;
     target: AppServerReviewTarget;
   };
 }): ReviewConfigState {
@@ -1368,6 +1389,10 @@ function createReviewConfig(params: {
     commit: "",
     customInstructions: "",
     runMode: "codex-sub-agent",
+    // A review rebuilt from its command keeps the choice it was queued with.
+    ...(params.reviewCommand?.afterReview
+      ? { waitAfterReview: params.reviewCommand.afterReview === "wait" }
+      : {}),
     target: "baseBranch",
     workspaceCwd: params.reviewCommand?.cwd ?? (
       preferredWorkspaceCwd ??
@@ -3174,11 +3199,16 @@ export const Composer = memo(function Composer(props: ComposerProps) {
   const savedInitialPendingSteer = props.thread
     ? draftStore.getPendingSteer(composerScopeKey)
     : undefined;
+  // A starting launchpad carries the submitted message as startup context.
+  // None of it is an unsent draft. In particular, mounting Tiptap with its
+  // old document and an empty value publishes that document back as an edit
+  // before the launchpad hydration effect can clear it.
+  const initialLaunchpad = props.launchpadMaterializing ? undefined : props.launchpad;
   const hydratedInitialLaunchpad =
-    savedInitialDraft || !props.launchpad
+    savedInitialDraft || !initialLaunchpad
       ? undefined
       : hydrateComposerDraft(
-          props.launchpadMaterializing ? "" : props.launchpad.prompt ?? "",
+          initialLaunchpad.prompt ?? "",
           props.skills,
           threadLinks,
           pullRequestLinks,
@@ -3218,14 +3248,14 @@ export const Composer = memo(function Composer(props: ComposerProps) {
       draft: savedInitialDraft?.draft ?? hydratedInitialLaunchpad?.draft ?? "",
       editorDocument:
         savedInitialDraft?.editorDocument ??
-        (props.launchpad?.editorDocument as JSONContent | undefined),
+        (initialLaunchpad?.editorDocument as JSONContent | undefined),
       imageAttachments:
         savedInitialDraft?.imageAttachments ??
-        props.launchpad?.imageAttachments ??
+        initialLaunchpad?.imageAttachments ??
         [],
       fileAttachments:
         savedInitialDraft?.fileAttachments ??
-        props.launchpad?.fileAttachments ??
+        initialLaunchpad?.fileAttachments ??
         [],
       skillTokens:
         savedInitialDraft?.skillTokens ?? hydratedInitialLaunchpad?.skillTokens ?? [],
@@ -6809,6 +6839,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
     cwd?: string;
     displayText: string;
     runMode?: ReviewRunMode;
+    afterReview?: ReviewAfterAction;
     target: AppServerReviewTarget;
     reviewer?: ModelSettingsRecent;
   }, options?: {
@@ -6956,6 +6987,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
         target: reviewCommand.target,
         delivery: "inline",
         ...(reviewCommand.runMode ? { runMode: reviewCommand.runMode } : {}),
+        ...(reviewCommand.afterReview ? { afterReview: reviewCommand.afterReview } : {}),
         ...(reviewCommand.cwd ? { cwd: reviewCommand.cwd } : {}),
         ...(submittedReviewer
           ? {
@@ -7322,6 +7354,10 @@ export const Composer = memo(function Composer(props: ComposerProps) {
     await submitReviewConfig(reviewConfig);
   };
 
+  // The review's own choice, else Settings -> General -> Reviews.
+  const reviewWaitsAfter = (config: ReviewConfigState | undefined): boolean =>
+    config?.waitAfterReview ?? props.reviewAutoFixDefault === false;
+
   const submitReviewConfig = async (
     config: ReviewConfigState | undefined,
   ): Promise<void> => {
@@ -7356,6 +7392,11 @@ export const Composer = memo(function Composer(props: ComposerProps) {
       ...configuredReviewCommand,
       runMode: runModeDecision.explicitRunModeSupported
         ? runModeDecision.runMode : undefined,
+      // An owner that predates auto-fix gets no field, so it is never told a
+      // choice it would ignore.
+      ...(reviewAutoFixSupported
+        ? { afterReview: reviewWaitsAfter(config) ? "wait" as const : "auto-fix" as const }
+        : {}),
     };
     if (futureScheduledDraftSendAt) {
       if (props.launchpad && !props.launchpadMaterializing && !sendingRef.current) {
@@ -7817,6 +7858,13 @@ export const Composer = memo(function Composer(props: ComposerProps) {
       // purpose is to not lose work silently.
       props.onUserRepliedToThread?.(props.thread);
       if (response.queueStatus === "queued") {
+        if (optimisticMessageId) {
+          props.removeOptimisticMessage?.(optimisticMessageId);
+          setActiveOptimisticMessageId(undefined);
+        }
+        if (!backendQueueSubmission && submittedScopeIsVisible()) {
+          props.onPendingStatusChange?.(undefined);
+        }
         const queueEntryId = response.queueEntryId ?? response.turnId;
         if (backendQueueSubmission) {
           updateQueuedTurnInScope(
@@ -8229,6 +8277,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
       cwd?: string;
       displayText: string;
       runMode?: ReviewRunMode;
+      afterReview?: ReviewAfterAction;
       target: AppServerReviewTarget;
       reviewer?: ModelSettingsRecent;
     },
@@ -8285,6 +8334,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
           draftText: text,
           delivery: "inline",
           ...(reviewCommand.runMode ? { runMode: reviewCommand.runMode } : {}),
+          ...(reviewCommand.afterReview ? { afterReview: reviewCommand.afterReview } : {}),
           cwd: reviewCommand.cwd,
           // Carry the picked reviewer through the queue so releasing it later
           // does not silently fall back to the thread's own provider.
@@ -8573,6 +8623,19 @@ export const Composer = memo(function Composer(props: ComposerProps) {
     props.onPendingStatusChange?.(
       pending.delivery === "now" ? "Interrupting" : "Steering",
     );
+    // The owner can start a fallback before its admission response arrives.
+    // Keep observations only for this in-flight request, so a stale receipt
+    // cannot restore a queue chip already removed by the owner's projection.
+    const observedFallbackActions = new Map<string, ScheduledThreadAction>();
+    const stopObserving = props.desktopApi.onAgentEvent?.((event) => {
+      if (event.notification.method !== "thread/scheduledAction/updated") return;
+      const action = event.notification.params.action;
+      if (!isScheduledThreadAction(action)) return;
+      if (!agentEventMatchesThread(event, props.thread!, action.threadId)) return;
+      const previous = observedFallbackActions.get(action.id);
+      if (previous?.status === "started" || (previous && previous.updatedAt > action.updatedAt)) return;
+      observedFallbackActions.set(action.id, action);
+    });
     try {
       const responsePromise = props.desktopApi.steerTurn({
         backend: props.thread.source,
@@ -8636,29 +8699,53 @@ export const Composer = memo(function Composer(props: ComposerProps) {
         setSendError(undefined);
         props.onPendingStatusChange?.("Queued");
       }
-      if (response.disposition === "scheduled" && response.scheduledAction) {
-        const action = response.scheduledAction;
+      if (
+        (response.disposition === "scheduled" || response.disposition === "started")
+        && response.scheduledAction
+      ) {
+        const receipt = response.scheduledAction;
+        const observed = observedFallbackActions.get(receipt.id);
+        const action = receipt.status === "started"
+          ? receipt
+          : observed && (observed.status === "started" || observed.updatedAt >= receipt.updatedAt)
+            ? observed
+            : receipt;
         const failureMessage = scheduledActionFailureMessage(action);
         if (failureMessage) throw new Error(failureMessage);
-        upsertScheduledProjectionInScope(expectedScopeKey, {
-          id: `scheduled-projection:${action.id}`,
-          scheduledActionId: action.id,
-          input: payload.input,
-          text: pending.text,
-          imageAttachments: pending.imageAttachments,
-          fileAttachments: pending.fileAttachments,
-          ...(action.status === "scheduled"
-            ? { scheduledSendAt: action.scheduledFor }
-            : {}),
-          ...(action.status === "dispatching"
-            ? { backendQueuePending: true }
-            : {}),
-          ...(action.status === "queued" && action.queueEntryId
-            ? { queueEntryId: action.queueEntryId }
-            : {}),
-        });
+        if (action.status === "started") {
+          const projected = draftStore.getQueuedTurns(expectedScopeKey).find((queued) =>
+            queued.scheduledActionId === action.id
+            || (action.queueEntryId && queued.queueEntryId === action.queueEntryId));
+          if (projected) removeQueuedTurnInScope(expectedScopeKey, projected);
+        } else {
+          upsertScheduledProjectionInScope(expectedScopeKey, {
+            id: `scheduled-projection:${action.id}`,
+            scheduledActionId: action.id,
+            input: payload.input,
+            text: pending.text,
+            imageAttachments: pending.imageAttachments,
+            fileAttachments: pending.fileAttachments,
+            ...(action.status === "scheduled"
+              ? { scheduledSendAt: action.scheduledFor }
+              : {}),
+            ...(action.status === "dispatching"
+              ? { backendQueuePending: true }
+              : {}),
+            ...(action.status === "queued" && action.queueEntryId
+              ? { queueEntryId: action.queueEntryId }
+              : {}),
+          });
+        }
+        if (steeringRequestIdRef.current === pending.id) steeringRequestIdRef.current = undefined;
         setPendingSteer(undefined);
         setSendError(undefined);
+        if (action.status !== "started" && response.fallbackReason === "native-review") {
+          showComposerNotice({
+            title: "Message queued",
+            message: "Steering is unavailable during this type of Codex review. Your message was queued instead.",
+            tone: "neutral",
+          });
+        }
       }
       if (response.disposition === "held") {
         const projection = {
@@ -8774,6 +8861,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
       }
       props.onPendingStatusChange?.("Thinking");
     } finally {
+      stopObserving?.();
       setSteering(false);
     }
   };
@@ -10440,6 +10528,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
           }
 
           const normalized = await normalizeImageFile(file, {
+            preserveOriginalIfLarger: filesystemFederationTarget?.scope === "remote",
             fallback: props.desktopApi?.normalizeImageForUpload,
             maxPatchCount: props.pastedImageMaxPatches,
             sourceMimeType: type,
@@ -11124,6 +11213,9 @@ export const Composer = memo(function Composer(props: ComposerProps) {
   const reviewOwnerSummary = props.backends?.find(
     (candidate) => candidate.kind === props.thread?.source,
   );
+  const reviewAutoFixSupported =
+    reviewOwnerSummary?.capabilities.reviewAutoFix === true;
+  const reviewAutoFixChecked = !reviewWaitsAfter(reviewConfig);
   const reviewRunModeDecision = props.thread
     ? resolveReviewRunMode({
         ownerSummary: reviewOwnerSummary,
@@ -11358,6 +11450,22 @@ export const Composer = memo(function Composer(props: ComposerProps) {
   const forkInlineCompletion = forkInlineHint
     ? forkCommandCompletion(draft)
     : undefined;
+  // Claude and ACP agents read a command from the start of the prompt, so a
+  // draft that starts with one of their commands draws it as a chip and, until
+  // an argument is typed, the arguments it takes.
+  const commandBackend = props.launchpad?.backend ?? props.thread?.source;
+  const { chip: commandChip, hint: commandInlineHint } = describeLeadingCommand({
+    commands: props.providerCommands?.filter((command) =>
+      backendDrawsCommandChips(command.backend ?? commandBackend)
+    ) ?? [],
+    draft,
+    showHint:
+      autocompleteKind !== "slash"
+      && !forkInlineHint
+      && !forking
+      && !preparingSend,
+    skillTokens,
+  });
   // Queue is the primary mid-turn; the steer chord is its keyboard-only
   // sibling, so the button is where it gets named.
   const submitButtonSteerHint =
@@ -12768,7 +12876,12 @@ export const Composer = memo(function Composer(props: ComposerProps) {
           push the input or its toolbar off the window. See
           `composer-band-bounds.test.ts`. */}
       <div className="composer__band">
-      {/* Topmost in the band: ambient agent work the operator did not just
+      {/* A send to another machine holds this thread; say so above all else,
+          since the input below cannot start a turn until it finishes. */}
+      <ThreadHandoffComposerBand
+        threadKey={props.thread ? threadSummaryIdentityKey(props.thread) : undefined}
+      />
+      {/* Topmost in the band after that: ambient agent work the operator did not just
           launch. Env action rows sit below it, nearer the input, because they
           carry the Stop the operator is most likely to reach for. */}
       <ActiveSubAgentsStrip
@@ -12951,6 +13064,8 @@ export const Composer = memo(function Composer(props: ComposerProps) {
 
       {queuedTurns.map((queued, index) => {
         const queuedScopeKey = composerScopeKey;
+        // The send waits for a hibernated checkout's restore, then starts.
+        const waitingForCheckout = props.thread?.workspaceHibernated?.restoring === true;
         const backendOwned = Boolean(
           queued.backendQueuePending
           || queued.queueEntryId
@@ -12976,6 +13091,8 @@ export const Composer = memo(function Composer(props: ComposerProps) {
           ? "Failed to send"
           : scheduledSendAt
           ? `Scheduled · sends in ${formatScheduledSendCountdown(scheduledSendAt, scheduleNow)}`
+          : waitingForCheckout
+          ? "Waiting for checkout"
           : undefined;
         const failed = Boolean(queued.errorMessage || queued.manualReleaseRequired);
         const movable = queuedReorder.canMove(queued.id);
@@ -12989,6 +13106,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
               scheduledSendAt ? "composer__queued--scheduled" : "",
               failed ? "composer__queued--failed" : "",
               queued.paused ? "composer__queued--paused" : "",
+              queuedLabel === "Waiting for checkout" ? "composer__queued--waiting-checkout" : "",
               // Rows waiting on an answer keep their actions on screen.
               failed || scheduledSendAt || queued.paused
                 ? "composer__queued--pinned-actions"
@@ -13083,7 +13201,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
                   disabled={
                     props.disabled
                     || sending
-                    || Boolean(activeTurnId)
+                    || (Boolean(activeTurnId) && Boolean(queued.scheduledActionId))
                     || (!queued.queueEntryId && !queued.scheduledActionId)
                   }
                   type="button"
@@ -13875,6 +13993,20 @@ export const Composer = memo(function Composer(props: ComposerProps) {
             ) : null}
 
             <div className="composer__review-actions">
+              {reviewAutoFixSupported ? (
+                <ReviewAutoFixSwitch
+                  checked={reviewAutoFixChecked}
+                  onToggle={() => {
+                    setReviewConfig((current) => {
+                      const base = current ?? createReviewConfig({
+                        directory: props.directory,
+                        thread: props.thread,
+                      });
+                      return { ...base, waitAfterReview: !reviewWaitsAfter(base) };
+                    });
+                  }}
+                />
+              ) : null}
               <button
                 type="button"
                 className="composer__secondary-action"
@@ -13902,6 +14034,14 @@ export const Composer = memo(function Composer(props: ComposerProps) {
                   : "Start review"}
               </button>
             </div>
+            {reviewAutoFixSupported
+              && reviewAutoFixChecked
+              && reviewerSelection.backend
+              && reviewerSelection.backend !== props.thread?.source ? (
+                <p className="composer__review-note">
+                  The fix runs on this thread&apos;s agent, not the reviewer.
+                </p>
+              ) : null}
           </fieldset>
         ) : (
           <ComposerTiptapInput
@@ -13914,8 +14054,9 @@ export const Composer = memo(function Composer(props: ComposerProps) {
             disabled={composerDisabled}
             readOnly={preparingSend || forking}
             label={isLaunchpad ? "New thread" : "Reply"}
-            inlineHint={forkInlineHint}
+            inlineHint={forkInlineHint ?? commandInlineHint}
             inlineCompletion={forkInlineCompletion}
+            commandChip={commandChip}
             markdownConversion
             placeholder={composerPlaceholder}
             resolveThreadLink={(ref) => {
@@ -14042,6 +14183,11 @@ export const Composer = memo(function Composer(props: ComposerProps) {
                     label={command.label}
                     query={slashTrigger ? `/${slashTrigger.query}` : "/"}
                   />
+                  {command.argumentHint ? (
+                    <span className="composer__autocomplete-argument-hint">
+                      {command.argumentHint}
+                    </span>
+                  ) : null}
                   <span
                     className={`composer__autocomplete-source composer__autocomplete-source--${command.source}`}
                   >

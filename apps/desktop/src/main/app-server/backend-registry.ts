@@ -1,19 +1,38 @@
+import { ThreadCreationLifecycle, type PreparedThreadCreation, type ThreadCreationPreparation } from "@pwragent/owner-core/thread-creation-lifecycle";
+import { buildTurnStartEvent, buildTurnStartFailureEvent, ThreadTurnStartLifecycle } from "@pwragent/owner-core/thread-turn-start-lifecycle";
+import { ThreadInterruptionLifecycle } from "@pwragent/owner-core/thread-interruption-lifecycle";
+import { ThreadSteeringLifecycle, type ThreadSteeringSubmission } from "@pwragent/owner-core/thread-steering-lifecycle";
+import { ThreadSteerSubmissionLifecycle, type PreparedAcpSteer, type PreparedCodexSteer } from "@pwragent/owner-core/thread-steer-submission-lifecycle";
+import { ThreadTitleLifecycle, extractFirstMeaningfulTextInput } from "@pwragent/owner-core/thread-title-lifecycle";
+import { ThreadNamingLifecycle, isPromptPlaceholderTitle, isInjectedContextPlaceholderTitle, type ThreadRenameOptions } from "@pwragent/owner-core/thread-naming-lifecycle";
+import { projectOwnerThreadTitle, projectOverlayThreadTitle } from "@pwragent/owner-core/thread-title-projection";
+import { ProfileThreadOwnerAdmission, type ThreadOwnerAdmission } from "@pwragent/owner-core/thread-owner-admission";
+import { getRuntimeLeaseManager } from "../runtime-lease-manager";
+import type { OwnerThreadRegistry } from "@pwragent/owner-core/thread-storage";
 import { buildPwrAgentToolGuideDefinition } from "../agent-tools/pwragent-tool-guide";
+import { NavigationDirectoryScope } from "@pwragent/owner-core/navigation-directory-scope";
 import { buildPwrAgentTaskMonitorToolDefinitions } from "../agent-tools/pwragent-task-monitor-agent-tools";
 import { delegatedTurnAttribution, withoutTurnAttribution } from "./delegated-turn-attribution";
 import { LaunchpadCreationOperations, type LaunchpadCreationOperation } from "./launchpad-creation-operations";
 import { SELF_STARTED_TURN_ENTRY_PREFIX } from "./thread-pending-wakes";
 import type { LaunchpadCreationRequest, LaunchpadCreationResponse, ThreadTodoMessageTarget } from "@pwragent/shared";
 import { ClaudeBackend, ClaudeTurnActiveError, type ClaudeBackendOptions } from "../claude/claude-backend";
+import type { ClaudeSubAgentCard } from "../claude/claude-tasks";
 import { inspectClaudeInstallation } from "../claude/claude-executable";
+import { openClaudeSessionReader } from "../claude/claude-session-reader";
+import { claudePlanTurnRefusal } from "../claude/claude-permissions";
 import type { ClaudeSelfStartedTurnSource } from "../claude/claude-self-started-turns";
 import type { ForgeReadHandler } from "../agent-tools/pwragent-forge-agent-tools";
-import { buildForgeToolDefinitions, type ForgePrToolHandler, type ForgePrToolPreflight } from "../agent-tools/pwragent-forge-pr-agent-tools";
+import { buildForgeToolDefinitions, type ForgePrToolHandler, type ForgePrToolPreflight, type ForgePrToolPreflightResult } from "../agent-tools/pwragent-forge-pr-agent-tools";
 import { ForgeReadError, repositoryKey, validateForgeReadArgs, type ForgeReadRequest, type ForgeRepository } from "../pr-status/forge-tool-contract";
 import { forgePrToolGroup, type ForgePrToolArgs, type ForgePrToolOperation, type ForgeReviewComment } from "../pr-status/forge-pr-tool-contract";
 import { sweepThreadArchiveRetention, archivedThreadFamily, archiveRetentionFamilyEligible } from "./thread-archive-retention";
 import { runGitCommand } from "./git-executable";
 import { ArchiveWorktreeReferences, canonicalWorktreePaths } from "./archive-worktree-references";
+import type { MaintenanceDiscoveryProgress } from "./unreferenced-worktrees";
+import { resolveOwnedMaintenanceCheckouts } from "./thread-owned-checkouts";
+import { mapMaintenanceAudit } from "./maintenance-audit-pool";
+import { ArchiveFleetIndex, type FleetChange, type FleetRow } from "./archive-cleanup-fleet-index";
 import { ArchiveWorkspaceAdmission, ArchiveWorkspaceOwnership, archiveCleanupWorkspaceFilter, type ArchiveWorkspaceMutation, type ArchiveWorkspaceObservation } from "./archive-cleanup-workspace-scope";
 import { PlanLimitStore, planLimitKey } from "./plan-limit-store";
 import { NOT_A_GIT_REPOSITORY, probeCurrentGitBranch } from "./git-head-branch";
@@ -29,24 +48,33 @@ import {
   DEFAULT_FORGE_AGENT_TOOL_POLICY,
   PWRAGENT_TOOL_NAMESPACE,
   TASK_MONITOR_TOOL_NAMESPACE,
+  DEFAULT_CHECKOUT_HIBERNATION_POLICY,
   DEFAULT_THREAD_ARCHIVE_POLICY,
   FORGE_AGENT_TOOL_GROUP_LABELS,
   isTokenMiserSubAgent,
   totalTokenMiserGateAccountings,
-  RENAME_THREAD_EXPECTED_NAME_MISMATCH,
   classifyDirectory,
   finalTurnOutputText,
   readUuidV7Timestamp,
+  type DesktopCheckoutHibernationPolicy,
   type DesktopThreadArchivePolicy,
   type DesktopThreadArchiveSweepStatus,
   type ForgeAgentToolAccess,
   type ForgeAgentToolGroup,
   type ForgeAgentToolPolicy,
-  type McpConnectionToolApproval,
+  type McpConnectionStatus,
+  type McpConnectionToolApprovalResolution,
+  type McpProjectToolApprovalOffer,
+  buildMcpProjectToolApprovalOffer,
+  MCP_PROJECT_TOOL_APPROVAL_CHOICE_META_KEY,
+  MCP_PROJECT_TOOL_APPROVAL_OFFER_META_KEY,
+  readMcpProjectToolApprovalChoice,
+  resolveMcpConnectionToolApproval,
 } from "@pwragent/shared";
 import {
   buildForgeApprovalRememberOptions,
   FORGE_AGENT_RULE_APPROVAL_SOURCE,
+  FORGE_APPROVAL_MERGE_METHODS_META_KEY,
   FORGE_APPROVAL_REMEMBER_OPTIONS_META_KEY,
   forgeAgentRuleAgentKey,
   forgeAgentToolRuleDescription,
@@ -57,6 +85,7 @@ import {
   forgeRuleRepositoryLabel,
   isForgeApprovalRememberGroup,
   normalizeForgeRuleRepository,
+  readForgeApprovalMergeMethodChoice,
   readForgeApprovalRememberChoice,
   resolveForgeAgentToolAccess,
   type ForgeAgentIdentity,
@@ -64,7 +93,9 @@ import {
   type ForgeAgentRuleNames,
   type ForgeAgentToolRuleApprovalNote,
   type ForgeAgentToolRuleGroup,
+  type ForgeApprovalMergeMethods,
   type ForgeApprovalRememberOptionId,
+  type ThreadTodoMergeMethod,
 } from "@pwragent/shared";
 import type {
   ListBackgroundTerminalsRequest,
@@ -75,9 +106,9 @@ import type {
 } from "@pwragent/shared";
 import { ArchiveCleanupReadPool } from "./archive-cleanup-read-pool";
 import { ArchiveCleanupQueue, ArchiveCleanupCancelledError, ARCHIVE_CLEANUP_SLICE_SIZE, ARCHIVE_CLEANUP_QUEUE_LIMIT, type ArchiveCleanupContext } from "./archive-cleanup-queue";
-import { ArchiveCleanupCheckpointStore, type ArchiveCleanupIntent } from "../state/archive-cleanup-checkpoint";
-import { ProjectHeldWakeupStore, type StoredProjectHeldWakeup } from "../state/project-held-wakeup-store";
-import { RestartContinuationStore, type StoredRestartContinuation } from "../state/restart-continuation-store";
+import type { ArchiveCleanupCheckpointStorage, ArchiveCleanupIntent } from "../storage/desktop-runtime-storage";
+import type { ProjectHeldWakeupStorage, StoredProjectHeldWakeup } from "../storage/desktop-runtime-storage";
+import type { RestartContinuationStorage, StoredRestartContinuation } from "../storage/desktop-runtime-storage";
 import type { RestartGateStatus } from "../../shared/restart-gate";
 import {
   OPEN_RESTART_GATE,
@@ -184,6 +215,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual, promisify } from "node:util";
+import type { RetainedOwnerThreadStorage } from "@pwragent/owner-core/retained-owner-thread-storage";
 import type {
   DynamicToolSpec as CodexDynamicToolSpec,
   ThreadForkParams as CodexThreadForkParams,
@@ -209,16 +241,28 @@ import {
   resolveActiveProfilePath,
 } from "../profile";
 import {
-  getAppStateDb,
+  createAcpAvailableCommandsStorage,
+  createArchiveCleanupCheckpointStorage,
+  createCodexEnvironmentHydrationStorage,
+  createProjectHeldWakeupStorage,
+  createProviderThreadSnapshotStorage,
+  createRetainedOwnerThreadStorage,
+  createRestartContinuationStorage,
+  createThreadDependencyStorage,
+  createThreadSearchStorage,
+  createTokenMiserStorage,
+} from "../storage/desktop-runtime-storage";
+import {
   getAppStateMode,
   isAppStateInitialized,
-} from "../state/app-state";
-import { runOneTimeArchivedWorktreeRepair } from "../state/archived-worktree-repair";
+} from "../storage/desktop-runtime-storage";
+import { runOneTimeArchivedWorktreeRepair } from "../storage/desktop-runtime-storage";
 import type {
+  ArchivedThreadAutomationRetirement,
   OverlayStoreLike,
-  SqliteOverlayStore,
+  DesktopOwnerStorage,
   WorktreeGitWorkingStateCacheEntry,
-} from "../state/overlay-store-sqlite";
+} from "../storage/desktop-overlay-store";
 import { requestShowThread } from "../window-show-thread";
 import { materializeTranscriptImageEventForRenderer, toTranscriptImageProtocolUrl } from "../transcript-image-protocol";
 import { PerKeyAsyncLock } from "../util/per-key-async-lock";
@@ -263,6 +307,9 @@ import {
   resolveMcpConnectionSetup,
   estimateTokenUsageCost,
   formatTokenUsageUsd,
+  CLAUDE_NATIVE_SUBAGENT_MONITOR_ID_PREFIX,
+  type AppServerBackgroundTask,
+  isClaudeNativeSubAgent,
   isCodexNativeSubAgentVisibleInNavigation,
   isToolManagedWorktreePath,
   normalizeRenamedTitleSource,
@@ -307,7 +354,6 @@ import {
   type AppServerRenamedTitleSource,
   type AppServerThreadStatus,
   type AppServerThreadSummary,
-  type AppServerThreadTitleSource,
   type CodexNativeSubAgentSummary,
   CODEX_NATIVE_SUBAGENT_PANEL_RETENTION_MS,
   type AppServerTurnInputItem,
@@ -487,6 +533,12 @@ import {
   type PwrAgentThreadInspectionErrorCode,
   type PwrAgentThreadInspectionRequest,
   type PwrAgentThreadInspectionResponse,
+  type ThreadMaintenanceApplyRequest,
+  type ThreadMaintenanceCoverage,
+  type ThreadMaintenanceKeptThread,
+  type ThreadMaintenanceRules,
+  type ThreadMaintenanceRun,
+  type ThreadMaintenanceScan,
   type ThreadReadEntrySummary,
   type ThreadReadMessageSummary,
   type ThreadMutationAppliedChange,
@@ -536,6 +588,9 @@ import {
   type ThreadPricingSummary,
   type ThreadUsageLineRecord,
   type PrSummary,
+  type ThreadPullRequestWatchSummary,
+  type SetThreadCheckoutHibernationResponse,
+  type ThreadHibernatedWorkspace,
   type WorktreeSnapshotSummary,
   type UpdateDirectoryLaunchpadRequest,
   type UpdateDirectoryLaunchpadResponse,
@@ -625,7 +680,7 @@ import {
   type CodexPwrdrvrTokenMiserActivation,
   type CodexServerCapabilities,
   type HelperThreadToolCallHandler,
-} from "../codex-app-server/client";
+} from "../codex-app-server/desktop-client";
 import {
   DEFAULT_CODEX_APP_SERVER_RECYCLE_SETTINGS,
   codexAppServerRecycleCheckIntervalMs,
@@ -644,7 +699,6 @@ import { subAgentActivityToolCall } from "../codex-app-server/subagent-activity"
 import { ProviderTranscriptThreadSearchAdapter } from "../thread-search/thread-search-provider-adapters";
 import { OwnerContentSearch } from "../thread-search/owner-content-search";
 import { ThreadSearchService } from "../thread-search/thread-search-service";
-import { ThreadSearchStore } from "../thread-search/thread-search-store";
 import {
   handleAutomationInspectionDynamicToolCall,
   isAutomationInspectionDynamicToolCall,
@@ -694,6 +748,7 @@ import type { PwrAgentStarMapHandler } from "../agent-tools/pwragent-star-map-ag
 import {
   type PwrAgentThreadTodoHandler,
 } from "../agent-tools/pwragent-thread-todo-agent-tools";
+import { ThreadTodoError } from "../thread-todos/thread-todo-service";
 import type { MessagingAgentToolService } from "../messaging/messaging-agent-tool-service";
 import { resolveAutomationInspectionMcpCommand } from "../automations/automation-inspection-cli";
 import { automationMcpToolAllowed, buildAutomationMcpPolicy, type AutomationMcpServer } from "../automations/automation-mcp-policy";
@@ -741,7 +796,7 @@ import {
 } from "../token-miser/token-miser-types";
 import { TokenMiserDiagnostics, type TokenMiserDiagnosticContext } from "../token-miser/token-miser-diagnostics";
 import { TokenMiserService, type TokenMiserServiceOptions } from "../token-miser/token-miser-service";
-import { TokenMiserStore } from "../token-miser/token-miser-store";
+import type { TokenMiserStore } from "../token-miser/token-miser-store";
 import {
   estimateTokenCount,
   type TokenMiserObjectMetadata,
@@ -755,7 +810,7 @@ import {
 } from "../agent-tools/agent-tool-mcp-server";
 import { createScratchProjectDirectory } from "./scratch-projects";
 import { CodexProtocolCaptureSession } from "../diagnostics/codex-protocol-capture";
-import { getDesktopOverlayStore } from "./desktop-overlay-store";
+import { getDesktopOverlayStore } from "../storage/desktop-overlay-store";
 import { createProtocolCaptureFromEnv } from "../testing/protocol-capture";
 import type { ProtocolCaptureStore } from "../testing/capture-store";
 import { createReplayClientsFromEnv } from "../testing/replay-runtime";
@@ -780,9 +835,8 @@ import {
   type ThreadInfoIdentity,
 } from "./thread-info-store";
 import {
-  ProviderThreadSnapshotStore,
-  type ProviderThreadSnapshotStoreLike,
-} from "./provider-thread-snapshot-store";
+  type ProviderThreadSnapshotStorage,
+} from "@pwragent/owner-core/provider-thread-snapshot-storage";
 import type { GitReadRequest } from "../git-info/read-cache";
 import {
   resolveWorktreeRepositoryDirectory,
@@ -793,16 +847,29 @@ import {
   BACKGROUND_WORKTREE_WORKING_STATE_BATCH_SIZE,
   selectStaleWorktreeWorkingStatePaths,
 } from "./thread-working-state-refresh-policy";
-import {
-  AcpAvailableCommandsStore,
-  type AcpAvailableCommandsStoreLike,
-} from "../acp/acp-available-commands-store";
+import type { AcpAvailableCommandsStorage } from "@pwragent/owner-core/acp-storage";
 import { GitWorkspaceHandoffService } from "./git-workspace-handoff-service";
-import { MissingArchiveWorktreeError, WorktreeArchiveService } from "./worktree-archive-service";
+import { MissingArchiveRepositoryError, MissingArchiveWorktreeError, SnapshotTreeMismatchError, WorktreeArchiveService } from "./worktree-archive-service";
 import { WorktreeRecoveryService } from "./worktree-recovery-service";
-import { detectMissingThreadWorkspace } from "./missing-thread-workspace";
+import { isInManagedWorktreeRoot } from "./managed-worktree-ownership";
+import { hasWorktreeRegistration, inspectRegisterableWorktree, sameRegisteredWorktree } from "./worktree-maintenance-registration";
+import { protectiveMaintenanceWatches, type MaintenancePrObservation } from "./maintenance-pr-watches";
+import { userHomeWorktreesRoot } from "../settings/desktop-config";
+import { describeHibernatedThreadWorkspace, detectMissingThreadWorkspace, primaryThreadWorktree } from "./missing-thread-workspace";
+import {
+  HIBERNATION_KEEP_REASONS,
+  hibernationKeepReason,
+  checkoutHibernationLastActivity,
+  hibernationTarget,
+  isArchivedCheckoutCandidate,
+  otherThreadsUsingPath,
+  type HibernationContext,
+} from "./checkout-hibernation";
+import { HIBERNATION_WORKSPACE_KEEP_REASONS, inspectHibernationWorkspace } from "./checkout-hibernation-workspace";
+import { hasWorktreeTerminalsOpenIn } from "../terminal/worktree-terminals";
 import { WorktreeContainerService, type WorktreeContainerCleanup } from "./worktree-container-service";
-import { ARCHIVE_ACTIVE_SUB_AGENT_STATUSES, ThreadArchiveSweeper, archiveCandidateLastActivity, isStaleArchiveCandidate, type ThreadArchiveCandidate } from "./thread-archive-sweeper";
+import { ARCHIVE_ACTIVE_SUB_AGENT_STATUSES, ThreadArchiveSweeper, type ThreadArchiveCandidate } from "./thread-archive-sweeper";
+import { maintenanceKeptThread } from "./maintenance-checkout-owners";
 import { getDesktopMessagingStore } from "../messaging/desktop-messaging-store";
 import { compareBindingsByCreation } from "../messaging/core/messaging-binding-thread-match";
 import { toMessagingThreadBindingSummary } from "../messaging/messaging-bindings-snapshot";
@@ -835,6 +902,13 @@ import { buildMinimalGrokHelperSessionPolicy } from "../acp/minimal-helper-sessi
 import { ensureAcpHelperWorkspace } from "../acp/acp-capability-probe";
 import { acpRuntimeSupportsSessionLoad } from "../acp/acp-runtime-capabilities";
 import { getMainLogger } from "../log";
+import {
+  planThreadMaintenanceApply,
+  summarizeThreadMaintenanceRun,
+  summarizeThreadMaintenanceScan,
+  threadMaintenanceConfirmationQuestion,
+} from "../agent-tools/thread-maintenance-tool-results";
+import { THREAD_MAINTENANCE_TOOL_WAIT_MS, ThreadMaintenanceToolScans } from "../agent-tools/thread-maintenance-tool-scans";
 import {
   getDesktopConfigStore,
   getDesktopSettingsService,
@@ -890,9 +964,9 @@ import {
   type CodexEnvironmentSelection,
 } from "./codex-environment-runtime";
 import {
-  CodexEnvironmentHydrationStore,
+  type CodexEnvironmentHydrationStore,
   type CodexEnvironmentHydrationStoreLike,
-} from "./codex-environment-hydration-store";
+} from "../storage/codex-environment-hydration-store";
 import {
   ThreadTurnQueue,
   type ThreadTurnQueueEntry,
@@ -900,7 +974,7 @@ import {
   type ThreadTurnQueueOrigin,
   type ThreadTurnQueueImmediateSubmissionResult,
   type ThreadTurnQueueSubmissionResult,
-} from "./thread-turn-queue";
+} from "@pwragent/owner-core/thread-turn-queue";
 import {
   getProjectForgeAutomationIndex,
   summarizeProjectHeldWakeup,
@@ -921,7 +995,7 @@ import {
   ownThreadInputAttachments,
   stageTurnInputAttachmentsForRetention,
 } from "./turn-input-attachment-files";
-import type { MessagingStoreLike } from "../state/messaging-store-sqlite";
+import type { MessagingStoreLike } from "../storage/desktop-runtime-storage";
 import {
   PdfAttachmentStore,
   type PendingPdfAttachment,
@@ -933,6 +1007,7 @@ import {
   preparePdfTurnInput,
   type PdfTurnInputHandling,
 } from "../pdf/pdf-turn-input-preparation";
+import { getReviewAutoFixArming } from "../thread-reviews/review-auto-fix";
 
 type InitializeResult = {
   serverInfo?: {
@@ -1032,6 +1107,13 @@ const ACP_LISTINGS_ARE_ENRICHED = true;
 const backendRegistryLog = getMainLogger("pwragent:backend-registry");
 const backendLifecycleLog = getMainLogger("pwragent:backend-lifecycle");
 class AutomaticArchiveCancelledError extends Error {}
+
+/** A hibernation check failed again just before removal. */
+class CheckoutHibernationKeptError extends Error {
+  constructor(readonly reason: string) {
+    super(reason);
+  }
+}
 
 /**
  * A paused project refused an agent's message from another thread. The
@@ -1137,6 +1219,8 @@ type BackendClient = {
     diagnostics?: { callerReason?: string; ownerId?: string },
   ): Promise<AppServerThreadSummary[]>;
   listArchiveCleanupThreadsPage?: CodexAppServerClient["listArchiveCleanupThreadsPage"];
+  /** The listing above honors `sortKey: "updated_at"`. */
+  archiveCleanupRecencyReads?: boolean;
   readArchiveCleanupThreadSummary?: CodexAppServerClient["readArchiveCleanupThreadSummary"];
   enrichArchiveCleanupThreads?: CodexAppServerClient["enrichArchiveCleanupThreads"];
   listNativeSubAgentThreads?(
@@ -2353,8 +2437,8 @@ type WorktreeArchiveCandidate = {
   worktreePath: string;
 };
 
-type ProjectHeldWakeupStoreLike = Pick<ProjectHeldWakeupStore, "save" | "update" | "remove" | "claimOrphaned">;
-type RestartContinuationStoreLike = Pick<RestartContinuationStore, "saveAll" | "remove" | "claimOrphaned">;
+type ProjectHeldWakeupStoreLike = ProjectHeldWakeupStorage;
+type RestartContinuationStoreLike = RestartContinuationStorage;
 
 /** A running turn a quiet restart stops and continues after the restart. */
 export type QuietRestartTarget = {
@@ -2442,6 +2526,11 @@ const RESTART_DISPATCH_FALLBACK_MS = 120_000;
 
 const THREAD_TURN_QUEUE_ORIGINS: readonly string[] = ["manual", "automation", "messaging", "scheduled"] satisfies ThreadTurnQueueOrigin[];
 
+/** Rows per page, and pages, of admission's incremental provider read. More
+ * changes than this cost about as much as one complete read, so read that. */
+const ARCHIVE_FLEET_DELTA_PAGE_SIZE = 5;
+const ARCHIVE_FLEET_DELTA_PAGES = 20;
+
 type ArchiveCleanupMetadata = {
   workspaceRevision?: number;
   activeThreads: AppServerThreadSummary[];
@@ -2455,6 +2544,9 @@ type ArchiveCleanupMetadata = {
     activeByPath: Map<string, AppServerThreadSummary[]>;
     archivedByPath: Map<string, AppServerThreadSummary[]>;
   };
+  /** The paths of each listed thread that can relate to the listed scopes.
+   * Absent for a thread: every one of its paths. */
+  ownershipPaths?: WeakMap<AppServerThreadSummary, readonly string[]>;
 };
 
 type ArchiveCleanupDiscoveryRequest = {
@@ -2463,12 +2555,14 @@ type ArchiveCleanupDiscoveryRequest = {
   context?: ArchiveCleanupContext;
   targetThread?: AppServerThreadSummary;
   codexRolloutMissing?: boolean;
-  reuseInventory?: boolean;
   /** Complete membership/overlays before candidate discovery; no Git probes. */
   identityOnly?: boolean;
   /** Fresh global membership/overlays, with Git probes limited to this scope. */
   ownershipScope?: string;
   removalAdmission?: ArchiveWorkspaceAdmission;
+  /** Collects each identity row before overlay merging, for the fleet index. */
+  fleetRows?: Array<{ backend: AppServerBackendKind; base: AppServerThreadSummary; overlay?: ThreadOverlayState; archived: boolean }>;
+  onDiscoveryProgress?: (progress: MaintenanceDiscoveryProgress) => void;
 };
 
 type ArchiveWorktreeRemovalAdmission = {
@@ -2478,10 +2572,6 @@ type ArchiveWorktreeRemovalAdmission = {
   containerPath?: string;
   scope: ArchiveWorkspaceAdmission;
 };
-
-type ArchiveCleanupInventory = Pick<ArchiveCleanupMetadata,
-  "activeThreads" | "archivedThreads" | "overlaysByThreadKey" | "worktreeEvidence" | "workspaceRevision"
->;
 
 function archiveWorkspacePaths(thread: Pick<AppServerThreadSummary, "projectKey" | "linkedDirectories">): string[] {
   return [thread.projectKey, ...thread.linkedDirectories.flatMap((directory) => [linkedDirectoryWorktreePath(directory), directory.path])]
@@ -2510,7 +2600,40 @@ export type ArchivedWorktreeRepairReport = {
   cleanup: ArchiveThreadCleanupResult[];
   emptyContainerCandidates: Array<{ backend: AppServerBackendKind; threadId: string; worktreePath: string; containerIdentity: NonNullable<WorktreeContainerCleanup["identity"]> }>;
   containerCleanup: WorktreeContainerCleanup[];
+  /** Read-only audits only: PwrAgent worktrees no thread refers to. */
+  unreferencedWorktrees?: string[];
+  unreferencedTruncated?: boolean;
+  /** Why unreferenced checkouts could not be listed this time. */
+  unreferencedUnavailable?: string;
+  inventory?: { roots: string[]; paths: string[]; repositories?: string[]; providers: NonNullable<ThreadMaintenanceCoverage["providers"]>;
+    keptPaths?: { path: string; reason: string }[];
+    owners?: { path: string; threads: ThreadMaintenanceKeptThread[]; candidates: ThreadArchiveCandidate[] }[] };
 };
+
+/** Checkouts left in place by a repair pass, counted by a short reason. A
+ * checkout that was already gone is not counted: nothing was kept. */
+function archivedWorktreeKeptReasons(report: ArchivedWorktreeRepairReport): Record<string, number> {
+  const kept: Record<string, number> = {};
+  const add = (reason: string) => { kept[reason] = (kept[reason] ?? 0) + 1; };
+  for (const detail of report.protectedWorktreeDetails) {
+    add(detail.externallyManaged ? "Externally managed" : "Used by an active thread");
+  }
+  for (const item of report.cleanup) {
+    if (item.removedWorktree || item.error || !item.skippedReason) continue;
+    if (item.skippedReason === MISSING_WORKTREE_SKIP_REASON) continue;
+    if (item.skippedReason === MISSING_REPOSITORY_SKIP_REASON) add("Repository no longer exists");
+    else if (item.skippedReason.includes("still used by")) add("Used by an active thread");
+    else if (item.skippedReason.startsWith("Externally managed")) add("Externally managed");
+    else add(item.skippedReason.split(":")[0]!.replace(/\.$/, ""));
+  }
+  return kept;
+}
+
+/** How long a reviewed approval to snapshot past the limit stays usable. */
+const REVIEWED_SNAPSHOT_LIMIT_TTL_MS = 30 * 60_000;
+
+const MISSING_WORKTREE_SKIP_REASON = "Worktree directory no longer exists.";
+const MISSING_REPOSITORY_SKIP_REASON = "Its repository no longer exists; the checkout was kept.";
 
 type WorktreeRestoreCandidate = {
   branch?: string;
@@ -2885,6 +3008,7 @@ function buildCapabilities(
     startTurn: supported.has("turn/start") || assumeCodexAppServerSurface,
     startReview: reviewCodexSubAgent || reviewRunner,
     reviewRunMode: true,
+    reviewAutoFix: true,
     reviewCodexSubAgent,
     reviewRunner,
     interruptTurn: supported.has("turn/interrupt"),
@@ -4194,6 +4318,18 @@ function codexNativeSubAgentOutcome(
     return "cancelled";
   }
   return undefined;
+}
+
+/** The thread list's tray row for a stored native sub-agent card. */
+function nativeSubAgentRowFromCard(card: ThreadSubAgentSummary, threadId: string): CodexNativeSubAgentSummary {
+  return {
+    threadId,
+    title: card.task,
+    createdAt: card.createdAt,
+    updatedAt: card.updatedAt,
+    threadStatus: codexNativeSubAgentIsTerminal(card.status) ? "idle" : "active",
+    ...(card.agentName ? { agentNickname: card.agentName } : {}),
+  };
 }
 
 function codexNativeSubAgentIsTerminal(status: ThreadSubAgentSummary["status"]): boolean {
@@ -6847,6 +6983,7 @@ type McpGatewayConversationConsent = {
 };
 
 type ThreadListCacheState = {
+  archived: boolean;
   expiresAt?: number;
   promise?: Promise<AppServerThreadSummary[]>;
   threads?: AppServerThreadSummary[];
@@ -7196,7 +7333,7 @@ function createDefaultCodexEnvironmentHydrationStore():
   | CodexEnvironmentHydrationStore
   | undefined {
   try {
-    return new CodexEnvironmentHydrationStore(getAppStateDb());
+    return createCodexEnvironmentHydrationStorage();
   } catch {
     return undefined;
   }
@@ -7764,22 +7901,6 @@ function resolveThreadMessageOrigin(params: {
   return undefined;
 }
 
-function extractFirstMeaningfulTextInput(input: AppServerTurnInputItem[]): string | undefined {
-  const text = input
-    .filter((item): item is Extract<AppServerTurnInputItem, { type: "text" }> => item.type === "text")
-    .map((item) => item.text.trim())
-    .filter(Boolean)
-    .join("\n");
-  return text || undefined;
-}
-
-function buildTitleGenerationKey(
-  backend: AppServerBackendKind,
-  threadId: string,
-): string {
-  return buildThreadIdentityKey(backend, threadId);
-}
-
 function titleHelperSubAgentId(
   backend: AppServerBackendKind,
   threadId: string,
@@ -7893,72 +8014,6 @@ function titleHelperSubAgentMessage(params: {
     : "Title generation failed.";
 }
 
-function buildPromptHash(prompt: string): string {
-  return prompt.replace(/\s+/g, " ").trim().toLowerCase();
-}
-
-function isEligibleForGeneratedTitle(
-  thread: AppServerThreadSummary | undefined,
-  prompt: string,
-  options?: { systemPlaceholder?: boolean },
-): boolean {
-  if (!thread) {
-    return true;
-  }
-  if (isPromptPlaceholderTitle(thread.title, prompt)) {
-    return true;
-  }
-  if (thread.titleSource === "explicit") {
-    return Boolean(
-      options?.systemPlaceholder
-      && isGenericPlaceholderTitle(thread.title),
-    );
-  }
-  if (isInjectedContextPlaceholderTitle(thread.title)) {
-    return true;
-  }
-  if (thread.titleSource === "fallback") {
-    return (
-      !isAcpBackendId(thread.source) ||
-      isAcpFallbackPlaceholderTitle(thread.title)
-    );
-  }
-  const derivedTitle = shortenDerivedThreadTitle(prompt) ?? prompt;
-  return normalizeTitleForComparison(thread.title) === normalizeTitleForComparison(derivedTitle);
-}
-
-function normalizeTitleForComparison(value: string): string {
-  return value.replace(/\s+/g, " ").trim().toLowerCase();
-}
-
-function isPromptPlaceholderTitle(title: string, prompt: string): boolean {
-  const normalizedTitle = normalizeTitleForComparison(title);
-  const normalizedPrompt = normalizeTitleForComparison(prompt);
-  const derivedTitle = shortenDerivedThreadTitle(prompt) ?? prompt;
-  return (
-    normalizedTitle === normalizedPrompt ||
-    normalizedTitle === normalizeTitleForComparison(derivedTitle)
-  );
-}
-
-function isInjectedContextPlaceholderTitle(title: string): boolean {
-  const normalizedTitle = normalizeTitleForComparison(title);
-  return (
-    normalizedTitle.startsWith("# agents.md instructions") ||
-    normalizedTitle.startsWith("agents.md instructions for")
-  );
-}
-
-function isAcpFallbackPlaceholderTitle(title: string): boolean {
-  const normalizedTitle = normalizeTitleForComparison(title);
-  return normalizedTitle === "acp session";
-}
-
-function isGenericPlaceholderTitle(title: string): boolean {
-  const normalizedTitle = normalizeTitleForComparison(title);
-  return normalizedTitle === "untitled thread";
-}
-
 function truncateLogValue(value: string | undefined): string | null {
   const normalized = value?.replace(/\s+/g, " ").trim();
   if (!normalized) {
@@ -7980,19 +8035,6 @@ function buildTitleEligibilityLogDetails(
       ? isInjectedContextPlaceholderTitle(thread.title)
       : null,
   };
-}
-
-function buildLateTitleCancellationReason(
-  backend: AppServerBackendKind,
-  thread: AppServerThreadSummary,
-): string {
-  if (thread.titleSource === "explicit") {
-    return `The thread was explicitly renamed first: ${thread.title}.`;
-  }
-  if (isAcpBackendId(backend)) {
-    return `ACP provided a durable title first: ${thread.title}.`;
-  }
-  return `A newer thread title was already present: ${thread.title}.`;
 }
 
 function createReplayThreadTitleService(): ThreadTitleService | undefined {
@@ -8494,6 +8536,22 @@ function buildCodexPdfMcpDisabledConfig(): CodexThreadStartParams["config"] {
  * and answers the agent tool's read operations. Tests supply a stub for
  * exactly this shape.
  */
+/** A project grant a tool approval card offers, and what accepting it writes. */
+type McpProjectToolApprovalCardOffer = {
+  connectionId: string;
+  repository: string;
+  offer: McpProjectToolApprovalOffer;
+};
+
+function withoutMcpProjectToolApprovalOffer(
+  request: AppServerPendingRequestNotification,
+): AppServerPendingRequestNotification {
+  const meta = request.params._meta;
+  if (!meta || typeof meta !== "object" || !(MCP_PROJECT_TOOL_APPROVAL_OFFER_META_KEY in meta)) return request;
+  const { [MCP_PROJECT_TOOL_APPROVAL_OFFER_META_KEY]: _offer, ...rest } = meta as Record<string, unknown>;
+  return { ...request, params: { ...request.params, _meta: rest } } as AppServerPendingRequestNotification;
+}
+
 export type BackendRegistryMcpConnectionService =
   Pick<McpConnectionGatewayService, "registerBridge">
   // Everything past bridge registration is optional so a test can stub the
@@ -8507,6 +8565,7 @@ export type BackendRegistryMcpConnectionService =
       | "threadHandoverAt"
       | "peekThreadBridge"
       | "listConnections"
+      | "setConnectionProjectToolApproval"
       | "createConnection"
       | "probeConnection"
       | "requestGatewayToolOperation"
@@ -8828,6 +8887,10 @@ function threadOrchestrationFailure(
   };
 }
 
+function archivedThreadMessageRefusal(thread: Pick<AppServerThreadSummary, "id" | "title">): string {
+  return `Thread "${thread.title}" (${thread.id}) is archived; cannot send a message. Restore it with mutate_thread (archive=false) before sending.`;
+}
+
 /** See `DesktopBackendRegistry.readThreadHandoffSettings`. */
 export type HandoffSourceSettings = {
   executionMode: ThreadExecutionMode;
@@ -8852,6 +8915,20 @@ export type AgentThreadActions = {
     request: SetThreadParentRequest,
   ) => Promise<SetThreadParentResponse>;
 };
+
+/** The app-level Thread maintenance service, injected so the registry never
+ * imports the runtime that constructs it. */
+export type ThreadMaintenanceToolHandler = {
+  /** Runs a scan the service retains under `scanId`. */
+  scan: (request: { rules?: Partial<ThreadMaintenanceRules>; projectKey?: string; scanId: string }) => Promise<ThreadMaintenanceScan>;
+  getScan: (scanId: string) => ThreadMaintenanceScan | undefined;
+  getRun: () => ThreadMaintenanceRun | undefined;
+  start: (request: ThreadMaintenanceApplyRequest) => { run: ThreadMaintenanceRun; done: Promise<ThreadMaintenanceRun> };
+  open: (request: { projectKey?: string }) => boolean;
+};
+
+const THREAD_MAINTENANCE_CONFIRM_QUESTION_ID = "thread_maintenance";
+const THREAD_MAINTENANCE_CONFIRM_APPROVE_LABEL = "Run maintenance";
 
 function threadInspectionFailure(
   code: PwrAgentThreadInspectionErrorCode,
@@ -9012,6 +9089,7 @@ type StartingTurnOrigin = {
 type PendingThreadMessageContext = {
   backend: AppServerBackendKind;
   createdAt: number;
+  admittedCodexTurnSequence?: number;
   id: string;
   messageId?: string;
   imageParts?: AppServerThreadImagePart[];
@@ -9061,11 +9139,6 @@ function contentHasRenderableImage(content: unknown[]): boolean {
     );
   });
 }
-
-type AcceptedSteerRequest = {
-  promise: Promise<SteerTurnResponse>;
-  signature: string;
-};
 
 type AcceptedThreadControlRequest = {
   promise: Promise<PwrAgentThreadOrchestrationResponse>;
@@ -9148,37 +9221,6 @@ function toForwardSlashes(value: string): string {
   return value.replace(/\\/g, "/");
 }
 
-function buildSteerRequestKey(params: SteerTurnRequest): string {
-  return [
-    params.backend,
-    params.threadId,
-    params.expectedTurnId,
-    params.requestId,
-  ].join("\u0000");
-}
-
-function buildSteerTurnKeyPrefix(params: {
-  backend: AppServerBackendKind;
-  threadId: string;
-  turnId: string;
-}): string {
-  return [params.backend, params.threadId, params.turnId, ""].join("\u0000");
-}
-
-function buildSteerRequestSignature(
-  params: SteerTurnRequest,
-  messageOrigin?: AppServerThreadMessageOrigin,
-): string {
-  return createHash("sha256")
-    .update(JSON.stringify({
-      input: params.input,
-      messageOrigin: withoutTurnAttribution(messageOrigin) ?? null,
-      // An interrupt and a steer of the same text are different requests.
-      ...(params.delivery === "now" ? { delivery: "now" } : {}),
-    }))
-    .digest("hex");
-}
-
 type CodexRetryableTurnStart = {
   kind: "turn";
   params: {
@@ -9202,9 +9244,9 @@ type CodexRetryableTurnStart = {
   turnId?: string;
 };
 
-type BackendRegistryOverlayStoreLike = OverlayStoreLike & Partial<
+type BackendRegistryOverlayStoreLike = OverlayStoreLike & Partial<Pick<OwnerThreadRegistry, "getThreadMetadata" | "updateThreadMetadata">> & Partial<
   Pick<
-    SqliteOverlayStore,
+    DesktopOwnerStorage,
     | "acknowledgeThreadEnvironmentFailure"
     | "adoptLegacyRemoteDirectoryLaunchpad"
     | "readThreadGitWorkingStateCache"
@@ -9232,6 +9274,7 @@ type BackendRegistryOverlayStoreLike = OverlayStoreLike & Partial<
     | "writeThreadGitWorkingStateCacheEntry"
     | "getVoiceManagerThread"
     | "getArchiveCleanupOverlayStates"
+    | "readArchiveCleanupChangeToken"
   >
 >;
 
@@ -9300,19 +9343,19 @@ const RUNNING_TURN_SHUTDOWN_STOP_TIMEOUT_MS = 2_000;
  * each turn it stopped to end, whichever terminal path removes it.
  */
 class ActiveTurnKeySet extends Set<string> {
-  private readonly deleteListeners = new Set<() => void>();
+  private readonly deleteListeners = new Set<(key: string) => void>();
 
   override delete(key: string): boolean {
     const deleted = super.delete(key);
     if (deleted) {
       for (const listener of this.deleteListeners) {
-        listener();
+        listener(key);
       }
     }
     return deleted;
   }
 
-  onDelete(listener: () => void): () => void {
+  onDelete(listener: (key: string) => void): () => void {
     this.deleteListeners.add(listener);
     return () => {
       this.deleteListeners.delete(listener);
@@ -9455,12 +9498,6 @@ function readProviderRuntimeFingerprints(
   ) as Record<ProviderId, string>;
 }
 
-type ThreadRenameOptions = {
-  titleSource?: AppServerRenamedTitleSource;
-  renameOrigin?: "agent_tool";
-  previousThreadName?: string;
-};
-
 export class DesktopBackendRegistry {
   private readonly launchpadCreationOperations = new LaunchpadCreationOperations();
   private readonly codexClient: BackendClient;
@@ -9539,7 +9576,7 @@ export class DesktopBackendRegistry {
   // repo's last-observed list is cached here and replayed for them. See
   // `resolveAcpAvailableCommands` for the read path and
   // `rememberAcpAvailableCommands` for the write-through.
-  private readonly acpAvailableCommandsStore?: AcpAvailableCommandsStoreLike;
+  private readonly acpAvailableCommandsStore?: AcpAvailableCommandsStorage;
   private readonly acpAvailableCommandProbeBudgetMs: number;
   private readonly acpAvailableCommandProbes = new Map<
     string,
@@ -9592,10 +9629,49 @@ export class DesktopBackendRegistry {
   );
   private readonly archiveLifecycleMutationPaths = new Map<string, Set<readonly string[]>>();
   private readonly archiveCleanupReads = new ArchiveCleanupReadPool(THREAD_LIST_REUSE_WINDOW_MS);
-  private readonly archiveCleanupQueue = new ArchiveCleanupQueue<ArchiveThreadResponse>(undefined,
-    () => this.dispatchReleasedArchiveCleanups(this.archiveWorktreeReferences.readyIntents()));
+  private archiveCleanupProgressVisible = false;
+  private archiveCleanupProgressSignature?: string;
+  private readonly archiveCleanupQueue = new ArchiveCleanupQueue<ArchiveThreadResponse>(undefined, () => {
+    this.drainArchiveCleanupOverflow();
+    this.dispatchReleasedArchiveCleanups(this.archiveWorktreeReferences.readyIntents());
+    // A drained queue ends its batch; the next batch reads the fleet afresh.
+    if (!this.archiveCleanupQueue.pendingKeys().length && !this.archiveCleanupOverflow.size) this.archiveFleet = undefined;
+  }, () => {
+    if (this.closed) return;
+    // The physical queue also paces audits, hourly repair and recovery. Only
+    // newly requested archives belong in the archive action progress notice.
+    const progress = this.archiveCleanupQueue.progress(true);
+    const overflow = [...this.archiveCleanupOverflow.values()].filter((job) => !job.resuming).length;
+    const params = {
+      batchId: `${this.runtimeInstanceId}:${progress.batch}`,
+      active: progress.active.flatMap(({ key, worktreePath }) => {
+        const identity = parseThreadIdentityKey(key);
+        return identity ? [{ backend: identity.backend, threadId: identity.threadId, ...(worktreePath ? { worktreePath } : {}) }] : [];
+      }),
+      queued: progress.queued + overflow,
+      completed: progress.completed,
+      total: progress.total + overflow,
+    };
+    // Audits/recovery have no action progress. Still clear an earlier action
+    // if its terminal update was coalesced with the start of a silent batch.
+    if (params.total === 0 && !this.archiveCleanupProgressVisible) return;
+    const signature = JSON.stringify(params);
+    if (signature === this.archiveCleanupProgressSignature) return;
+    this.archiveCleanupProgressSignature = signature;
+    this.archiveCleanupProgressVisible = params.active.length > 0 || params.queued > 0;
+    void this.emit({ backend: "codex", notification: {
+      method: "archiveCleanup/progress", params,
+    } }).catch((error: unknown) => backendRegistryLog.warn("archive cleanup progress publication failed", { error: String(error) }));
+  });
+  /** Cleanups beyond the bounded physical queue, in arrival order. Each keeps
+   * its intent in `pendingArchiveCleanupIntents`, so quit checkpoints it. */
+  private readonly archiveCleanupOverflow = new Map<string, {
+    intent: ArchiveCleanupIntent; resuming: boolean;
+    resolve: (response: ArchiveThreadResponse) => void; reject: (error: unknown) => void;
+    promise: Promise<ArchiveThreadResponse>;
+  }>();
   private readonly archiveRepairOwners = new Map<string, string>();
-  private readonly archiveCleanupCheckpointStore?: Pick<ArchiveCleanupCheckpointStore, "save" | "recover">;
+  private readonly archiveCleanupCheckpointStore?: ArchiveCleanupCheckpointStorage;
   private readonly projectHeldWakeupStore?: ProjectHeldWakeupStoreLike;
   /** Project-held entries with a durable copy, by queue entry id, as stored. */
   private readonly durableProjectHeldWakeups = new Map<string, StoredProjectHeldWakeup>();
@@ -9614,17 +9690,27 @@ export class DesktopBackendRegistry {
   private readonly archiveReferenceNotificationWork = new WeakMap<AppServerNotification, Promise<void>>();
   private readonly releasedArchiveReferenceKeys = new Set<string>();
   private readonly archiveReferenceIdentities = new Map<string, { backend: AppServerBackendKind; threadId: string }>();
-  private readonly canonicalArchiveOwnership = new WeakMap<AppServerThreadSummary[], Promise<{ active: Map<string, AppServerThreadSummary[]>; unknown: AppServerThreadSummary[]; external: Set<string> }>>();
+  private readonly canonicalArchiveOwnership = new WeakMap<AppServerThreadSummary[], Promise<{
+    active: Map<string, AppServerThreadSummary[]>;
+    unknown: AppServerThreadSummary[];
+    external: Map<string, Set<AppServerThreadSummary>>;
+  }>>();
   private readonly pendingArchiveCleanupIntents = new Map<string, ArchiveCleanupIntent>();
   private archiveCleanupResumeStarted = false;
   private archivedWorktreeRepair?: Promise<ArchivedWorktreeRepairReport>;
-  private archiveCleanupInventories = new WeakMap<object, {
-    revision: number;
-    includesArchived: boolean;
-    identityOnly?: boolean;
-    inventory: ArchiveCleanupInventory;
-  }>();
+  /** Orders deferred ownership observations against reference releases. */
   private archiveWorkspaceRevision = 0;
+  /** Additions (reference rows plus queued intents) at the last checkpoint. */
+  private archiveCheckpointedAdditions = -1;
+  /** Counts cleanup intents queued, so a boundary persists new queued work. */
+  private archiveCleanupIntentAdditions = 0;
+  /** The fleet index of the current cleanup queue batch. Each batch reads the
+   * fleet once; writers and notifications keep it current within the batch. */
+  private archiveFleet?: { batch: object; index: ArchiveFleetIndex };
+  /** The identities each fleet admission found related to its scope. */
+  private readonly archiveFleetAdmissionKeys = new WeakMap<ArchiveWorkspaceAdmission, ReadonlySet<string>>();
+  /** Each fleet admission's related paths per identity; see `ownershipPaths`. */
+  private readonly archiveFleetAdmissionPaths = new WeakMap<ArchiveWorkspaceAdmission, ReadonlyMap<string, readonly string[]>>();
   private readonly threadArchiveOperations = new Map<string, Promise<ArchiveThreadResponse>>();
   private readonly archiveCleanupCompletions = new Map<string, { promise: Promise<ArchiveThreadResponse>; archivedAt: number }>();
   private readonly cancelledArchiveCleanupKeys = new Set<string>();
@@ -9652,6 +9738,7 @@ export class DesktopBackendRegistry {
   private readonly reviewStartFailureNotices = new Map<string, string>();
   private readonly codexProtocolCaptureSession?: CodexProtocolCaptureSession;
   private readonly captureStores: ProtocolCaptureStore[] = [];
+  readonly navigationDirectoryScope = new NavigationDirectoryScope();
   private readonly eventListeners = new Set<
     (event: AgentEvent) => void | Promise<void>
   >();
@@ -9665,18 +9752,6 @@ export class DesktopBackendRegistry {
     string,
     PendingRequestApprovalContext
   >();
-  private readonly pendingTitleGenerations = new Map<
-    string,
-    {
-      promptHash: string;
-      token: number;
-    }
-  >();
-  private readonly pendingTitleGenerationInputs = new Map<
-    string,
-    AppServerTurnInputItem[]
-  >();
-  private readonly titleGenerationWork = new Set<Promise<void>>();
   private readonly turnInputAttachments = new Map<
     string,
     { input: AppServerTurnInputItem[] }
@@ -9685,19 +9760,14 @@ export class DesktopBackendRegistry {
     string,
     PendingThreadMessageContext
   >();
+  private codexMessageContextTurnSequence = 0;
+  private readonly codexMessageContextTurnObservations = new Map<string, Map<string, number>>();
   /**
    * A provider can call a tool before its turn-start call returns, and so
    * before the turn's origin row is written. The causal lookup reads these
    * first, so that call is gated like the rest of the turn. Memory only.
    */
   private readonly startingTurnOrigins = new Set<StartingTurnOrigin>();
-  // Keep accepted requests through the active turn, not just while the RPC is
-  // in flight. The backend can acknowledge a steer before its user item is
-  // observed, and completion signals in that window must not resubmit it.
-  private readonly acceptedSteerRequests = new Map<
-    string,
-    AcceptedSteerRequest
-  >();
   private readonly acceptedThreadControlRequests = new Map<
     string,
     AcceptedThreadControlRequest
@@ -9735,6 +9805,8 @@ export class DesktopBackendRegistry {
   /** Visible Codex thread count from the full list, for the operator notice. */
   private codexVisibleThreadCount = 0;
   private readonly activeCodexTurnModes = new Map<string, ThreadExecutionMode>();
+  // Kept from the turn request: collaboration mode is independent of approval mode.
+  private readonly activeCodexTurnCollaborationModes = new Map<string, AppServerCollaborationModeRequest["mode"]>();
   private readonly activeCodexReviewTurnKeys = new Set<string>();
   private readonly activeCodexReviewInterruptTurnIds = new Map<string, string>();
   private readonly pendingReviewTerminals = new Set<Map<string, ReviewTerminal>>();
@@ -9780,9 +9852,14 @@ export class DesktopBackendRegistry {
   private readonly threadHandoffReservations = new Set<string>();
   private readonly threadLifecycleLocks = new PerKeyAsyncLock();
   private readonly threadAttachmentAdmissionLocks = new PerKeyAsyncLock();
-  private readonly automaticArchiveReservations = new Map<string, { cancelled: boolean }>();
+  private readonly automaticArchiveReservations = new Map<string, { cancelled: boolean; worktreePath?: string }>();
   private readonly threadLifecycleMutationCounts = new Map<string, number>();
-  private readonly handoffTurnStarts = new Map<string, number>();
+  private readonly threadStarts = new ThreadTurnStartLifecycle({
+    assertAvailable: ({ backend, threadId }) => this.assertThreadNotHandingOff(backend, threadId),
+    withMutation: (identity, work) => this.withThreadLifecycleMutation(identity, work),
+    assertUnlocked: ({ backend, threadId }) => this.assertThreadNotLocked(backend, threadId),
+    wake: (identity) => this.ensureCheckoutAwake(identity),
+  });
   /**
    * Codex runtime activity recovered from `thread/list` / `thread/read`.
    * The long-lived Codex registry keeps this truth across a desktop
@@ -9973,8 +10050,25 @@ export class DesktopBackendRegistry {
   >();
   private readonly taskMonitorWatchdogTimer?: NodeJS.Timeout;
   private threadArchiveSweeper?: ThreadArchiveSweeper;
+  /** In-memory, per-thread approvals from a reviewed maintenance run to
+   * snapshot past the normal size limit. Never persisted: a restart drops
+   * them, and the cleanup retry then keeps the checkout. */
+  private readonly reviewedSnapshotLimits = new Map<string, { bytes: number; expiresAt: number }>();
   private readonly threadArchiveSweepStatusListeners = new Set<(status: DesktopThreadArchiveSweepStatus) => void>();
   private readonly readThreadArchivePolicy: () => DesktopThreadArchivePolicy;
+  private readonly readCheckoutHibernationPolicy: () => DesktopCheckoutHibernationPolicy;
+  private readonly managedMaintenanceRoots: () => Promise<string[]>;
+  /** Single-flight restores of hibernated checkouts. Concurrent sends share
+   * one, and the turn queue treats the thread as busy until it settles. */
+  private readonly checkoutRestores = new Map<string, Promise<void>>();
+  /** The last failed restore per thread. Memory only: a failed restore writes
+   * nothing, and the next attempt or a relaunch tries again. */
+  private readonly checkoutRestoreFailures = new Map<string, { worktreePath: string; message: string }>();
+  /** Failures the next queued dispatch reports instead of retrying at once. */
+  private readonly undeliveredCheckoutRestoreFailures = new Set<string>();
+  /** What a running restore has done so far, for the thread card. Memory
+   * only; it outlives the snapshot record while setup runs. */
+  private readonly checkoutRestoreProgress = new Map<string, ThreadHibernatedWorkspace>();
   private readonly runtimeInstanceId: string;
   private readonly registrySessionId: string;
   private readonly resolveLiveProfileRuntimeInstanceIdsFn: () => string[];
@@ -10042,7 +10136,8 @@ export class DesktopBackendRegistry {
    * synchronous and cannot start provider work, so a 500ms UI poll can use one.
    */
   private readonly threadInfoStore = new ThreadInfoStore();
-  private readonly providerThreadSnapshotStore?: ProviderThreadSnapshotStoreLike;
+  private readonly providerThreadSnapshotStore?: ProviderThreadSnapshotStorage;
+  private readonly retainedOwnerThreadStorage?: RetainedOwnerThreadStorage;
   private durableStartupThreadHydrationAttempted = false;
   private startupProviderRefreshAttempted = false;
   private startupCodexRefreshFailed = false;
@@ -10083,7 +10178,6 @@ export class DesktopBackendRegistry {
     string,
     { title: string; titleSource: AppServerRenamedTitleSource }
   >();
-  private readonly threadRenameQueues = new Map<string, Promise<void>>();
   private hasLoggedNotificationsEnabledError = false;
   private readonly threadTurnQueue: ThreadTurnQueue;
   private readonly queuedMessageTitler: QueuedMessageTitler;
@@ -10335,8 +10429,11 @@ export class DesktopBackendRegistry {
       // arguments makes the agent retry and the operator approve it twice.
       const prepared = this.forgePrToolPreflight ? await this.forgePrToolPreflight(operation, args, context) : undefined;
       const repository = prepared?.repository ?? args.repository;
-      const settled = prepared?.args ?? args;
-      notes = await this.approveForgeToolWrite(operation, settled, context, group, repository);
+      let settled = prepared?.args ?? args;
+      const approval = await this.approveForgeToolWrite(operation, settled, context, group, repository, prepared?.mergeMethods);
+      notes = approval.notes;
+      // The operator's pick from the merge menu replaces the settled method.
+      if (approval.mergeMethod) settled = { ...settled, method: approval.mergeMethod };
       // Act exactly where the card said, even if the thread's remotes or branch change while it waits.
       target = repository ? { ...settled, repository } : settled;
     }
@@ -10395,7 +10492,14 @@ export class DesktopBackendRegistry {
       if (isAcpBackendId(backend)) {
         model = this.acpBackend.getSession(backend, threadId)?.acpRuntime?.currentModelId?.trim() || undefined;
       }
-      model ??= (await this.overlayStore.getThreadOverlayState({ backend, threadId }))?.model?.trim() || undefined;
+      if (model === undefined) {
+        // The default desktop adapter uses the shared owner port. Older injected
+        // overlay adapters can still supply the desktop model projection.
+        const metadata = this.overlayStore.getThreadMetadata
+          ? await this.overlayStore.getThreadMetadata({ backend, threadId })
+          : await this.overlayStore.getThreadOverlayState({ backend, threadId });
+        model = metadata?.model?.trim() || undefined;
+      }
     } catch (error) {
       model = undefined;
       backendRegistryLog.warn("could not read the thread's model for forge rules", { backend, threadId, error: String(error) });
@@ -10417,31 +10521,12 @@ export class DesktopBackendRegistry {
     };
   }
 
-  /**
-   * The project's name in the Directories lens, so a card names it as the
-   * sidebar and Settings do. Owner/repo when no row matches or the lookup is
-   * slow: a card must not wait on the directory inventory.
-   */
+  /** `ruleRepositoryProjectLabel` for a forge call's repository. */
   private async forgeProjectLabel(repository: ForgeRepository | undefined): Promise<string | undefined> {
     if (!repository) return undefined;
     const fallback = `${repository.owner}/${repository.repo}`;
     const key = normalizeForgeRuleRepository(repository);
-    if (!key || !this.forgeProjectLabelResolver) return fallback;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      const label = await Promise.race([
-        this.forgeProjectLabelResolver(key),
-        new Promise<undefined>((resolve) => {
-          timer = setTimeout(() => resolve(undefined), FORGE_PROJECT_LABEL_TIMEOUT_MS);
-        }),
-      ]);
-      return label?.trim() || fallback;
-    } catch (error) {
-      backendRegistryLog.warn("could not read the project name for a forge card", { error: String(error) });
-      return fallback;
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
+    return key ? await this.ruleRepositoryProjectLabel(key, fallback) : fallback;
   }
 
   /** Display names for rule wording: installed ACP agents and Codex model providers. */
@@ -10464,7 +10549,8 @@ export class DesktopBackendRegistry {
   /**
    * The operator's consent for one GitHub write. The level comes from the
    * most specific project rule for this repository and agent, else the
-   * group's setting. `allow` runs; `auto` follows the turn's approval mode
+   * group's setting. Plan turns refuse every write before considering the
+   * level. `allow` runs; `auto` follows the turn's approval mode
    * (see `forgeAutoRunsWithoutApproval`); otherwise the shipped MCP approval
    * card asks. Automations cannot answer, so they are refused with the
    * setting to change.
@@ -10475,7 +10561,11 @@ export class DesktopBackendRegistry {
     context: AgentToolCallContext,
     group: ForgeAgentToolGroup,
     repository?: ForgeRepository,
-  ): Promise<ForgeWriteApprovalNotes | undefined> {
+    mergeMethods?: ForgePrToolPreflightResult["mergeMethods"],
+  ): Promise<{ notes?: ForgeWriteApprovalNotes; mergeMethod?: ThreadTodoMergeMethod }> {
+    if (this.isForgePlanTurn(context)) {
+      throw new ForgeReadError("plan_mode", claudePlanTurnRefusal(operation));
+    }
     const identity = await this.resolveForgeAgentIdentity(context);
     const resolution = resolveForgeAgentToolAccess(this.resolveForgeToolPolicy(), group, repository, identity);
     const access = resolution.level;
@@ -10495,7 +10585,7 @@ export class DesktopBackendRegistry {
       throw new ForgeReadError("tools_disabled", `${FORGE_AGENT_TOOL_GROUP_LABELS[group]} is Off in Settings → Git → Agent forge tools, so ${operation} is unavailable.`);
     }
     if (access === "allow") {
-      if (!rule) return undefined;
+      if (!rule) return {};
       const description = forgeAgentToolRuleDescription(rule, wording);
       backendRegistryLog.info("running forge write allowed by a project rule", {
         backend: context.backend,
@@ -10504,7 +10594,7 @@ export class DesktopBackendRegistry {
         operation,
         rule: description,
       });
-      return { approval: { source: FORGE_AGENT_RULE_APPROVAL_SOURCE, rule: description } };
+      return { notes: { approval: { source: FORGE_AGENT_RULE_APPROVAL_SOURCE, rule: description } } };
     }
     const signal = context.signal ?? new AbortController().signal;
     signal.throwIfAborted();
@@ -10549,7 +10639,7 @@ export class DesktopBackendRegistry {
         operation,
         ...(rule ? { rule: forgeAgentToolRuleDescription(rule, wording) } : {}),
       });
-      return undefined;
+      return {};
     }
     if (automation) {
       throw new ForgeReadError("approval_required", rule
@@ -10569,7 +10659,7 @@ export class DesktopBackendRegistry {
     const grantKey = `${group}:${access}${rule
       ? `:${rule.repository}:${forgeAgentRuleAgentKey(rule.agent)}`
       : resolution.source === "unreadable_rule" ? ":unreadable" : ""}`;
-    if (sessionGrant && this.forgeToolSessionApprovals.get(sessionKey)?.get(grantTarget) === grantKey) return undefined;
+    if (sessionGrant && this.forgeToolSessionApprovals.get(sessionKey)?.get(grantTarget) === grantKey) return {};
     const cardWording = { ...wording, projectLabel: await this.forgeProjectLabel(repository) };
     signal.throwIfAborted();
     meta.subtitle = rule
@@ -10592,8 +10682,23 @@ export class DesktopBackendRegistry {
       })
       : [];
     if (rememberOptions.length > 0) meta[FORGE_APPROVAL_REMEMBER_OPTIONS_META_KEY] = rememberOptions;
+    // A merge names its method on the button and offers the others, as a
+    // to-do merge card does. The settled method is the button's.
+    const offeredMergeMethods = mergeMethods && args.method && mergeMethods.offered.includes(args.method)
+      ? mergeMethods.offered
+      : undefined;
+    if (offeredMergeMethods && args.method) {
+      meta[FORGE_APPROVAL_MERGE_METHODS_META_KEY] = {
+        selected: args.method,
+        methods: offeredMergeMethods,
+      } satisfies ForgeApprovalMergeMethods;
+    }
     const key = buildPendingRequestKey({ backend: context.backend, threadId: context.threadId, requestId });
-    type Approval = { grant: "once" | "session"; remember?: ForgeApprovalRememberOptionId } | false;
+    type Approval = {
+      grant: "once" | "session";
+      remember?: ForgeApprovalRememberOptionId;
+      mergeMethod?: ThreadTodoMergeMethod;
+    } | false;
     const approved = await new Promise<Approval>((resolve, reject) => {
       const finish = (value: Approval, error?: unknown): void => {
         signal.removeEventListener("abort", aborted);
@@ -10619,9 +10724,15 @@ export class DesktopBackendRegistry {
           if (choice && !remember) {
             backendRegistryLog.warn("ignoring a forge remember choice this card did not offer", { threadId: context.threadId, requestId, choice });
           }
+          const pickedMethod = readForgeApprovalMergeMethodChoice(responseMeta);
+          const mergeMethod = pickedMethod && offeredMergeMethods?.includes(pickedMethod) ? pickedMethod : undefined;
+          if (pickedMethod && !mergeMethod) {
+            backendRegistryLog.warn("ignoring a merge method this card did not offer", { threadId: context.threadId, requestId, method: pickedMethod });
+          }
           finish({
             grant: sessionGrant && responseMeta?.persist === "session" ? "session" : "once",
             ...(remember ? { remember } : {}),
+            ...(mergeMethod ? { mergeMethod } : {}),
           });
         },
         reject: (error) => finish(false, error),
@@ -10636,11 +10747,24 @@ export class DesktopBackendRegistry {
       grants.set(grantTarget, grantKey);
       this.forgeToolSessionApprovals.set(sessionKey, grants);
     }
-    if (!approved.remember || !ruleRepository || !isForgeApprovalRememberGroup(group)) return undefined;
+    if (approved.mergeMethod) {
+      // A pick from the menu is the operator's preference for the project,
+      // whether or not this merge succeeds, as on a to-do card.
+      try {
+        mergeMethods?.remember?.(approved.mergeMethod);
+      } catch (error) {
+        backendRegistryLog.warn("could not remember a merge method pick", { threadId: context.threadId, error: String(error) });
+      }
+    }
+    const merge = approved.mergeMethod ? { mergeMethod: approved.mergeMethod } : {};
+    if (!approved.remember || !ruleRepository || !isForgeApprovalRememberGroup(group)) return merge;
     return {
-      rememberedRule: await this.rememberForgeApprovalRule(approved.remember, {
-        group, repository: ruleRepository, identity, context, wording,
-      }),
+      ...merge,
+      notes: {
+        rememberedRule: await this.rememberForgeApprovalRule(approved.remember, {
+          group, repository: ruleRepository, identity, context, wording,
+        }),
+      },
     };
   }
 
@@ -10775,8 +10899,10 @@ export class DesktopBackendRegistry {
   private threadPullRequestWatchToolHandler:
     | ThreadPullRequestWatchToolHandler
     | undefined;
+  private threadMaintenanceToolHandler: ThreadMaintenanceToolHandler | undefined;
+  private threadMaintenanceToolScans: ThreadMaintenanceToolScans | undefined;
   private threadDependencyToolHandler:
-    | ((args: import("@pwragent/shared").ManageThreadDependenciesRequest, provenance?: Pick<AppServerThreadMessageOrigin, "causalMessagingSource" | "causalMessagingAmbiguous">) => Promise<PwrAgentThreadInspectionResponse>)
+    | ((args: import("@pwragent/shared").ManageThreadDependenciesRequest, provenance?: Pick<AppServerThreadMessageOrigin, "causalMessagingSource" | "causalMessagingAmbiguous">, actor?: string) => Promise<PwrAgentThreadInspectionResponse>)
     | undefined;
   private directoryGitStatusWriter: DirectoryGitStatusWriter | undefined;
   private readonly pendingDirectoryGitStatusKeys = new Set<string>();
@@ -10889,9 +11015,6 @@ export class DesktopBackendRegistry {
    * failure-poisoning semantics live in PerKeyAsyncLock.
    */
   private readonly codexEnvironmentRuntimeLocks = new PerKeyAsyncLock();
-  private readonly attemptedTitleGenerations = new Set<string>();
-  /** Launch placeholders stay helper-eligible until renamed or attempted. */
-  private readonly systemPlaceholderTitleThreadKeys = new Set<string>();
   private readonly pendingDirectoryRepairs = new Map<string, Promise<void>>();
   private readonly failedDirectoryRelationshipLogKeys = new Set<string>();
   private readonly pendingCodexWorkspaceCwdSyncs = new Map<
@@ -10901,7 +11024,6 @@ export class DesktopBackendRegistry {
       promise: Promise<void>;
     }
   >();
-  private titleGenerationSequence = 0;
   /**
    * Gate for the Codex `listThreads` probe. Returns `true` while the
    * first-run wizard is still asking the operator which Codex profile
@@ -11013,9 +11135,12 @@ export class DesktopBackendRegistry {
    * it to `state/app-state.getAppStateMode()`.
    */
   private readonly isBootstrapModeFn: () => boolean;
+  private readonly ownerAdmission?: ThreadOwnerAdmission;
 
   constructor(options?: {
+    ownerAdmission?: ThreadOwnerAdmission;
     getThreadArchivePolicy?: () => DesktopThreadArchivePolicy;
+    getCheckoutHibernationPolicy?: () => DesktopCheckoutHibernationPolicy;
     codexClient?: BackendClient;
     overlayStore?: BackendRegistryOverlayStoreLike;
     correspondenceStore?: ThreadCorrespondenceStore;
@@ -11028,8 +11153,9 @@ export class DesktopBackendRegistry {
     acpAgentStore?: AcpBackendAdapterOptions["acpAgentStore"];
     acpRolloutStore?: AcpBackendAdapterOptions["acpRolloutStore"];
     acpSessionStore?: AcpSessionStoreLike | null;
-    acpAvailableCommandsStore?: AcpAvailableCommandsStoreLike | null;
-    providerThreadSnapshotStore?: ProviderThreadSnapshotStoreLike | null;
+    acpAvailableCommandsStore?: AcpAvailableCommandsStorage | null;
+    providerThreadSnapshotStore?: ProviderThreadSnapshotStorage | null;
+    retainedOwnerThreadStorage?: RetainedOwnerThreadStorage | null;
     acpAvailableCommandProbeBudgetMs?: number;
     discoverLocalAcpAgents?: LocalAcpDiscovery;
     /**
@@ -11043,6 +11169,8 @@ export class DesktopBackendRegistry {
     useMachineAcpDiscovery?: boolean;
     useMachineClaudeDiscovery?: boolean;
     claudeBackendOptions?: Partial<ClaudeBackendOptions>;
+    /** Tests: PwrAgent's worktree roots, which default to ~/.pwragent's. */
+    managedWorktreeRoots?: () => Promise<string[]>;
     isAcpAgentEnabled?: (registryId: string) => boolean;
     createAcpClient?: AcpClientFactory;
     /** The transport of an ACP helper's own agent process. */
@@ -11116,7 +11244,7 @@ export class DesktopBackendRegistry {
       ) => Promise<unknown> | unknown,
     ) => () => void;
     runtimeInstanceId?: string;
-    archiveCleanupCheckpointStore?: Pick<ArchiveCleanupCheckpointStore, "save" | "recover"> | null;
+    archiveCleanupCheckpointStore?: ArchiveCleanupCheckpointStorage | null;
     /** `null` keeps held wake-ups in memory only. */
     projectHeldWakeupStore?: ProjectHeldWakeupStoreLike | null;
     /** `null` keeps no restart continuations. */
@@ -11132,20 +11260,28 @@ export class DesktopBackendRegistry {
       cwd: string,
     ) => Promise<LinkedDirectorySummary | undefined>;
   }) {
+    this.ownerAdmission = options?.ownerAdmission;
+    this.activeTurnKeys.onDelete((key) => { this.activeCodexTurnCollaborationModes.delete(key); });
+    this.managedMaintenanceRoots = options?.managedWorktreeRoots
+      ?? (async () => [userHomeWorktreesRoot(), resolveActiveProfilePath("worktrees")]);
     this.readThreadArchivePolicy = options?.getThreadArchivePolicy ?? (() => {
       try { return getDesktopSettingsService().resolveThreadArchivePolicy(); }
       catch { return { ...DEFAULT_THREAD_ARCHIVE_POLICY }; }
+    });
+    this.readCheckoutHibernationPolicy = options?.getCheckoutHibernationPolicy ?? (() => {
+      try { return getDesktopSettingsService().resolveCheckoutHibernationPolicy(); }
+      catch { return { ...DEFAULT_CHECKOUT_HIBERNATION_POLICY }; }
     });
     const processRuntimeIdentity = getProcessRuntimeIdentity();
     this.configStore = options?.configStore;
     this.runtimeInstanceId =
       options?.runtimeInstanceId ?? processRuntimeIdentity.instanceId;
     this.archiveCleanupCheckpointStore = options?.archiveCleanupCheckpointStore === null ? undefined
-      : options?.archiveCleanupCheckpointStore ?? (isAppStateInitialized() ? new ArchiveCleanupCheckpointStore(getAppStateDb().raw) : undefined);
+      : options?.archiveCleanupCheckpointStore ?? (isAppStateInitialized() ? createArchiveCleanupCheckpointStorage() : undefined);
     this.projectHeldWakeupStore = options?.projectHeldWakeupStore === null ? undefined
-      : options?.projectHeldWakeupStore ?? (isAppStateInitialized() ? new ProjectHeldWakeupStore(getAppStateDb().raw) : undefined);
+      : options?.projectHeldWakeupStore ?? (isAppStateInitialized() ? createProjectHeldWakeupStorage() : undefined);
     this.restartContinuationStore = options?.restartContinuationStore === null ? undefined
-      : options?.restartContinuationStore ?? (isAppStateInitialized() ? new RestartContinuationStore(getAppStateDb().raw) : undefined);
+      : options?.restartContinuationStore ?? (isAppStateInitialized() ? createRestartContinuationStorage() : undefined);
     this.restartDispatchPlanOptions = options?.restartDispatchPlan ?? {};
     this.registrySessionId = options?.registrySessionId ?? randomUUID();
     this.runningTurnShutdownStopTimeoutMs =
@@ -11170,8 +11306,10 @@ export class DesktopBackendRegistry {
         ? undefined
         : options?.providerThreadSnapshotStore
           ?? (isAppStateInitialized()
-            ? new ProviderThreadSnapshotStore(getAppStateDb())
+            ? createProviderThreadSnapshotStorage()
             : undefined);
+    this.retainedOwnerThreadStorage = options?.retainedOwnerThreadStorage === null ? undefined
+      : options?.retainedOwnerThreadStorage ?? (isAppStateInitialized() ? createRetainedOwnerThreadStorage() : undefined);
     const replayClients = createReplayClientsFromEnv();
     const createsLiveCodexClient =
       !options?.codexClient && !replayClients?.codexClient;
@@ -11492,6 +11630,7 @@ export class DesktopBackendRegistry {
         return cleanup;
       };
       const client = new CodexAppServerClient({
+        assertOwnerAdmission: () => this.assertThreadOwnership(),
         args: settingsService ? undefined : buildCodexClientArgs(codexEnv),
         command: codexCommand,
         connectionObserver: codexObserver,
@@ -11618,10 +11757,9 @@ export class DesktopBackendRegistry {
         },
         onError: () => backendRegistryLog.warn("Token Miser diagnostic batch could not be saved"),
       });
-      this.tokenMiserStore = new TokenMiserStore(
+      this.tokenMiserStore = createTokenMiserStorage(
         path.join(tokenMiserStateDir, "objects"),
         {
-          stateDb: getAppStateDb(),
           onMetadataUpdated: async (metadata, reason) => {
             if (reason === "retrieval") this.tokenMiserDiagnostics?.recordRetrieval(metadata);
             this.pendingTokenMiserInterceptions.set(metadata.objectId, metadata);
@@ -11742,7 +11880,7 @@ export class DesktopBackendRegistry {
         ? undefined
         : options?.acpAvailableCommandsStore ??
           (isAppStateInitialized()
-            ? new AcpAvailableCommandsStore(getAppStateDb())
+            ? createAcpAvailableCommandsStorage()
             : undefined);
     this.acpAvailableCommandProbeBudgetMs =
       options?.acpAvailableCommandProbeBudgetMs
@@ -11866,6 +12004,11 @@ export class DesktopBackendRegistry {
         ? async () => inspectClaudeInstallation({ env: await settingsService?.resolveTerminalSpawnEnvAsync() })
         : async () => ({ authStatus: "unknown" }),
       resolveEnv: async () => await settingsService?.resolveTerminalSpawnEnvAsync() ?? process.env,
+      // A chunk's __dirname is its own folder; this module is bundled into
+      // the main entry, beside the worker.
+      openSessionReader: (env) => openClaudeSessionReader(env, {
+        workerPath: path.join(__dirname, "claude-session-reader-worker.js"),
+      }),
       emit: async (event) => { await this.emit(event); },
       request: async (request, signal) => await this.handleServerRequest("claude", request, signal),
       cancelRequest: async (threadId, turnId, requestId) => {
@@ -11890,10 +12033,13 @@ export class DesktopBackendRegistry {
       holdSelfStartedTurn: async ({ threadId, prompt, source }) => await this.holdBackendSelfStartedTurn({
         backend: "claude", threadId, prompt, source,
       }),
+      recordSubAgents: async (params) => await this.recordClaudeSubAgents(params),
       planLimits: this.planLimits,
       ...options?.claudeBackendOptions,
+      assertOwnerAdmission: () => this.assertThreadOwnership(),
     });
     this.acpBackend = new AcpBackendAdapter({
+      assertOwnerAdmission: () => this.assertThreadOwnership(),
       planLimits: this.planLimits,
       acpAgentStore: options?.acpAgentStore,
       acpRolloutStore: options?.acpRolloutStore,
@@ -12161,7 +12307,9 @@ export class DesktopBackendRegistry {
       isThreadActive: ({ backend, threadId }) =>
         this.stoppingRunningTurnsForShutdown
         || this.threadHasActiveTurn(threadId, backend)
-        || this.threadHasBlockingWorkspaceMove({ backend, threadId }),
+        || this.threadHasBlockingWorkspaceMove({ backend, threadId })
+        // A send waits behind a checkout restore like a queued message.
+        || this.checkoutRestores.has(buildThreadIdentityKey(backend, threadId)),
       isDispatchHeld: (entry) => restartGateHolds(this.restartGate, {
         ...(entry.restartContinuation && entry.id ? { restartEntryId: entry.id } : {}),
       }, Date.now()),
@@ -12974,6 +13122,14 @@ export class DesktopBackendRegistry {
   }
 
   private threadPrimaryGitRepositoryReader?: (backend: AppServerBackendKind, threadId: string) => string | undefined;
+  private threadProjectRepositoryResolver?: (backend: AppServerBackendKind, threadId: string) => Promise<string | undefined>;
+
+  /** Reads a thread's primary repository when the navigation cache has none yet. */
+  setThreadProjectRepositoryResolver(
+    resolver: (backend: AppServerBackendKind, threadId: string) => Promise<string | undefined>,
+  ): void {
+    this.threadProjectRepositoryResolver = resolver;
+  }
 
   setThreadPrimaryGitRepositoryReader(
     reader: ((backend: AppServerBackendKind, threadId: string) => string | undefined) | undefined,
@@ -13006,8 +13162,16 @@ export class DesktopBackendRegistry {
     this.threadPullRequestWatchToolHandler = handler ?? undefined;
   }
 
+  setThreadMaintenanceToolHandler(handler: ThreadMaintenanceToolHandler | undefined): void {
+    this.threadMaintenanceToolHandler = handler;
+    this.threadMaintenanceToolScans = handler ? new ThreadMaintenanceToolScans({
+      scan: async (request) => await handler.scan(request),
+      getScan: (scanId) => handler.getScan(scanId),
+    }) : undefined;
+  }
+
   setThreadDependencyToolHandler(
-    handler: ((args: import("@pwragent/shared").ManageThreadDependenciesRequest, provenance?: Pick<AppServerThreadMessageOrigin, "causalMessagingSource" | "causalMessagingAmbiguous">) => Promise<PwrAgentThreadInspectionResponse>) | undefined,
+    handler: ((args: import("@pwragent/shared").ManageThreadDependenciesRequest, provenance?: Pick<AppServerThreadMessageOrigin, "causalMessagingSource" | "causalMessagingAmbiguous">, actor?: string) => Promise<PwrAgentThreadInspectionResponse>) | undefined,
   ): void {
     this.threadDependencyToolHandler = handler;
   }
@@ -13028,6 +13192,24 @@ export class DesktopBackendRegistry {
     handler: ThreadPullRequestDetachHandler | null | undefined,
   ): void {
     this.threadPullRequestDetachHandler = handler ?? undefined;
+  }
+
+  private threadDependenciesPeerHandler?: (
+    request: import("@pwragent/shared").ManageThreadDependenciesRequest,
+    requesterInstanceId: string | undefined,
+  ) => Promise<import("@pwragent/shared").ManageThreadDependenciesResponse>;
+
+  setThreadDependenciesPeerHandler(handler: typeof this.threadDependenciesPeerHandler): void {
+    this.threadDependenciesPeerHandler = handler;
+  }
+
+  /** A peer's Continue After request about one of this owner's threads. */
+  async manageThreadDependenciesForPeer(
+    request: import("@pwragent/shared").ManageThreadDependenciesRequest,
+    requesterInstanceId: string | undefined,
+  ): Promise<import("@pwragent/shared").ManageThreadDependenciesResponse> {
+    if (!this.threadDependenciesPeerHandler) throw new Error("Continue After is not available on this instance yet.");
+    return await this.threadDependenciesPeerHandler(request, requesterInstanceId);
   }
 
   setThreadPrWatchesPeerHandler(
@@ -13252,6 +13434,7 @@ export class DesktopBackendRegistry {
     turnId: string;
   }> {
     this.assertNotBootstrap("startAutomationHeadlessTurn");
+    this.assertThreadOwnership();
     const overlay = await this.overlayStore.getThreadOverlayState({
       backend: params.backend,
       threadId: params.agentThreadId,
@@ -13471,7 +13654,7 @@ export class DesktopBackendRegistry {
       // title they already have. A grouped steer that took another message
       // arrives here untitled, so the larger batch is named again.
       if (!event.entry.title) this.requestQueuedMessageTitle(event.entry);
-    } else {
+    } else if (event.type !== "blocked") {
       this.queuedMessageTitler.forget(event.entry.id);
     }
     const origins = event.type === "queued" && event.inputUpdated
@@ -13777,7 +13960,7 @@ export class DesktopBackendRegistry {
     }
     // An event during the read must prevent publishing the old projection.
     // Do not share an in-flight request whose deadline belongs to another caller.
-    const pending: ThreadListCacheState = {};
+    const pending: ThreadListCacheState = { archived: params.archived === true };
     this.threadListCache.set(cacheKey, pending);
     const threads: AppServerThreadSummary[] = [];
     let providerFailed = false;
@@ -13806,7 +13989,7 @@ export class DesktopBackendRegistry {
         });
         return [];
       });
-      threads.push(...this.withPendingStartedThreads("codex", codexThreads, params));
+      threads.push(...await this.withRetainedOwnerThreads(this.withPendingStartedThreads("codex", codexThreads, params), params));
     }
     checkDeadline();
     if (!params.backend || params.backend === "claude") {
@@ -13834,7 +14017,8 @@ export class DesktopBackendRegistry {
         : undefined;
       const projected = this.withObservedThreadName({
         ...thread,
-        executionMode: overlay?.executionMode ?? thread.executionMode,
+        ...(thread.source === "codex" ? projectOverlayThreadTitle(thread, overlay) : {}),
+        executionMode: thread.source === "claude" ? thread.executionMode ?? overlay?.executionMode : overlay?.executionMode ?? thread.executionMode,
         model: overlay?.model ?? thread.model,
         reasoningEffort: overlay?.reasoningEffort ?? thread.reasoningEffort,
         serviceTier: overlay?.serviceTier ?? thread.serviceTier,
@@ -13854,6 +14038,7 @@ export class DesktopBackendRegistry {
         this.threadListCache.delete(cacheKey);
       } else {
         this.threadListCache.set(cacheKey, {
+          archived: params.archived === true,
           threads: result,
           expiresAt: Date.now() + THREAD_SEARCH_REUSE_WINDOW_MS,
         });
@@ -13975,7 +14160,7 @@ export class DesktopBackendRegistry {
     });
     // An event can invalidate or replace this entry while the read awaits
     // enrichment. Only the promise that still owns the key may publish it.
-    const pendingState: ThreadListCacheState = {};
+    const pendingState: ThreadListCacheState = { archived: normalizedParams.archived === true };
     const displayMetadataObservationSequence =
       this.reserveThreadInfoObservation();
     const execution = listingDiagnostics.trace("registry", {
@@ -13988,6 +14173,7 @@ export class DesktopBackendRegistry {
         if (this.threadListCache.get(cacheKey) === pendingState) {
           listingDiagnostics.remember(threads, execution);
           this.threadListCache.set(cacheKey, {
+            archived: normalizedParams.archived === true,
             expiresAt: Date.now() + (this.incompleteThreadLists.has(threads)
               ? INCOMPLETE_THREAD_LIST_REUSE_WINDOW_MS
               : THREAD_LIST_REUSE_WINDOW_MS),
@@ -14055,7 +14241,7 @@ export class DesktopBackendRegistry {
         backend: params.backend,
         threadId,
       },
-      { requireFresh: true },
+      { requireFresh: true, archived: false },
     );
     if (cached) {
       return cached;
@@ -14067,7 +14253,13 @@ export class DesktopBackendRegistry {
       enrichDirectories: false,
       forceRefresh: true,
     });
-    return threads.find((thread) => thread.id === threadId);
+    const thread = threads.find((thread) => thread.id === threadId);
+    if (thread || (params.backend && params.backend !== "codex")
+      || !this.retainedOwnerThreadStorage?.list().some(row => row.id === threadId)) return thread;
+    // A retained identity can be archived. Consult native archive authority
+    // through the same read policy rather than treating its metadata as active.
+    return (await this.listThreads({ backend: "codex", archived: true, enrichDirectories: false,
+      callerReason: "thread-id-lookup", forceRefresh: true })).find(row => row.id === threadId);
   }
 
   /**
@@ -14117,10 +14309,13 @@ export class DesktopBackendRegistry {
       backend?: AppServerBackendKind;
       threadId: string;
     },
-    options?: { requireFresh?: boolean },
+    options?: { requireFresh?: boolean; archived?: boolean },
   ): AppServerThreadSummary | undefined {
     const now = options?.requireFresh === true ? Date.now() : undefined;
     for (const state of this.threadListCache.values()) {
+      if (options?.archived !== undefined && state.archived !== options.archived) {
+        continue;
+      }
       if (now !== undefined && (state.expiresAt ?? 0) <= now) {
         continue;
       }
@@ -14377,7 +14572,7 @@ export class DesktopBackendRegistry {
     },
     displayMetadataObservationSequence: number,
   ): Promise<AppServerThreadSummary[]> {
-    const durableThreads = this.readDurableStartupThreads(
+    const durableThreads = await this.readDurableStartupThreads(
       params,
       displayMetadataObservationSequence,
     );
@@ -14412,7 +14607,7 @@ export class DesktopBackendRegistry {
         params.archived,
       );
       this.persistProviderThreadSnapshot(params.backend, threads, params);
-      return threads;
+      return params.backend === "codex" ? await this.withRetainedOwnerThreads(threads, params) : threads;
     }
 
     const [codexThreads, acpThreads, claudeThreads] = await Promise.all([
@@ -14488,7 +14683,11 @@ export class DesktopBackendRegistry {
     diagnostics: { callerReason: ThreadListCallerReason; ownerId: string },
   ): Promise<{ threads: AppServerThreadSummary[]; enriched: boolean }> {
     if (backend === "claude") {
-      return { threads: await this.claudeBackend.listThreads(params), enriched: true };
+      const threads = await this.claudeBackend.listThreads(params);
+      return {
+        threads: params.archived ? threads : await this.withClaudeNativeSubAgents(threads),
+        enriched: true,
+      };
     }
     if (backend === "codex") {
       const archiveGeneration = this.archiveCleanupReads.generation("codex");
@@ -14545,7 +14744,7 @@ export class DesktopBackendRegistry {
     return threads;
   }
 
-  private readDurableStartupThreads(
+  private async readDurableStartupThreads(
     params: {
       archived?: boolean;
       backend?: AppServerBackendKind;
@@ -14557,7 +14756,7 @@ export class DesktopBackendRegistry {
       maxPages?: number;
     },
     displayMetadataObservationSequence: number,
-  ): AppServerThreadSummary[] | undefined {
+  ): Promise<AppServerThreadSummary[] | undefined> {
     if (
       this.durableStartupThreadHydrationAttempted
       || !this.providerThreadSnapshotStore
@@ -14574,11 +14773,27 @@ export class DesktopBackendRegistry {
     this.durableStartupThreadHydrationAttempted = true;
     const snapshots = this.providerThreadSnapshotStore.list();
     this.startupProviderRefreshStatus ??= { state: "checking" };
-    const threads = snapshots.flatMap((snapshot) =>
+    // ACP metadata is local and complete. A retained provider snapshot cannot
+    // resurrect a deleted session or hide one whose agent was uninstalled.
+    const nativeThreads = [...snapshots.filter(snapshot => !isAcpBackendId(snapshot.backend)).flatMap((snapshot) =>
       snapshot.backend === "codex" && params.limit !== undefined
-        ? snapshot.threads.slice(0, params.limit)
-        : snapshot.threads,
-    ).sort((left, right) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0));
+        ? snapshot.threads.filter(thread => thread.archivedAt === undefined).slice(0, params.limit)
+        : snapshot.threads.filter(thread => thread.archivedAt === undefined),
+    ), ...await this.readAcpThreadsForCache()];
+    if (this.closed) return [];
+    this.confirmRetainedNativeOwners(snapshots.flatMap(snapshot => snapshot.backend === "codex" ? [...snapshot.threads] : []));
+    const codexIds = nativeThreads.filter(thread => thread.source === "codex").map(thread => thread.id);
+    const readOverlays = this.overlayStore.getThreadListingOverlayStates ?? this.overlayStore.getThreadOverlayStates;
+    const overlays = codexIds.length ? await readOverlays.call(this.overlayStore, { backend: "codex", threadIds: codexIds }) : {};
+    // A retained inventory predates handover. It cannot contradict the latest
+    // canonical acknowledgement the way a fresh provider response can.
+    const titledThreads = nativeThreads.map(thread => thread.source === "codex"
+      ? { ...thread, ...projectOverlayThreadTitle(thread, {
+          title: overlays[thread.id]?.title, titleSource: overlays[thread.id]?.titleSource,
+        }) } : thread)
+      .sort((left, right) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0));
+    const threads = this.mergeRetainedOwnerThreads(titledThreads, params, new Set(snapshots.flatMap(snapshot =>
+      snapshot.backend === "codex" ? snapshot.threads.filter(thread => thread.archivedAt !== undefined).map(thread => thread.id) : [])));
     this.rememberThreadListContexts(
       threads,
       displayMetadataObservationSequence,
@@ -14622,6 +14837,7 @@ export class DesktopBackendRegistry {
 
   refreshProvidersAtStartup(permit: ProviderDiscoveryPermit): Promise<void> {
     assertProviderDiscoveryPermit(permit, ["startup"]);
+    if (this.shutdownRequested) return Promise.resolve();
     if (this.startupProviderRefreshPromise) {
       return this.startupProviderRefreshPromise;
     }
@@ -14631,6 +14847,7 @@ export class DesktopBackendRegistry {
     this.startupProviderRefreshAttempted = true;
     this.startupProviderRefreshStatus = { state: "checking" };
     this.startupProviderRefreshPromise = Promise.resolve().then(async () => {
+      if (this.shutdownRequested) return;
       const startedAt = Date.now();
       const results = await Promise.allSettled([
         this.refreshCodexProviderAtStartup(permit),
@@ -14667,11 +14884,12 @@ export class DesktopBackendRegistry {
             failedProviders: failures.length,
           }
         : { state: "ready" };
-      this.publishRefreshedProviderThreadsToCache(
+      await this.publishRefreshedProviderThreadsToCache(
         results.flatMap((result) =>
           result.status === "fulfilled" ? [result.value] : [],
         ),
       );
+      if (this.closed) return;
       await this.emit({
         backend: "codex",
         notification: {
@@ -14702,7 +14920,8 @@ export class DesktopBackendRegistry {
       forceRefresh: true,
     });
     if (this.closed) return;
-    this.publishRefreshedProviderThreadsToCache([{ backends: ["codex"], threads }]);
+    await this.publishRefreshedProviderThreadsToCache([{ backends: ["codex"], threads }]);
+    if (this.closed) return;
     const failedProviders = Math.max(
       0,
       (this.startupProviderRefreshStatus?.failedProviders ?? 0)
@@ -14777,22 +14996,27 @@ export class DesktopBackendRegistry {
     return this.startupProviderRefreshStatus;
   }
 
-  private publishRefreshedProviderThreadsToCache(
+  private async publishRefreshedProviderThreadsToCache(
     refreshes: readonly StartupProviderThreadRefresh[],
-  ): void {
+  ): Promise<void> {
     if (!this.providerThreadSnapshotStore) {
       return;
     }
     const refreshedBackends = new Set(
       refreshes.flatMap((refresh) => refresh.backends),
     );
-    const threads = [
-      ...refreshes.flatMap((refresh) => refresh.threads),
+    const acpThreads = await this.readAcpThreadsForCache();
+    if (this.closed) return;
+    const providerThreads = [
+      ...refreshes.flatMap((refresh) => refresh.threads).filter(thread => !isAcpBackendId(thread.source)),
       ...this.providerThreadSnapshotStore.list()
-        .filter((snapshot) => !refreshedBackends.has(snapshot.backend))
+        .filter((snapshot) => !refreshedBackends.has(snapshot.backend) && !isAcpBackendId(snapshot.backend))
         .flatMap((snapshot) => snapshot.threads),
+      ...acpThreads,
     ]
       .sort((left, right) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0));
+    const threads = this.mergeRetainedOwnerThreads(providerThreads, {}, new Set(this.providerThreadSnapshotStore.list()
+      .flatMap(snapshot => snapshot.backend === "codex" ? snapshot.threads.filter(thread => thread.archivedAt !== undefined).map(thread => thread.id) : [])));
     this.invalidateThreadListCache();
     this.rememberThreadListContexts(
       threads,
@@ -14805,6 +15029,7 @@ export class DesktopBackendRegistry {
       enrichDirectories: false,
     });
     this.threadListCache.set(cacheKey, {
+      archived: false,
       expiresAt: Date.now() + THREAD_LIST_REUSE_WINDOW_MS,
       threads,
     });
@@ -14836,7 +15061,15 @@ export class DesktopBackendRegistry {
     this.providerThreadSnapshotStore.replace({
       backend,
       observedAt: Date.now(),
-      threads,
+      threads: backend === "codex" ? threads : threads.map(thread => {
+        // rememberThreadListContexts has already merged this read's reserved
+        // observation sequence. A later native event wins over an older list.
+        const latest = this.threadInfoStore.get({ backend, threadId: thread.id });
+        return { ...thread,
+          ...(latest?.title ? { title: latest.title, titleSource: latest.titleSource ?? thread.titleSource } : {}),
+          ...(latest?.archived === true ? { archivedAt: thread.archivedAt ?? 0 } : {}),
+        };
+      }),
     });
   }
 
@@ -15301,12 +15534,34 @@ export class DesktopBackendRegistry {
     filter?: string,
     archived?: boolean,
   ): Promise<AppServerThreadSummary[]> {
+    const sessions = this.acpBackend.listAllSessions();
+    const backends = sessions
+      ? [...new Set(sessions.map(session => session.backendId))]
+      : (await this.acpBackend.listAvailableAgents()).map(agent => agent.backendId);
     const threadLists = await Promise.all(
-      (await this.acpBackend.listAvailableAgents()).map((agent) =>
-        this.listInstalledAcpThreads(agent.backendId, filter, archived),
+      backends.map((backend) =>
+        this.listInstalledAcpThreads(backend, filter, archived),
       ),
     );
     return threadLists.flat();
+  }
+
+  private async readAcpThreadsForCache(): Promise<AppServerThreadSummary[]> {
+    const enriched = await this.withThreadEnvironmentOptions(await this.listAllInstalledAcpThreads());
+    if (this.closed) return [];
+    const byIdentity = new Map(enriched.map(thread => [buildThreadIdentityKey(thread.source, thread.id), thread]));
+    // Directory/environment IO may overlap deletion, hiding or a native rename.
+    // Only current native members and facts may enter the navigation cache.
+    const sessions = this.acpBackend.listAllSessions() ?? enriched.flatMap(thread => {
+      const session = isAcpBackendId(thread.source) ? this.acpBackend.getSession(thread.source, thread.id) : undefined;
+      return session ? [session] : [];
+    });
+    return sessions.filter(session => !session.hidden && session.archivedAt === undefined).map(session => {
+      const native = this.acpBackend.sessionToThreadSummary(session);
+      const previous = byIdentity.get(buildThreadIdentityKey(session.backendId, session.sessionId));
+      return previous && previous.projectKey === native.projectKey ? { ...native,
+        linkedDirectories: previous.linkedDirectories, codexEnvironmentOptions: previous.codexEnvironmentOptions } : native;
+    });
   }
 
   /**
@@ -15317,7 +15572,7 @@ export class DesktopBackendRegistry {
    */
   private async withThreadEnvironmentOptions(
     threads: AppServerThreadSummary[],
-  ): Promise<AppServerThreadSummary[]> {
+  ): Promise<Array<AppServerThreadSummary & { codexEnvironmentOptions?: CodexEnvironmentOption[] }>> {
     if (threads.length === 0) return threads;
     const readOverlays = this.overlayStore.getThreadListingOverlayStates
       ?? this.overlayStore.getThreadOverlayStates;
@@ -16479,7 +16734,7 @@ export class DesktopBackendRegistry {
     return this.liveSubAgentMonitorIds("codex", threadId).length > 0
       || this.threadLifecycleMutationCounts.has(identityKey)
       || this.threadHandoffReservations.has(identityKey)
-      || this.handoffTurnStarts.has(identityKey)
+      || this.threadStarts.hasPending({ backend: "codex", threadId })
       || this.codexBackgroundTerminals.has(threadId)
       || this.liveCodexToolItemsByThread.has(threadId)
       || this.codexRetryableOperations.has(threadId)
@@ -16547,9 +16802,247 @@ export class DesktopBackendRegistry {
     return () => { this.threadArchiveSweepStatusListeners.delete(listener); };
   }
 
+  /** Every non-archived thread as a housekeeping candidate. Complete
+   * provider reads without navigation projection or display persistence, so
+   * an idle sweep makes no SQLite commits. */
+  /** Every provider PwrAgent runs, for the hourly sweep and Thread
+   * maintenance alike. Claude threads come from PwrAgent's own session store,
+   * and one outside a PwrAgent worktree is kept by the shared keep rules. */
+  async listAutoArchiveCandidates(onProgress?: (progress: MaintenanceDiscoveryProgress) => void): Promise<ThreadArchiveCandidate[]> {
+    await this.subAgentStartupReconciliation;
+    if (this.closed || this.isBootstrapModeFn()) return [];
+    // Use complete provider reads without navigation projection or display
+    // persistence. An idle hourly sweep must make no SQLite commits.
+    onProgress?.({ detail: "Reading Codex threads and native children" });
+    const codexThreads: AppServerThreadSummary[] = [];
+    if (!this.isCodexBootstrapDeferredFn()) {
+      if (!this.codexClient.listArchiveCleanupThreadsPage) throw new Error("Complete Codex maintenance discovery is unavailable.");
+      for (const archived of [false, true]) {
+        const cursors = new Set<string>();
+        let cursor: string | undefined;
+        do {
+          const page = await this.codexClient.listArchiveCleanupThreadsPage({
+            archived, cursor, limit: 100, checkpoint: async () => {}, directoryFilter: async () => false,
+          });
+          codexThreads.push(...page.threads);
+          onProgress?.({ detail: "Reading Codex checkout owners, including archived threads and native children", found: codexThreads.length });
+          cursor = page.nextCursor?.trim();
+          if (cursor && cursors.has(cursor)) throw new Error("Codex maintenance discovery returned a repeated cursor.");
+          if (cursor) cursors.add(cursor);
+        } while (cursor);
+      }
+    }
+    // Read provider membership without navigation enrichment or its durable
+    // caches. A failed provider is an incomplete safety inventory, not zero
+    // checkout users. Include children regardless of their parent's machine.
+    const threads = [...codexThreads];
+    for (const backendId of await this.acpBackend.archiveCleanupBackendIds()) {
+      onProgress?.({ detail: `Reading ${backendId} threads`, found: threads.length });
+      for (const archived of [false, true]) {
+        let after: string | undefined;
+        do {
+          const page = this.acpBackend.listArchiveCleanupSessionsPage(backendId, { archived, after, limit: 100 });
+          threads.push(...page.sessions.map((session) => this.acpBackend.sessionToThreadSummary(session)));
+          if (page.nextCursor && after && page.nextCursor <= after) throw new Error("ACP maintenance discovery did not advance.");
+          after = page.nextCursor;
+        } while (after);
+      }
+    }
+    onProgress?.({ detail: "Reading Claude threads", found: threads.length });
+    threads.push(...await this.claudeBackend.listThreads({ archived: false }), ...await this.claudeBackend.listThreads({ archived: true }));
+    const workspaceObservations = new Map<string, Promise<LinkedDirectorySummary | undefined>>();
+    // One read for every thread a PR watch will wake.
+    const activePrWatches = await this.overlayStore.listAllActivePrStatusWatches();
+    const savedPrStatuses = activePrWatches.length ? await this.readMaintenancePrStatuses() : [];
+    const mergeHeldThreadKeys = this.readMergeHeldThreadKeys();
+    const candidates: ThreadArchiveCandidate[] = [];
+    // A failed read keeps only the threads it covers, never the whole list.
+    const unreadable = (error: unknown, backend: AppServerBackendKind, threadId?: string) => {
+      backendRegistryLog.warn("auto-archive candidate state read failed; the thread is kept", {
+        backend, threadId, error: error instanceof Error ? error.message : String(error),
+      });
+    };
+    for (const backend of new Set(threads.map((thread) => thread.source))) {
+      const backendThreads = [...new Map(threads.filter((thread) => thread.source === backend)
+        .map((thread) => [thread.id, thread])).values()];
+      let overlays: Record<string, ThreadOverlayState | undefined> | undefined;
+      try {
+        overlays = await this.overlayStore.getThreadOverlayStates({
+          backend, threadIds: backendThreads.map((thread) => thread.id),
+        });
+      } catch (error) { unreadable(error, backend); }
+      for (const thread of backendThreads) {
+        onProgress?.({ detail: `Resolving ${backend} checkout ownership`, found: candidates.length, root: thread.projectKey });
+        const watches = await this.maintenancePrWatches(activePrWatches.filter((watch) => watch.backend === backend && watch.threadId === thread.id),
+          overlays?.[thread.id], savedPrStatuses);
+        const activePrWatch = watches.length > 0;
+        const mergeHeld = mergeHeldThreadKeys.has(buildThreadIdentityKey(backend, thread.id));
+        if (!overlays) {
+          candidates.push({ thread, activePrWatch, activePrWatches: watches, mergeHeld, unreadable: true });
+          continue;
+        }
+        try {
+          const resolved = await this.maintenanceThreadWorkspace(thread, overlays[thread.id], workspaceObservations);
+          candidates.push({
+            thread: resolved, overlay: overlays[thread.id],
+            activeSubAgent: await this.hasArchiveActiveSubAgent(backend, thread.id),
+            activePrWatch,
+            activePrWatches: watches,
+            mergeHeld,
+          });
+        } catch (error) {
+          unreadable(error, backend, thread.id);
+          candidates.push({ thread, overlay: overlays[thread.id], activePrWatch, activePrWatches: watches, mergeHeld, unreadable: true });
+        }
+      }
+    }
+    // Ownership is a checkout-wide decision. Resolve the complete inventory
+    // before admitting any receipt, including external owners already archived.
+    const ownership = this.maintenanceOwnershipInventory(candidates);
+    const observations = new Map<string, Promise<boolean>>();
+    for (const candidate of candidates) {
+      if (candidate.unreadable) continue;
+      try {
+        candidate.managedWorktreePath = await this.managedMaintenanceCheckout(candidate.thread, ownership, observations);
+      } catch (error) {
+        candidate.unreadable = true;
+        unreadable(error, candidate.thread.source, candidate.thread.id);
+      }
+    }
+    return candidates;
+  }
+
+  private maintenanceOwnershipInventory(candidates: readonly ThreadArchiveCandidate[], current?: ThreadArchiveCandidate):
+    Pick<ArchiveCleanupMetadata, "activeThreads" | "archivedThreads"> {
+    const owners = new Map(candidates.map((candidate) => [buildThreadIdentityKey(candidate.thread.source, candidate.thread.id), candidate]));
+    if (current) owners.set(buildThreadIdentityKey(current.thread.source, current.thread.id), current);
+    const activeThreads: AppServerThreadSummary[] = [];
+    const archivedThreads: AppServerThreadSummary[] = [];
+    for (const candidate of owners.values()) {
+      const { thread, overlay } = candidate;
+      const linkedDirectories = withRetainedWorktrees(
+        mergeThreadLinkedDirectories([...thread.linkedDirectories, ...overlay?.extraLinkedDirectories ?? []]), overlay,
+      );
+      (isArchivedCheckoutCandidate(candidate) ? archivedThreads : activeThreads).push({ ...thread, linkedDirectories });
+    }
+    return { activeThreads, archivedThreads };
+  }
+
+  /** Provider cwd summaries are intentionally minimal. Resolve their current
+   * checkout from Git metadata on every maintenance read, independently of
+   * which threads navigation has previously opened. Never persists a cache. */
+  private async maintenanceThreadWorkspace(
+    thread: AppServerThreadSummary,
+    overlay: ThreadOverlayState | undefined,
+    observations = new Map<string, Promise<LinkedDirectorySummary | undefined>>(),
+  ): Promise<AppServerThreadSummary> {
+    const cwd = resolveThreadWorkspaceCwd(thread, overlay?.extraLinkedDirectories ?? []);
+    if (!cwd) return thread;
+    let observation = observations.get(cwd);
+    if (!observation) {
+      observation = this.acpWorktreeRepositoryResolver(cwd);
+      observations.set(cwd, observation);
+    }
+    const observed = await observation;
+    if (!observed) return thread;
+    // Git uses forward slashes on Windows; maintenance also receives native
+    // filesystem paths. Keep one spelling for review keys and coverage.
+    const directory = { ...observed, path: path.normalize(observed.path),
+      ...(observed.worktreePath ? { worktreePath: path.normalize(observed.worktreePath) } : {}) };
+    // Explicit external ownership wins over filesystem classification.
+    const external = [...thread.linkedDirectories, ...overlay?.extraLinkedDirectories ?? []]
+      .some((item) => item.worktreeOwnership === "external"
+        && [cwd, directory.worktreePath!].some((target) =>
+          normalizeWorktreePathForComparison(item.worktreePath ?? item.path) === normalizeWorktreePathForComparison(target)));
+    const resolvedPaths = new Set([cwd, directory.worktreePath!].map(normalizeWorktreePathForComparison));
+    return { ...thread, linkedDirectories: [
+      { ...directory, ...(external ? { worktreeOwnership: "external" as const } : {}) },
+      ...thread.linkedDirectories.filter((item) => !resolvedPaths.has(normalizeWorktreePathForComparison(item.worktreePath ?? item.path))),
+    ] };
+  }
+
+  private async isManagedMaintenanceCheckout(worktreePath: string): Promise<boolean> {
+    return await isInManagedWorktreeRoot(worktreePath, await this.managedMaintenanceRoots());
+  }
+
+  private async readMaintenancePrStatuses(): Promise<MaintenancePrObservation[] | null> {
+    try { return Object.values(await this.overlayStore.readPrStatusCache()); }
+    catch (error) {
+      backendRegistryLog.warn("maintenance PR observations unavailable; watches remain protective", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
+  private async maintenancePrWatches(
+    watches: ThreadPullRequestWatchSummary[],
+    overlay: ThreadOverlayState | undefined,
+    saved?: readonly MaintenancePrObservation[] | null,
+  ): Promise<ThreadPullRequestWatchSummary[]> {
+    if (!watches.length) return [];
+    const cached = saved === undefined ? await this.readMaintenancePrStatuses() : saved;
+    if (cached === null) return watches;
+    return protectiveMaintenanceWatches(watches, [
+      ...(overlay?.prs ?? []).map((pr) => ({ pr, fetchedAt: overlay?.prsFetchedAt ?? 0 })), ...cached,
+    ]);
+  }
+
+  /** The resolver above established a linked checkout and this thread's
+   * attachment. A legacy external flag cannot veto our canonical root;
+   * outside roots, only an explicit, still-valid registration can override it. */
+  private async managedMaintenanceCheckout(
+    thread: AppServerThreadSummary,
+    ownership?: Pick<ArchiveCleanupMetadata, "activeThreads" | "archivedThreads">,
+    observations = new Map<string, Promise<boolean>>(),
+  ): Promise<string | undefined> {
+    const directory = primaryThreadWorktree(thread);
+    if (!directory || directory.worktreeOwnership !== "external") return undefined;
+    let observation = observations.get(directory.worktreePath);
+    if (!observation) {
+      observation = ownership ? this.isManagedArchiveCheckout(ownership, directory.worktreePath)
+        : this.isManagedMaintenanceCheckout(directory.worktreePath);
+      observations.set(directory.worktreePath, observation);
+    }
+    return await observation ? directory.worktreePath : undefined;
+  }
+
+  /** Threads a Continue After wait holds from merging; auto-archive keeps them. */
+  private readMergeHeldThreadKeys(): Set<string> {
+    if (!isAppStateInitialized()) return new Set();
+    return new Set(createThreadDependencyStorage().active()
+      .filter((dependency) => dependency.holdMerge && (dependency.status === "waiting" || dependency.status === "ready"))
+      .map((dependency) => buildThreadIdentityKey(dependency.backend, dependency.threadId)));
+  }
+
+  /** The project a candidate counts toward: its main checkout. */
+  async resolveAutoArchiveProject({ thread, overlay }: ThreadArchiveCandidate): Promise<string | undefined> {
+    const directory = [...thread.linkedDirectories, ...overlay?.extraLinkedDirectories ?? []][0];
+    // Scratch projects share one quota per projects root, matching their
+    // single Workspaces row. Each would otherwise be its own project and
+    // never reach the per-project limit.
+    const descriptor = directory ? classifyDirectory(directory) : undefined;
+    if (descriptor?.kind === "workspace") return descriptor.key;
+    const cwd = directory?.worktreePath ?? directory?.path;
+    if (!cwd) return thread.projectKey;
+    try {
+      // Constant output per checkout. Listing every worktree made one scan
+      // quadratic in a repository's worktree count. Git's primary checkout is
+      // the common directory without its trailing /.git, or the common
+      // directory itself for a bare or separate Git dir.
+      const { stdout } = await runGitCommand(cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"], { timeout: 10_000 });
+      const commonDirectory = stdout.trim();
+      if (!commonDirectory) return directory?.path ?? thread.projectKey;
+      return path.basename(commonDirectory) === ".git" ? path.dirname(commonDirectory) : commonDirectory;
+    } catch {
+      // The managed checkout may already be gone; its linked repository
+      // still identifies the project without making each old worktree a quota.
+      return directory?.path ?? thread.projectKey;
+    }
+  }
+
   private getThreadArchiveSweeper(): ThreadArchiveSweeper {
     return this.threadArchiveSweeper ??= new ThreadArchiveSweeper({
-      getPolicy: () => this.readThreadArchivePolicy(),
       cleanupWorktrees: async ({ manual, onProgress, onFailure }) => {
         const publishProgress = (completed: number, report: ArchivedWorktreeRepairReport) => onProgress({
           candidates: report.candidates.length, protected: report.protectedWorktrees,
@@ -16558,6 +17051,7 @@ export class DesktopBackendRegistry {
           emptyContainers: report.emptyContainerCandidates.length,
           processedContainers: Math.max(0, completed - report.candidates.length),
           removedContainers: report.containerCleanup.filter((item) => item.removed).length,
+          kept: archivedWorktreeKeptReasons(report),
         });
         const repair = async () => await this.repairArchivedThreadWorktrees({
           onProgress: (completed, _total, report) => {
@@ -16565,71 +17059,25 @@ export class DesktopBackendRegistry {
           },
         });
         const report = isAppStateInitialized()
-          ? await runOneTimeArchivedWorktreeRepair({ db: getAppStateDb().raw, repair, force: manual })
+          ? await runOneTimeArchivedWorktreeRepair({ repair, force: manual })
           : manual ? await repair() : undefined;
         if (!report) return;
         publishProgress(report.candidates.length + report.emptyContainerCandidates.length, report);
         for (const item of [...report.cleanup, ...report.containerCleanup]) {
-          if (item.error) onFailure(new Error(item.error));
+          if (item.error) onFailure(new Error(item.error), { path: item.worktreePath });
         }
       },
       cleanupRetention: async (onFailure) => await this.sweepArchivedThreadRetention(onFailure),
-      resolveProject: async ({ thread, overlay }) => {
-        const directory = [...thread.linkedDirectories, ...overlay?.extraLinkedDirectories ?? []][0];
-        // Scratch projects share one quota per projects root, matching their
-        // single Workspaces row. Each would otherwise be its own project and
-        // never reach the per-project limit.
-        const descriptor = directory ? classifyDirectory(directory) : undefined;
-        if (descriptor?.kind === "workspace") return descriptor.key;
-        const cwd = directory?.worktreePath ?? directory?.path;
-        if (!cwd) return thread.projectKey;
-        try {
-          const { stdout } = await runGitCommand(cwd, ["worktree", "list", "--porcelain"], { timeout: 10_000 });
-          return stdout.split("\n").find((line) => line.startsWith("worktree "))?.slice(9);
-        } catch {
-          // The managed checkout may already be gone; its linked repository
-          // still identifies the project without making each old worktree a quota.
-          return directory?.path ?? thread.projectKey;
-        }
+      listCandidates: async () => await this.listAutoArchiveCandidates(),
+      hibernation: {
+        getPolicy: () => this.readCheckoutHibernationPolicy(),
+        keepReason: (candidate, candidates, policy, now) => this.checkoutHibernationKeepReason(candidate, candidates, policy, now),
+        inspectWorkspace: async (worktreePath, policy, signal) => (await inspectHibernationWorkspace(worktreePath, {
+          signal, limitBytes: policy.maxSnapshotMb * 1024 * 1024, removeRebuildableOutput: policy.removeRebuildableOutput,
+        })).keep,
+        hibernate: async (candidate, policy) => await this.hibernateIdleCheckout(candidate, policy),
       },
-      listCandidates: async () => {
-        await this.subAgentStartupReconciliation;
-        if (this.closed || this.isBootstrapModeFn()) return [];
-        // Use complete provider reads without navigation projection or display
-        // persistence. An idle hourly sweep must make no SQLite commits.
-        const codexThreads = this.isCodexBootstrapDeferredFn() || !this.codexClient.listNativeSubAgentThreads ? [] : (await Promise.all([
-          this.codexClient.listThreads({
-            archived: false, enrichDirectories: false, skipArchivedMetadataRefresh: true, requireComplete: true,
-          }, { callerReason: "auto-archive" }),
-          this.codexClient.listNativeSubAgentThreads?.({ all: true }, { callerReason: "auto-archive" }) ?? [],
-        ])).flat();
-        const threads = [...codexThreads, ...await this.listAllInstalledAcpThreads(undefined, false)];
-        // One read for every thread a PR watch will wake.
-        const watchedThreadKeys = new Set(
-          (await this.overlayStore.listAllActivePrStatusWatches()).map((watch) =>
-            buildThreadIdentityKey(watch.backend, watch.threadId)),
-        );
-        const candidates: ThreadArchiveCandidate[] = [];
-        for (const backend of new Set(threads.map((thread) => thread.source))) {
-          const backendThreads = threads.filter((thread) => thread.source === backend);
-          const overlays = await this.overlayStore.getThreadOverlayStates({
-            backend, threadIds: backendThreads.map((thread) => thread.id),
-          });
-          for (const thread of backendThreads) {
-            candidates.push({
-              thread, overlay: overlays[thread.id],
-              activeSubAgent: await this.hasArchiveActiveSubAgent(backend, thread.id),
-              activePrWatch: watchedThreadKeys.has(buildThreadIdentityKey(backend, thread.id)),
-            });
-          }
-        }
-        return candidates;
-      },
-      refreshCandidate: async (candidate) => await this.refreshAutoArchiveCandidate(candidate),
-      isBusy: (candidate) => this.autoArchiveCandidateIsBusy(candidate),
-      canArchive: async (candidates) => await this.autoArchiveCandidatesAreEligible(candidates),
-      archive: async (_candidate, family) => await this.archiveInactiveThreadFamily(family),
-      onError: (error, threadId) => backendRegistryLog.warn("inactive thread archive sweep failed", {
+      onError: (error, threadId) => backendRegistryLog.warn("hourly thread sweep failed", {
         threadId, error: error instanceof Error ? error.message : String(error),
       }),
       onStatus: (status) => {
@@ -16649,6 +17097,7 @@ export class DesktopBackendRegistry {
         this.codexClient.listThreads({ archived, enrichDirectories: false, skipArchivedMetadataRefresh: true, requireComplete: true }, { callerReason: "auto-archive" }),
         this.codexClient.listNativeSubAgentThreads!({ all: true, archived }, { callerReason: "auto-archive" }),
         this.listAllInstalledAcpThreads(undefined, archived),
+        this.claudeBackend.listThreads({ archived, requireComplete: true }),
       ]);
       return lists.flat().map((thread) => ({ ...thread, archivedAt: archived ? thread.archivedAt ?? 1 : undefined }));
     }));
@@ -16665,9 +17114,14 @@ export class DesktopBackendRegistry {
       listThreads: async () => await this.listThreadsForArchiveRetention(),
       listStates: async () => await this.overlayStore.listThreadArchiveStates!(),
       shouldStop: () => this.closed || this.stoppingRunningTurnsForShutdown,
-      observeArchives: async (threads, now) => await this.overlayStore.observeArchivedThreads!(
+      observeArchives: async (threads, now) => await this.observeArchivedThreads(
         threads.map((thread) => ({ backend: thread.source, threadId: thread.id })), now),
       confirmAbsent: async (state) => {
+        if (state.backend === "claude") {
+          const absent = await this.claudeBackend.confirmThreadAbsent(state.threadId);
+          if (absent) await deleteThreadAssets(state);
+          return absent;
+        }
         if (isAcpBackendId(state.backend)) {
           const absent = !this.acpBackend.getSession(state.backend, state.threadId);
           if (absent) await deleteThreadAssets(state);
@@ -16730,7 +17184,7 @@ export class DesktopBackendRegistry {
           await deleteThreadAssets({ backend: thread.source, threadId: thread.id });
         }
         this.invalidateThreadListCache(root.source);
-        for (const thread of family) this.invalidateArchiveCleanupReads(thread.source, undefined, true, thread.id);
+        for (const thread of family) this.invalidateArchiveCleanupReads(thread.source, undefined, true, thread.id, [], "deleted");
       };
       if (isAcpBackendId(root.source)) {
         const backend = root.source;
@@ -16738,6 +17192,8 @@ export class DesktopBackendRegistry {
           this.acpBackend.deleteStoredSession(backend, threadId);
           await this.emit({ backend, notification: { method: "thread/deleted", params: { threadId } } });
         });
+      } else if (root.source === "claude") {
+        await run(async (threadId) => await this.claudeBackend.deleteThread(threadId));
       } else {
         await this.withCodexThreadClient(root.id, async (client) => {
           if (!client.deleteThread) throw new Error("This provider does not support permanent thread deletion.");
@@ -16747,23 +17203,6 @@ export class DesktopBackendRegistry {
     };
     try { await withLocks(0); }
     finally { for (const key of keys) this.automaticArchiveReservations.delete(key); }
-  }
-
-  private async autoArchiveCandidatesAreEligible(candidates: ThreadArchiveCandidate[]): Promise<boolean> {
-    for (const candidate of candidates) {
-      const current = await this.refreshAutoArchiveCandidate(candidate);
-      if (!isStaleArchiveCandidate(current, Date.now(), this.readThreadArchivePolicy()) || this.autoArchiveCandidateIsBusy(current)) return false;
-      if (this.readThreadArchivePolicy().mode === "count"
-        && archiveCandidateLastActivity(current) > archiveCandidateLastActivity(candidate)) return false;
-      const paths = (item: ThreadArchiveCandidate) => JSON.stringify(
-        [...item.thread.linkedDirectories, ...item.overlay?.extraLinkedDirectories ?? []]
-          .map((directory) => directory.worktreePath ?? directory.path).sort(),
-      );
-      // A moved workspace has not passed the Git probes from this sweep.
-      if (paths(current) !== paths(candidate)) return false;
-    }
-    return !this.closed && !this.stoppingRunningTurnsForShutdown
-      && candidates.every((candidate) => !this.autoArchiveCandidateIsBusy(candidate));
   }
 
   private cancelAutomaticArchive(backend: AppServerBackendKind, threadId: string): void {
@@ -16834,67 +17273,402 @@ export class DesktopBackendRegistry {
     }
   }
 
-  /** Resolves false when the archive was cancelled before its mutation. */
-  private async archiveInactiveThreadFamily(candidates: ThreadArchiveCandidate[]): Promise<boolean> {
-    const policy = JSON.stringify(this.readThreadArchivePolicy());
-    const reservation = { cancelled: false };
-    const keys = candidates.map(({ thread }) => buildThreadIdentityKey(thread.source, thread.id)).sort();
-    for (const key of keys) this.automaticArchiveReservations.set(key, reservation);
-    const beforeMutation = async () => {
-      if (reservation.cancelled || !await this.autoArchiveCandidatesAreEligible(candidates)
-        || reservation.cancelled || JSON.stringify(this.readThreadArchivePolicy()) !== policy) throw new AutomaticArchiveCancelledError();
-      // The awaited admission result itself yields. Check the reservation
-      // again synchronously at the call site that sends the mutation.
-      return () => {
-        if (reservation.cancelled || JSON.stringify(this.readThreadArchivePolicy()) !== policy
-          || candidates.some((candidate) => this.autoArchiveCandidateIsBusy(candidate))) {
-          throw new AutomaticArchiveCancelledError();
-        }
-      };
+  private checkoutHibernationContext(
+    candidate: ThreadArchiveCandidate,
+    candidates: readonly ThreadArchiveCandidate[],
+  ): HibernationContext {
+    const runtime = candidate.overlay?.codexEnvironmentRuntime ?? candidate.thread.codexEnvironmentRuntime;
+    const target = hibernationTarget(candidate);
+    return {
+      busy: this.autoArchiveCandidateIsBusy(candidate)
+        || runtime?.actionStatus === "started"
+        || runtime?.actionRuns?.some((run) => run.status === "started") === true,
+      sharedPath: "keep" in target ? false : otherThreadsUsingPath(candidate, target.worktreePath, candidates) > 0,
     };
-    const withFamilyLocks = async (index: number): Promise<void> => {
-      if (index < keys.length) {
-        return await this.threadLifecycleLocks.run(keys[index]!, async () => await withFamilyLocks(index + 1));
-      }
-      const { thread } = candidates[0]!;
-      backendRegistryLog.info("thread archive requested", {
-        backend: thread.source, threadId: thread.id, runtimeInstanceId: this.runtimeInstanceId, requestedAt: Date.now(), automatic: true,
-      });
-      await this.archiveThreadWithoutLifecycleLock({ backend: thread.source, threadId: thread.id }, beforeMutation);
-    };
+  }
+
+  /**
+   * Hibernates one idle thread's checkout: snapshot, re-check, remove, then
+   * one SQLite commit for the snapshot record. Housekeeping order matches
+   * automatic archive: the reservation (which any operator action on the
+   * thread cancels), then its lifecycle lock, then the workspace write.
+   * Resolves true when hibernated, false when cancelled, or a keep reason.
+   */
+  private async hibernateIdleCheckout(
+    candidate: ThreadArchiveCandidate,
+    policy: DesktopCheckoutHibernationPolicy,
+    options: { reviewed?: boolean } = {},
+  ): Promise<boolean | string> {
+    const target = hibernationTarget(candidate);
+    if ("keep" in target) return target.keep;
+    const { source: backend, id: threadId } = candidate.thread;
+    const key = buildThreadIdentityKey(backend, threadId);
+    if (this.automaticArchiveReservations.has(key)) return false;
+    const reservation = { cancelled: false, worktreePath: target.worktreePath };
+    this.automaticArchiveReservations.set(key, reservation);
+    const policyKey = JSON.stringify(policy);
+    const paths = (item: ThreadArchiveCandidate) => JSON.stringify(
+      [...item.thread.linkedDirectories, ...item.overlay?.extraLinkedDirectories ?? []]
+        .map((directory) => directory.worktreePath ?? directory.path).sort());
     try {
-      await withFamilyLocks(0);
-      return true;
-    } catch (error) {
-      if (!(error instanceof AutomaticArchiveCancelledError)) throw error;
-      return false;
+      return await this.threadLifecycleLocks.run(key, async () => {
+        if (reservation.cancelled) return false;
+        let snapshot: WorktreeSnapshotSummary;
+        // The last probe before removal. The tree check below proves the
+        // snapshot holds exactly these files.
+        let saved: Extract<Awaited<ReturnType<typeof inspectHibernationWorkspace>>, { keep?: undefined }> | undefined;
+        try {
+          snapshot = await this.withArchiveWorkspaceWrite([target.worktreePath], async () => await this.worktreeArchiveService.hibernate({
+            backend, threadId,
+            worktreePath: target.worktreePath,
+            repositoryPath: target.repositoryPath,
+            capSnapshotBytes: policy.maxSnapshotMb * 1024 * 1024,
+            beforeRemove: async () => {
+              // Checks 1 to 5 again, against fresh thread state.
+              const current = await this.refreshAutoArchiveCandidate(candidate, { deferOwnership: true });
+              const all = await this.listAutoArchiveCandidates();
+              current.managedWorktreePath = await this.managedMaintenanceCheckout(current.thread, this.maintenanceOwnershipInventory(all, current));
+              const assertCurrent = () => {
+                // A reviewed run uses the policy it was reviewed under, so a
+                // change to Settings does not cancel it; the sweep's does.
+                if (reservation.cancelled || this.closed
+                  || (!options.reviewed && JSON.stringify(this.readCheckoutHibernationPolicy()) !== policyKey)) {
+                  throw new AutomaticArchiveCancelledError();
+                }
+                const reason = hibernationKeepReason(current, Date.now(), policy, this.checkoutHibernationContext(current, all));
+                if (reason) throw new CheckoutHibernationKeptError(reason);
+                if (checkoutHibernationLastActivity(current) > checkoutHibernationLastActivity(candidate)) {
+                  throw new CheckoutHibernationKeptError(HIBERNATION_KEEP_REASONS.recentlyActive);
+                }
+                if (paths(current) !== paths(candidate)) throw new CheckoutHibernationKeptError("Workspace moved");
+                // Never close an operator's terminal to hibernate.
+                if (hasWorktreeTerminalsOpenIn(target.worktreePath)) throw new CheckoutHibernationKeptError("Terminal open");
+              };
+              assertCurrent();
+              const workspace = await inspectHibernationWorkspace(target.worktreePath, {
+                signal: new AbortController().signal,
+                limitBytes: policy.maxSnapshotMb * 1024 * 1024,
+                removeRebuildableOutput: policy.removeRebuildableOutput,
+              });
+              if (workspace.keep !== undefined) throw new CheckoutHibernationKeptError(workspace.keep);
+              saved = workspace;
+              assertCurrent();
+              return assertCurrent;
+            },
+          }));
+        } catch (error) {
+          if (error instanceof AutomaticArchiveCancelledError) return false;
+          if (error instanceof CheckoutHibernationKeptError) return error.reason;
+          if (error instanceof SnapshotTreeMismatchError) return "Changed while saving";
+          if (error instanceof MissingArchiveWorktreeError) return HIBERNATION_WORKSPACE_KEEP_REASONS.missing;
+          if (error instanceof MissingArchiveRepositoryError) return "Repository missing";
+          if (error instanceof Error && /^Snapshot (size|file) limit exceeded/.test(error.message)) {
+            return HIBERNATION_WORKSPACE_KEEP_REASONS.overLimit;
+          }
+          throw error;
+        }
+        if (saved) {
+          snapshot = { ...snapshot, changedFileCount: saved.files, changedBytes: saved.bytes,
+            ...(saved.removedOutput ? { removedOutput: saved.removedOutput } : {}) };
+        }
+        // The one commit a hibernation makes. Recorded even if the operator
+        // acted meanwhile: the checkout is gone and this is its only record.
+        await this.overlayStore.upsertWorktreeSnapshot({ backend, threadId, snapshot });
+        this.checkoutRestoreFailures.delete(key);
+        this.undeliveredCheckoutRestoreFailures.delete(key);
+        backendRegistryLog.info("idle checkout hibernated", {
+          backend, threadId, worktreePath: snapshot.worktreePath, snapshotRef: snapshot.snapshotRef,
+        });
+        await this.publishCheckoutHibernation({ backend, threadId }, {
+          workspace: describeHibernatedThreadWorkspace({ linkedDirectories: [target.directory], worktreeSnapshots: [snapshot],
+            codexEnvironmentRuntime: candidate.overlay?.codexEnvironmentRuntime ?? candidate.thread.codexEnvironmentRuntime }) ?? null,
+        });
+        this.invalidateThreadListCache(backend, true, threadId);
+        this.threadInfoStore.invalidateSummaries({ backend, threadId });
+        await this.publishLocalEvent({ backend, notification: {
+          method: "navigation/threadDirectories/updated",
+          params: { reason: "selected-thread", threadIds: [threadId] },
+        } });
+        return true;
+      });
     } finally {
-      for (const key of keys) this.automaticArchiveReservations.delete(key);
+      if (this.automaticArchiveReservations.get(key) === reservation) this.automaticArchiveReservations.delete(key);
     }
   }
 
-  private async refreshAutoArchiveCandidate(candidate: ThreadArchiveCandidate): Promise<ThreadArchiveCandidate> {
+  /** Tells every surface what the thread card should show now: its
+   * checkout (null once awake), Keep it awake, or both. */
+  private async publishCheckoutHibernation(
+    identity: { backend: AppServerBackendKind; threadId: string },
+    change: { workspace?: ThreadHibernatedWorkspace | null; keepAwake?: boolean },
+  ): Promise<void> {
+    await this.emit({ backend: identity.backend, notification: {
+      method: "thread/checkoutHibernation/updated",
+      params: { threadId: identity.threadId, ...change },
+    } });
+  }
+
+  /** Ends a restore that did not finish: the card goes back to the
+   * hibernated checkout it still is. */
+  private async endUnfinishedCheckoutRestore(identity: { backend: AppServerBackendKind; threadId: string }): Promise<void> {
+    const key = buildThreadIdentityKey(identity.backend, identity.threadId);
+    const progress = this.checkoutRestoreProgress.get(key);
+    if (!progress) return;
+    this.checkoutRestoreProgress.delete(key);
+    const { restoring: _restoring, restorePhase: _phase, ...hibernated } = progress;
+    await this.publishCheckoutHibernation(identity, { workspace: hibernated });
+  }
+
+  /** The detail read's view of a hibernated checkout, or undefined. A failed
+   * restore shows the missing-worktree card instead. */
+  readCheckoutHibernation(identity: { backend: AppServerBackendKind; threadId: string }): {
+    restoring: boolean;
+    /** The running restore, while it lasts: kept after the snapshot record
+     * reads restored, so the card stays through project setup. */
+    progress?: ThreadHibernatedWorkspace;
+    restoreFailure?: { worktreePath: string; message: string };
+  } {
+    const key = buildThreadIdentityKey(identity.backend, identity.threadId);
+    const progress = this.checkoutRestoreProgress.get(key);
+    return {
+      restoring: this.checkoutRestores.has(key),
+      ...(progress ? { progress } : {}),
+      ...(this.checkoutRestoreFailures.has(key) ? { restoreFailure: this.checkoutRestoreFailures.get(key) } : {}),
+    };
+  }
+
+  /**
+   * Starts restoring a hibernated checkout without waiting for it, so a send
+   * made now queues behind the restore and starts when it ends. Resolves
+   * whether a restore is running.
+   */
+  async wakeHibernatedCheckout(identity: { backend: AppServerBackendKind; threadId: string }): Promise<boolean> {
+    const key = buildThreadIdentityKey(identity.backend, identity.threadId);
+    if (this.checkoutRestores.has(key)) return true;
+    const overlay = await this.overlayStore.getThreadOverlayState(identity);
+    if (!overlay?.worktreeSnapshots?.some((snapshot) => snapshot.state === "hibernated")) return false;
+    // A fresh request: the operator asked again, so a failure is retried.
+    this.undeliveredCheckoutRestoreFailures.delete(key);
+    void this.restoreHibernatedCheckout(identity).catch(() => {});
+    return this.checkoutRestores.has(key);
+  }
+
+  /**
+   * Restore now, Keep it awake, and the thread menu's toggle. Keeping a
+   * thread awake also restores a hibernated checkout. The exemption is one
+   * commit when it changes; the restore costs what a send's restore does.
+   */
+  async setThreadCheckoutHibernation(request: {
+    backend: AppServerBackendKind;
+    threadId: string;
+    restore?: boolean;
+    keepAwake?: boolean;
+  }): Promise<SetThreadCheckoutHibernationResponse> {
+    const identity = { backend: request.backend, threadId: request.threadId };
+    const key = buildThreadIdentityKey(identity.backend, identity.threadId);
+    let overlay = await this.overlayStore.getThreadOverlayState(identity);
+    let keepAwake = overlay?.keepCheckoutAwake === true;
+    if (request.keepAwake !== undefined && request.keepAwake !== keepAwake) {
+      overlay = await this.overlayStore.setThreadKeepCheckoutAwake({ ...identity, keepAwake: request.keepAwake });
+      keepAwake = request.keepAwake;
+      this.invalidateThreadListCache(identity.backend, true, identity.threadId);
+      await this.publishCheckoutHibernation(identity, { keepAwake });
+    }
+    const isHibernated = (state: ThreadOverlayState | undefined) =>
+      state?.worktreeSnapshots?.some((snapshot) => snapshot.state === "hibernated") === true;
+    let restoreError: string | undefined;
+    if ((request.restore === true || request.keepAwake === true) && isHibernated(overlay)) {
+      // The operator asked: a failure recorded earlier is retried.
+      this.undeliveredCheckoutRestoreFailures.delete(key);
+      try {
+        await this.restoreHibernatedCheckout(identity);
+      } catch (error) {
+        restoreError = error instanceof Error ? error.message : String(error);
+      }
+    }
+    return {
+      backend: identity.backend,
+      threadId: identity.threadId,
+      keepAwake,
+      hibernated: isHibernated(await this.overlayStore.getThreadOverlayState(identity)),
+      ...(restoreError ? { restoreError } : {}),
+    };
+  }
+
+  /** Restore on open, when the policy says so. */
+  async wakeHibernatedCheckoutOnOpen(identity: { backend: AppServerBackendKind; threadId: string }): Promise<boolean> {
+    if (this.readCheckoutHibernationPolicy().restoreOn !== "open") return false;
+    const key = buildThreadIdentityKey(identity.backend, identity.threadId);
+    // Opening again does not retry a failed restore; sending does.
+    if (this.checkoutRestoreFailures.has(key)) return false;
+    return await this.wakeHibernatedCheckout(identity);
+  }
+
+  /**
+   * Every turn start passes here. A hibernated checkout is put back first;
+   * concurrent callers share that restore. A failure the queue has not yet
+   * reported is reported once, without another attempt, so a held message
+   * carries the reason until the operator retries it.
+   */
+  private async ensureCheckoutAwake(identity: { backend: AppServerBackendKind; threadId: string }): Promise<void> {
+    const key = buildThreadIdentityKey(identity.backend, identity.threadId);
+    const running = this.checkoutRestores.get(key);
+    if (running) {
+      await running;
+      return;
+    }
+    const failure = this.checkoutRestoreFailures.get(key);
+    if (failure && this.undeliveredCheckoutRestoreFailures.delete(key)) throw new Error(failure.message);
+    const overlay = await this.overlayStore.getThreadOverlayState(identity);
+    if (!overlay?.worktreeSnapshots?.some((snapshot) => snapshot.state === "hibernated")) return;
+    await this.restoreHibernatedCheckout(identity);
+  }
+
+  private restoreHibernatedCheckout(identity: { backend: AppServerBackendKind; threadId: string }): Promise<void> {
+    const key = buildThreadIdentityKey(identity.backend, identity.threadId);
+    const existing = this.checkoutRestores.get(key);
+    if (existing) return existing;
+    const restore = this.withThreadLifecycleMutation(identity, async () => await this.restoreHibernatedCheckoutNow(identity))
+      .finally(async () => {
+        // A restore that threw before it finished still ends on every surface.
+        await this.endUnfinishedCheckoutRestore(identity).catch(() => {});
+        this.checkoutRestores.delete(key);
+        // A message that queued behind the restore starts now, or is held
+        // with the restore's refusal.
+        this.threadTurnQueue.scheduleThreadDrain(identity);
+      });
+    this.checkoutRestores.set(key, restore);
+    return restore;
+  }
+
+  /** At most two commits: the snapshot record, and the environment runtime
+   * when setup ran. A refusal writes nothing. */
+  private async restoreHibernatedCheckoutNow(identity: { backend: AppServerBackendKind; threadId: string }): Promise<void> {
+    const key = buildThreadIdentityKey(identity.backend, identity.threadId);
+    const overlay = await this.overlayStore.getThreadOverlayState(identity);
+    const thread = this.getCachedThreadSummary(identity);
+    const primary = thread ? primaryThreadWorktree(thread) : undefined;
+    const hibernated = (overlay?.worktreeSnapshots ?? []).filter((snapshot) => snapshot.state === "hibernated");
+    const snapshot = (primary ? hibernated.find((candidate) => path.resolve(candidate.worktreePath) === path.resolve(primary.worktreePath)) : undefined)
+      ?? hibernated[0];
+    if (!snapshot) return;
+    const progress: ThreadHibernatedWorkspace = {
+      ...describeHibernatedThreadWorkspace({ linkedDirectories: [{ id: "restore", kind: "worktree", label: "",
+        path: snapshot.repositoryPath, worktreePath: snapshot.worktreePath }], worktreeSnapshots: [snapshot],
+        codexEnvironmentRuntime: overlay?.codexEnvironmentRuntime })!,
+      restoring: true,
+      restorePhase: "checkout",
+    };
+    this.checkoutRestoreProgress.set(key, progress);
+    await this.publishCheckoutHibernation(identity, { workspace: progress });
+    const fail = async (message: string): Promise<never> => {
+      this.checkoutRestoreFailures.set(key, { worktreePath: snapshot.worktreePath, message });
+      this.undeliveredCheckoutRestoreFailures.add(key);
+      backendRegistryLog.warn("hibernated checkout restore failed", { ...identity, worktreePath: snapshot.worktreePath, error: message });
+      // Still hibernated until the next detail read, where the
+      // missing-worktree card takes over with the refusal.
+      await this.endUnfinishedCheckoutRestore(identity);
+      await this.publishLocalEvent({ backend: identity.backend, notification: {
+        method: "navigation/threadDirectories/updated",
+        params: { reason: "selected-thread", threadIds: [identity.threadId] },
+      } });
+      throw new Error(message);
+    };
+    const result = await this.withArchiveWorkspaceWrite([snapshot.worktreePath], async () => await this.worktreeRecoveryService.recreate({
+      ...identity,
+      repositoryPath: snapshot.repositoryPath,
+      worktreePath: snapshot.worktreePath,
+      branch: snapshot.sourceBranch,
+      detached: !snapshot.sourceBranch,
+      checkpoint: { snapshotRef: snapshot.snapshotRef, snapshotCommit: snapshot.snapshotCommit },
+      expectedHead: snapshot.sourceHead,
+    }));
+    if (result.status === "failed") return await fail(result.message);
+    if (result.checkpoint && !result.checkpoint.restored) {
+      // The checkout came back without its changes. Remove it again so the
+      // snapshot stays the only copy and the next attempt starts clean.
+      await runGitCommand(snapshot.repositoryPath, ["worktree", "remove", "--force", snapshot.worktreePath]).catch(() => {});
+      return await fail("The saved changes did not apply to the restored checkout. They are kept in its snapshot.");
+    }
+    const restoredAt = Date.now();
+    await this.overlayStore.upsertWorktreeSnapshot({ ...identity, snapshot: { ...snapshot, state: "restored", restoredAt } });
+    this.checkoutRestoreFailures.delete(key);
+    this.undeliveredCheckoutRestoreFailures.delete(key);
+    backendRegistryLog.info("hibernated checkout restored", { ...identity, worktreePath: snapshot.worktreePath });
+    await this.rerunEnvironmentSetupAfterRestore(identity, overlay?.codexEnvironmentRuntime, snapshot.worktreePath, async () => {
+      const setup = { ...progress, restorePhase: "setup" as const };
+      this.checkoutRestoreProgress.set(key, setup);
+      await this.publishCheckoutHibernation(identity, { workspace: setup });
+    });
+    this.checkoutRestoreProgress.delete(key);
+    await this.publishCheckoutHibernation(identity, { workspace: null });
+    this.invalidateThreadListCache(identity.backend, true, identity.threadId);
+    this.threadInfoStore.invalidateSummaries(identity);
+    await this.publishLocalEvent({ backend: identity.backend, notification: {
+      method: "navigation/threadDirectories/updated",
+      params: { reason: "selected-thread", threadIds: [identity.threadId] },
+    } });
+  }
+
+  /** A restored checkout has no rebuildable output, so a project
+   * environment with a setup script runs it again. A setup failure is
+   * recorded on the runtime; the checkout and the send go ahead. */
+  private async rerunEnvironmentSetupAfterRestore(
+    identity: { backend: AppServerBackendKind; threadId: string },
+    sourceRuntime: CodexThreadEnvironmentRuntime | undefined,
+    cwd: string,
+    onSetupStart?: () => Promise<void>,
+  ): Promise<void> {
+    if (!sourceRuntime?.environmentId || sourceRuntime.executionTarget !== "local") return;
+    const environment = (await listCodexEnvironmentOptions(cwd).catch(() => []))
+      .find((candidate) => candidate.id === sourceRuntime.environmentId);
+    if (!environment?.setupScript) return;
+    await onSetupStart?.();
+    let runtime: CodexThreadEnvironmentRuntime | undefined;
+    try {
+      runtime = await this.buildForkedCodexEnvironmentRuntime({ cwd, forceSetup: true, sourceRuntime, workMode: "worktree" });
+    } catch (error) {
+      if (!(error instanceof CodexEnvironmentStartupError)) throw error;
+      runtime = error.runtime;
+      backendRegistryLog.warn("environment setup failed after checkout restore", { ...identity, error: error.message });
+    }
+    if (runtime) await this.overlayStore.setThreadCodexEnvironmentRuntime?.({ ...identity, codexEnvironmentRuntime: runtime });
+  }
+
+  private async refreshAutoArchiveCandidate(candidate: ThreadArchiveCandidate, options: { deferOwnership?: boolean } = {}): Promise<ThreadArchiveCandidate> {
     const { source: backend, id: threadId } = candidate.thread;
     const thread = isAcpBackendId(backend)
       ? (() => {
           const session = this.acpBackend.getSession(backend, threadId);
           return session ? this.acpBackend.sessionToThreadSummary(session) : undefined;
         })()
-      : await this.withCodexThreadClient(threadId, async (client) => {
-          if (!client.readThreadSummary) throw new Error("Thread metadata reads are unavailable.");
-          return await client.readThreadSummary(threadId);
-        });
+      : backend === "claude"
+        ? await this.claudeBackend.readThreadSummary(threadId)
+        : await this.withCodexThreadClient(threadId, async (client) => {
+            if (!client.readThreadSummary) throw new Error("Thread metadata reads are unavailable.");
+            return await client.readThreadSummary(threadId);
+          });
     if (!thread) throw new Error(`Thread metadata was not found: ${threadId}`);
-    return {
+    const overlay = await this.overlayStore.getThreadOverlayState({ backend, threadId });
+    const resolved = await this.maintenanceThreadWorkspace(thread, overlay);
+    const watches = await this.maintenancePrWatches(await this.overlayStore.listActiveThreadPrStatusWatches({ backend, threadId }), overlay);
+    const refreshed: ThreadArchiveCandidate = {
       thread: {
         ...candidate.thread,
-        ...thread,
-        linkedDirectories: thread.linkedDirectories.length > 0 ? thread.linkedDirectories : candidate.thread.linkedDirectories,
+        ...resolved,
       },
-      overlay: await this.overlayStore.getThreadOverlayState({ backend, threadId }),
+      overlay,
+      managedWorktreePath: await this.managedMaintenanceCheckout(resolved),
       activeSubAgent: await this.hasArchiveActiveSubAgent(backend, threadId),
-      activePrWatch: (await this.overlayStore.listActiveThreadPrStatusWatches({ backend, threadId })).length > 0,
+      activePrWatch: watches.length > 0,
+      activePrWatches: watches,
+      mergeHeld: this.readMergeHeldThreadKeys().has(buildThreadIdentityKey(backend, threadId)),
     };
+    if (!options.deferOwnership && !refreshed.managedWorktreePath && primaryThreadWorktree(resolved)?.worktreeOwnership === "external") {
+      const all = await this.listAutoArchiveCandidates();
+      refreshed.managedWorktreePath = await this.managedMaintenanceCheckout(resolved, this.maintenanceOwnershipInventory(all, refreshed));
+    }
+    return refreshed;
   }
 
   /** One partial-index read; finished cards, including every gate card, are not scanned. */
@@ -16903,23 +17677,61 @@ export class DesktopBackendRegistry {
     return active.some((agent) => ARCHIVE_ACTIVE_SUB_AGENT_STATUSES.includes(agent.status));
   }
 
-  private autoArchiveCandidateIsBusy({ thread }: ThreadArchiveCandidate): boolean {
+  private autoArchiveCandidateIsBusy(candidate: ThreadArchiveCandidate): boolean {
+    const { thread } = candidate;
     const identity = { backend: thread.source, threadId: thread.id };
     const info = this.threadInfoStore.get(identity);
     return this.closed || this.stoppingRunningTurnsForShutdown
       || this.threadLifecycleMutationCounts.has(buildThreadIdentityKey(thread.source, thread.id))
       || this.threadHandoffReservations.has(buildThreadIdentityKey(thread.source, thread.id))
-      || this.handoffTurnStarts.has(buildThreadIdentityKey(thread.source, thread.id))
+      || this.threadStarts.hasPending(identity)
       || (thread.source === "codex" && this.codexBackgroundTerminals.has(thread.id))
       || (thread.source === "claude" && this.claudeBackend.hasLiveSession(thread.id))
       || this.threadHasActiveTurn(thread.id, thread.source)
       || this.threadHasBlockingWorkspaceMove(identity)
       || this.threadTurnQueue.getQueuedEntries(identity).length > 0
-      || (info?.archived === true && thread.archivedAt === undefined)
+      || (info?.archived === true && !isArchivedCheckoutCandidate(candidate))
       || (thread.archivedAt === undefined && (info?.updatedAt ?? 0) > (thread.updatedAt ?? 0))
       || [...this.pendingServerRequests.values()].some((pending) =>
         pending.backend === thread.source && pending.notification.params.threadId === thread.id,
       );
+  }
+
+  /** Observe provider archives, then publish the changes only after their transaction commits. */
+  async observeArchivedThreads(
+    records: Array<{ backend: AppServerBackendKind; threadId: string }>,
+    now: number,
+    options?: { promoteSubthreads: boolean },
+  ): Promise<void> {
+    const retired = await this.overlayStore.observeArchivedThreads?.(records, now, options);
+    await this.publishArchivedThreadAutomationRetirements(retired ?? []);
+  }
+
+  async publishArchivedThreadAutomationRetirements(retired: ArchivedThreadAutomationRetirement[]): Promise<void> {
+    for (const thread of retired) {
+      const identity = { backend: thread.backend, threadId: thread.threadId };
+      if (thread.prWatchesChanged || thread.autoFixChanged) {
+        await this.emit({ backend: thread.backend, notification: {
+          method: "thread/prWatches/updated", params: identity,
+        } });
+      }
+      if (thread.autoFixChanged) {
+        await this.emit({ backend: thread.backend, notification: {
+          method: "thread/prAutoDispatch/updated", params: { threadId: thread.threadId, enabled: false },
+        } });
+        await this.emit({ backend: thread.backend, notification: {
+          method: "thread/prAutoDispatch/pendingUpdated", params: { threadId: thread.threadId, pending: null },
+        } });
+      }
+      for (const dependency of thread.dependencies) {
+        const targets = new Map([identity, ...dependency.conditions].map((target) => [
+          buildThreadIdentityKey(target.backend, target.threadId), target,
+        ]));
+        for (const target of targets.values()) await this.emit({ backend: target.backend, notification: {
+          method: "thread/dependencies/updated", params: { threadId: target.threadId, dependencyId: dependency.id },
+        } });
+      }
+    }
   }
 
   async archiveThread(
@@ -16984,10 +17796,10 @@ export class DesktopBackendRegistry {
       });
       // Same bookkeeping as ACP: preserve the tray and record the archive
       // before publishing its removal. Cleanup snapshots the checkout afterward.
-      await this.overlayStore.observeArchivedThreads?.([{ backend, threadId: request.threadId }], archivedAt, { promoteSubthreads: true });
+      await this.observeArchivedThreads([{ backend, threadId: request.threadId }], archivedAt, { promoteSubthreads: true });
       this.pendingStartedThreads.delete(buildThreadIdentityKey(backend, request.threadId));
       this.invalidateThreadListCache(backend);
-      this.invalidateArchiveCleanupReads(backend, undefined, true, request.threadId);
+      this.invalidateArchiveCleanupReads(backend, undefined, true, request.threadId, [], "archived");
       await this.emit({ backend, notification: { method: "thread/archived", params: { threadId: request.threadId } } });
       const messagingCleanup = await this.cleanupMessagingForArchivedThread({
         backend,
@@ -17045,9 +17857,9 @@ export class DesktopBackendRegistry {
     // Missing-rollout recovery still needs any retained workspace until its
     // cleanup and tombstone have settled.
     if (!codexRolloutMissing) this.pendingStartedThreads.delete(buildThreadIdentityKey(backend, result.threadId));
-    await this.overlayStore.observeArchivedThreads?.([{ backend, threadId: result.threadId }], archivedAt, { promoteSubthreads: true });
+    await this.observeArchivedThreads([{ backend, threadId: result.threadId }], archivedAt, { promoteSubthreads: true });
     this.invalidateThreadListCache(backend);
-    this.invalidateArchiveCleanupReads(backend, undefined, true, result.threadId);
+    this.invalidateArchiveCleanupReads(backend, undefined, true, result.threadId, [], "archived");
     if (backend === "codex") await this.archiveTokenMiserThread(result.threadId);
     const messagingCleanup = await this.cleanupMessagingForArchivedThread({
       backend,
@@ -17070,7 +17882,7 @@ export class DesktopBackendRegistry {
   }
 
   getArchiveCleanupCountForQuit(): number {
-    return new Set([...this.pendingArchiveCleanupIntents.keys(), ...this.archiveCleanupQueue.pendingKeys()]).size;
+    return new Set([...this.pendingArchiveCleanupIntents.keys(), ...this.archiveCleanupQueue.pendingKeys(), ...this.archiveCleanupOverflow.keys()]).size;
   }
 
   checkpointArchiveCleanupsForQuit(): void {
@@ -17083,8 +17895,16 @@ export class DesktopBackendRegistry {
   }
 
   private tryCheckpointArchiveCleanupsForQuit(phase: "before-drain" | "after-drain" | "reference-change"): void {
+    // A release or removal only shrinks the backlog, and recovery rereads every
+    // recovered row, so a reference boundary persists only what was added.
+    // Rewriting the remaining backlog after each release was quadratic.
+    // A drained backlog is still written: an empty checkpoint serializes nothing.
+    const additions = this.archiveWorktreeReferences.additions + this.archiveCleanupIntentAdditions;
+    if (phase === "reference-change" && additions === this.archiveCheckpointedAdditions && this.archiveCheckpointedAdditions >= 0
+      && (this.archiveWorktreeReferences.hasOwners || this.pendingArchiveCleanupIntents.size > 0)) return;
     try {
       this.checkpointArchiveCleanupsForQuit();
+      this.archiveCheckpointedAdditions = additions;
     } catch (error) {
       // Persistence failure must not prevent queue cancellation or backend
       // disposal, nor poison the memoized shutdown operation.
@@ -17095,13 +17915,30 @@ export class DesktopBackendRegistry {
   }
 
   private cancelArchiveCleanups(key: string): void {
+    this.cancelArchiveCleanupOverflow(key);
     this.archiveCleanupQueue.cancel(key);
     for (const [job, owner] of this.archiveRepairOwners) if (owner === key) this.archiveCleanupQueue.cancel(job);
   }
 
   private async cancelAndWaitArchiveCleanups(key: string): Promise<void> {
+    this.cancelArchiveCleanupOverflow(key);
     await Promise.all([key, ...[...this.archiveRepairOwners].filter(([, owner]) => owner === key).map(([job]) => job)]
       .map(async (job) => { await this.archiveCleanupQueue.cancelAndWait(job); }));
+  }
+
+  private drainArchiveCleanupOverflow(): void {
+    for (const [key, waiting] of this.archiveCleanupOverflow) {
+      if (this.closed || this.archiveCleanupQueue.availableSlots <= 0) return;
+      this.archiveCleanupOverflow.delete(key);
+      this.enqueueArchiveCleanup(waiting.intent, waiting.resuming).then(waiting.resolve, waiting.reject);
+    }
+  }
+
+  private cancelArchiveCleanupOverflow(key: string): void {
+    const waiting = this.archiveCleanupOverflow.get(key);
+    if (!waiting) return;
+    this.archiveCleanupOverflow.delete(key);
+    waiting.reject(new ArchiveCleanupCancelledError());
   }
 
   private enqueueArchiveRepair(owner: string, worktreePath: string, work: (context: ArchiveCleanupContext) => Promise<ArchiveThreadResponse>): Promise<ArchiveThreadResponse> {
@@ -17112,11 +17949,30 @@ export class DesktopBackendRegistry {
 
   private enqueueArchiveCleanup(intent: ArchiveCleanupIntent, resuming = false): Promise<ArchiveThreadResponse> {
     const key = buildThreadIdentityKey(intent.backend, intent.threadId);
-    const existing = this.archiveCleanupQueue.pending(key);
+    const existing = this.archiveCleanupQueue.pending(key) ?? this.archiveCleanupOverflow.get(key)?.promise;
     if (existing) return existing;
+    if (!this.closed && this.archiveCleanupQueue.availableSlots <= 0) {
+      // A bulk archive can outrun the physical queue. Hold the intent rather
+      // than refuse its cleanup; a freed slot admits it in arrival order.
+      let resolve!: (response: ArchiveThreadResponse) => void;
+      let reject!: (error: unknown) => void;
+      const promise = new Promise<ArchiveThreadResponse>((accept, fail) => { resolve = accept; reject = fail; });
+      this.pendingArchiveCleanupIntents.set(key, intent);
+      this.archiveCleanupOverflow.set(key, { intent, resuming, resolve, reject, promise });
+      backendRegistryLog.info("archive cleanup waiting for queue capacity", {
+        backend: intent.backend, threadId: intent.threadId, runtimeInstanceId: this.runtimeInstanceId, waiting: this.archiveCleanupOverflow.size,
+      });
+      void promise.catch((error: unknown) => {
+        if (!(this.closed && error instanceof ArchiveCleanupCancelledError)
+          && this.pendingArchiveCleanupIntents.get(key) === intent) this.pendingArchiveCleanupIntents.delete(key);
+      });
+      return promise;
+    }
     const queuedAt = Date.now();
     const logFields = { backend: intent.backend, threadId: intent.threadId, archivedAt: intent.archivedAt, runtimeInstanceId: this.runtimeInstanceId, queuedAt };
     backendRegistryLog.info("archive cleanup queued", { ...logFields, resuming, queueDepth: this.archiveCleanupQueue.pendingKeys().length + 1 });
+    // Released and recovered intents are already durable; a fresh archive is not.
+    if (!resuming && this.pendingArchiveCleanupIntents.get(key) !== intent) this.archiveCleanupIntentAdditions += 1;
     this.pendingArchiveCleanupIntents.set(key, intent);
     let startedAt: number | undefined;
     const completion = this.archiveCleanupQueue.enqueue(key, async (context) => {
@@ -17134,7 +17990,7 @@ export class DesktopBackendRegistry {
         // missing rollouts; it never repeats the provider archive operation.
         ...(resuming ? { requireArchived: true, codexRolloutMissing: false } : {}),
       });
-    });
+    }, { reportProgress: !resuming });
     void completion.then((response) => {
       const completedAt = Date.now();
       backendRegistryLog.info("archive cleanup completed", { ...logFields, completedAt,
@@ -17146,7 +18002,7 @@ export class DesktopBackendRegistry {
       if (this.pendingArchiveCleanupIntents.get(key) === intent) this.pendingArchiveCleanupIntents.delete(key);
       // Persist only reference-wait boundaries, not every successful archive.
       if (this.archiveCleanupQueue.pendingKeys().length === 1
-        && (this.archiveWorktreeReferences.intents().length || intent.deferredWorktrees)) this.tryCheckpointArchiveCleanupsForQuit("reference-change");
+        && (this.archiveWorktreeReferences.hasOwners || intent.deferredWorktrees)) this.tryCheckpointArchiveCleanupsForQuit("reference-change");
       queueMicrotask(() => this.dispatchReleasedArchiveCleanups(this.archiveWorktreeReferences.readyIntents(key)));
     }, (error: unknown) => {
       const completedAt = Date.now();
@@ -17180,7 +18036,7 @@ export class DesktopBackendRegistry {
       await Promise.allSettled(remaining.splice(0, room).map((intent) => {
         this.archiveWorktreeReferences.scheduled(intent);
         const completion = this.enqueueArchiveCleanup(intent, true);
-        return this.observeArchiveCleanupCompletion(completion, { ...intent, backgroundCleanup: true });
+        return this.observeArchiveCleanupCompletion(completion, { ...intent, backgroundCleanup: true, reporting: "background" });
       }));
       // Background acknowledgements do not drain the bounded queue. Wait for
       // admitted jobs before taking another chunk of the durable backlog.
@@ -17190,6 +18046,7 @@ export class DesktopBackendRegistry {
 
   private async observeArchiveCleanupCompletion(completion: Promise<ArchiveThreadResponse>, params: {
     backend: AppServerBackendKind; threadId: string; archivedAt: number; backgroundCleanup?: boolean; mustComplete?: boolean;
+    reporting?: "background";
   }): Promise<ArchiveThreadResponse> {
     const { backend, threadId, archivedAt } = params;
     // Register the result/error observer before returning a background ack.
@@ -17213,7 +18070,7 @@ export class DesktopBackendRegistry {
       if (this.closed) return;
       await this.emit({ backend, notification: {
         method: "thread/archiveCleanup/completed",
-        params: { threadId, archivedAt, cleanup: response.cleanup },
+        params: { threadId, archivedAt, cleanup: response.cleanup, ...(params.reporting ? { reporting: params.reporting } : {}) },
       } });
       backendRegistryLog.info("archive cleanup completion published", { backend, threadId, archivedAt,
         runtimeInstanceId: this.runtimeInstanceId, publishedAt: Date.now(), archiveAgeMs: Date.now() - archivedAt,
@@ -17222,7 +18079,8 @@ export class DesktopBackendRegistry {
       if (this.closed) return;
       await this.emit({ backend, notification: {
         method: "thread/archiveCleanup/completed",
-        params: { threadId, archivedAt, cleanup: [], error: error instanceof Error ? error.message : String(error) },
+        params: { threadId, archivedAt, cleanup: [], error: error instanceof Error ? error.message : String(error),
+          ...(params.reporting ? { reporting: params.reporting } : {}) },
       } });
       backendRegistryLog.info("archive cleanup completion published", { backend, threadId, archivedAt,
         runtimeInstanceId: this.runtimeInstanceId, publishedAt: Date.now(), archiveAgeMs: Date.now() - archivedAt, failed: true,
@@ -17278,119 +18136,140 @@ export class DesktopBackendRegistry {
     let cleanupMetadataError: string | undefined;
     try {
       cleanupMetadata = await this.traceArchiveCleanupStage(params, "metadata", async () => {
-        let targetThread: AppServerThreadSummary | undefined;
-        const cached = context.batch ? this.archiveCleanupInventories.get(context.batch) : undefined;
-        // A full, current batch inventory already contains each archived target.
-        // Do not deserialize every target again through thread/read. The lookup
-        // below rechecks the revision after its checkpoint and removal still
-        // obtains its own fresh ownership admission.
-        const canReuseTarget = cached?.includesArchived && cached.revision === this.archiveWorkspaceRevision;
-        if (!this.codexClient.enrichArchiveCleanupThreads && !canReuseTarget && !params.requireArchived && backend === "codex" && this.codexClient.readArchiveCleanupThreadSummary && !codexRolloutMissing) {
-          targetThread = await this.codexClient.readArchiveCleanupThreadSummary(result.threadId, context.checkpoint);
-        } else if (isAcpBackendId(backend)) {
-          const session = this.acpBackend.getSession(backend, result.threadId);
-          if (session?.archivedAt) targetThread = this.acpBackend.sessionToThreadSummary(session);
-        } else if (backend === "claude") {
-          targetThread = (await this.claudeBackend.listThreads({ archived: true }))
-            .find((thread) => thread.id === result.threadId);
-        }
-        if (targetThread) {
-          const readOverlays = this.overlayStore.getArchiveCleanupOverlayStates ?? this.overlayStore.getThreadOverlayStates;
-          await context.checkpoint();
-          const overlays = await readOverlays.call(this.overlayStore, { backend, threadIds: [result.threadId] });
-          targetThread = { ...targetThread, linkedDirectories: withRetainedWorktrees(mergeThreadLinkedDirectories([
-            ...targetThread.linkedDirectories, ...(overlays[result.threadId]?.extraLinkedDirectories ?? []),
-          ]), overlays[result.threadId]) };
-        }
-        const needsWorktreeOwnership = !params.preserveWorktrees && (isAcpBackendId(backend) || !targetThread
-          || targetThread.linkedDirectories.some((directory) => Boolean(linkedDirectoryWorktreePath(directory))));
-        return await this.findThreadForArchiveCleanup({
-          backend, threadId: result.threadId, context, codexRolloutMissing,
-          targetThread: needsWorktreeOwnership ? undefined : targetThread,
-          reuseInventory: true,
-        });
+        const read = async () => {
+          let targetThread: AppServerThreadSummary | undefined;
+          // A built fleet index holds the target. Discovery refreshes its dirty
+          // identities, and removal obtains its own fresh ownership admission.
+          const canReuseTarget = context.batch !== undefined && this.archiveFleet?.batch === context.batch && !this.archiveFleet.index.needsRebuild;
+          if (!this.codexClient.enrichArchiveCleanupThreads && !canReuseTarget && !params.requireArchived && backend === "codex" && this.codexClient.readArchiveCleanupThreadSummary && !codexRolloutMissing) {
+            targetThread = await this.codexClient.readArchiveCleanupThreadSummary(result.threadId, context.checkpoint);
+          } else if (isAcpBackendId(backend)) {
+            const session = this.acpBackend.getSession(backend, result.threadId);
+            if (session?.archivedAt) targetThread = this.acpBackend.sessionToThreadSummary(session);
+          } else if (backend === "claude") {
+            targetThread = (await this.claudeBackend.listThreads({ archived: true }))
+              .find((thread) => thread.id === result.threadId);
+          }
+          if (targetThread) {
+            const readOverlays = this.overlayStore.getArchiveCleanupOverlayStates ?? this.overlayStore.getThreadOverlayStates;
+            await context.checkpoint();
+            const overlays = await readOverlays.call(this.overlayStore, { backend, threadIds: [result.threadId] });
+            targetThread = { ...targetThread, linkedDirectories: withRetainedWorktrees(mergeThreadLinkedDirectories([
+              ...targetThread.linkedDirectories, ...(overlays[result.threadId]?.extraLinkedDirectories ?? []),
+            ]), overlays[result.threadId]) };
+          }
+          const needsWorktreeOwnership = !params.preserveWorktrees && (isAcpBackendId(backend) || !targetThread
+            || targetThread.linkedDirectories.some((directory) => Boolean(linkedDirectoryWorktreePath(directory))));
+          return await this.readThreadForArchiveCleanup({
+            backend, threadId: result.threadId, context, codexRolloutMissing,
+            targetThread: needsWorktreeOwnership ? undefined : targetThread,
+          });
+        };
+        return context.withInventory ? await context.withInventory(read) : await read();
       });
     } catch (error) {
       context.assertCurrent();
       cleanupMetadataError = error instanceof Error ? error.message : String(error);
       backendRegistryLog.warn("archive cleanup metadata lookup failed", { backend, threadId: result.threadId, error: cleanupMetadataError });
     }
-    let ungroupError: string | undefined;
-    try {
-      // Startup recovery can reach this stage without a foreground mutation
-      // in this process. Preserve nested tray members before the legacy
-      // top-level ungrouping fallback inspects them.
-      context.assertCurrent();
-      await this.overlayStore.observeArchivedThreads?.(
-        [{ backend, threadId: result.threadId }], params.archivedAt, { promoteSubthreads: true },
-      );
-      await this.traceArchiveCleanupStage(params, "ungroup", async () => await this.ungroupChildrenOfArchivedThread({
-        backend, activeThreads: cleanupMetadata?.activeChildren ?? cleanupMetadata?.activeThreads ?? [], parentThreadId: result.threadId,
-        overlaysByThreadKey: cleanupMetadata?.overlaysByThreadKey, context,
-        legacyParentBackends: cleanupMetadata?.legacyParentBackends ?? (cleanupMetadata ? new Set([...cleanupMetadata.activeThreads, ...cleanupMetadata.archivedThreads]
-          .filter((thread) => thread.id === result.threadId).map((thread) => thread.source)) : undefined),
-      }));
-    } catch (error) {
-      context.assertCurrent();
-      ungroupError = error instanceof Error ? error.message : String(error);
-      backendRegistryLog.warn("archive thread child ungrouping failed", { backend, threadId: result.threadId, error: ungroupError });
-    }
-    const cleanup = await this.traceArchiveCleanupStage(params, "worktrees", async () => params.preserveWorktrees ? [] : cleanupMetadata
-      ? await this.archiveThreadWorktrees({
-          backend, activeThreads: cleanupMetadata.activeThreads, archivedThreads: cleanupMetadata.archivedThreads,
-          thread: cleanupMetadata.thread, context, codexRolloutMissing, worktreeEvidence: cleanupMetadata.worktreeEvidence,
-          deferredWorktrees: params.deferredWorktrees, workspaceRevision: cleanupMetadata.workspaceRevision,
-        })
-      : this.buildArchiveCleanupMetadataSkippedResult({ backend, threadId: result.threadId, error: cleanupMetadataError }));
-    if (codexRolloutMissing) {
-      const cleanupFailures = [
-        cleanupMetadataError
-          ? `metadata lookup failed: ${cleanupMetadataError}`
-          : undefined,
-        messagingCleanup.error
-          ? `messaging cleanup failed: ${messagingCleanup.error}`
-          : undefined,
-        ungroupError
-          ? `child ungrouping failed: ${ungroupError}`
-          : undefined,
-        ...cleanup.map((item) => {
-          if (!item.error) {
-            return undefined;
-          }
-          const worktreeContext = item.worktreePath
-            ? ` for ${item.worktreePath}`
-            : "";
-          return `worktree cleanup failed${worktreeContext}: ${item.error}`;
-        }),
-      ].filter((failure): failure is string => Boolean(failure));
-      if (cleanupFailures.length > 0) {
-        throw new Error(
-          `Codex rollout is already missing, but PwrAgent archive cleanup did not complete: ${cleanupFailures.join("; ")}`,
+    const finish = async (): Promise<ArchiveThreadResponse> => {
+      // A shared checkout may have waited while its preceding owner finished
+      // archiving. Refresh that evidence before acting on the old active list.
+      if (cleanupMetadata?.workspaceRevision !== undefined && cleanupMetadata.workspaceRevision !== this.archiveWorkspaceRevision) {
+        cleanupMetadata = await this.findThreadForArchiveCleanup({ backend, threadId: result.threadId, context, codexRolloutMissing });
+      }
+      let ungroupError: string | undefined;
+      try {
+        // Startup recovery can reach this stage without a foreground mutation
+        // in this process. Preserve nested tray members before the legacy
+        // top-level ungrouping fallback inspects them.
+        context.assertCurrent();
+        await this.observeArchivedThreads(
+          [{ backend, threadId: result.threadId }], params.archivedAt, { promoteSubthreads: true },
         );
+        await this.traceArchiveCleanupStage(params, "ungroup", async () => await this.ungroupChildrenOfArchivedThread({
+          backend, activeThreads: cleanupMetadata?.activeChildren ?? cleanupMetadata?.activeThreads ?? [], parentThreadId: result.threadId,
+          overlaysByThreadKey: cleanupMetadata?.overlaysByThreadKey, context,
+          legacyParentBackends: cleanupMetadata?.legacyParentBackends ?? (cleanupMetadata ? new Set([...cleanupMetadata.activeThreads, ...cleanupMetadata.archivedThreads]
+            .filter((thread) => thread.id === result.threadId).map((thread) => thread.source)) : undefined),
+        }));
+      } catch (error) {
+        context.assertCurrent();
+        ungroupError = error instanceof Error ? error.message : String(error);
+        backendRegistryLog.warn("archive thread child ungrouping failed", { backend, threadId: result.threadId, error: ungroupError });
+      }
+      const cleanup = await this.traceArchiveCleanupStage(params, "worktrees", async () => params.preserveWorktrees ? [] : cleanupMetadata
+        ? await this.archiveThreadWorktrees({
+            backend, activeThreads: cleanupMetadata.activeThreads, archivedThreads: cleanupMetadata.archivedThreads,
+            thread: cleanupMetadata.thread, context, codexRolloutMissing, worktreeEvidence: cleanupMetadata.worktreeEvidence,
+            deferredWorktrees: params.deferredWorktrees, workspaceRevision: cleanupMetadata.workspaceRevision,
+            ownershipPaths: cleanupMetadata.ownershipPaths,
+          })
+        : this.buildArchiveCleanupMetadataSkippedResult({ backend, threadId: result.threadId, error: cleanupMetadataError }));
+      if (codexRolloutMissing) {
+        const cleanupFailures = [
+          cleanupMetadataError
+            ? `metadata lookup failed: ${cleanupMetadataError}`
+            : undefined,
+          messagingCleanup.error
+            ? `messaging cleanup failed: ${messagingCleanup.error}`
+            : undefined,
+          ungroupError
+            ? `child ungrouping failed: ${ungroupError}`
+            : undefined,
+          ...cleanup.map((item) => {
+            if (!item.error) {
+              return undefined;
+            }
+            const worktreeContext = item.worktreePath
+              ? ` for ${item.worktreePath}`
+              : "";
+            return `worktree cleanup failed${worktreeContext}: ${item.error}`;
+          }),
+        ].filter((failure): failure is string => Boolean(failure));
+        if (cleanupFailures.length > 0) {
+          throw new Error(
+            `Codex rollout is already missing, but PwrAgent archive cleanup did not complete: ${cleanupFailures.join("; ")}`,
+          );
+        }
+
+        await this.overlayStore.setThreadArchiveTombstone({
+          backend,
+          threadId: result.threadId,
+          archivedAt,
+        });
+        // A missing rollout can leave this owner in the provider's active list.
+        // Subsequent jobs must apply the new tombstone before checking sharing.
+        this.noteArchiveFleetChange({ backend, threadId: result.threadId }, "overlay", "tombstone");
+        this.archiveWorkspaceRevision += 1;
+        await this.observeReleasedArchiveReference(backend, result.threadId, true);
+        this.pendingStartedThreads.delete(key);
+        this.invalidateThreadListCache(backend);
+        backendRegistryLog.warn("codex archive tombstoned missing rollout", {
+          backend,
+          threadId: result.threadId,
+        });
       }
 
-      await this.overlayStore.setThreadArchiveTombstone({
+      return {
         backend,
         threadId: result.threadId,
         archivedAt,
-      });
-      // A missing rollout can leave this owner in the provider's active list.
-      // Subsequent jobs must apply the new tombstone before checking sharing.
-      this.invalidateArchiveCleanupInventory();
-      this.pendingStartedThreads.delete(key);
-      this.invalidateThreadListCache(backend);
-      backendRegistryLog.warn("codex archive tombstoned missing rollout", {
-        backend,
-        threadId: result.threadId,
-      });
-    }
-
-    return {
-      backend,
-      threadId: result.threadId,
-      archivedAt,
-      cleanup,
+        cleanup,
+      };
     };
+    if (!context.withWorktree || params.preserveWorktrees || !cleanupMetadata) return await finish();
+    const canonical = canonicalWorktreePaths();
+    const scopes = [...new Set(await Promise.all(cleanupMetadata.thread.linkedDirectories.flatMap((directory) => {
+      const worktreePath = linkedDirectoryWorktreePath(directory);
+      return worktreePath ? [worktreePath] : [];
+    }).map(async (worktreePath) => await canonical(backend === "codex"
+      ? await this.worktreeContainerService.containerPath(worktreePath) ?? worktreePath : worktreePath))))].sort();
+    // A deterministic acquisition order also covers multi-checkout threads;
+    // retain the locks through tombstone and snapshot publication.
+    const locked = async (index: number): Promise<ArchiveThreadResponse> => index === scopes.length
+      ? await finish() : await context.withWorktree!(scopes[index]!, async () => await locked(index + 1));
+    return await locked(0);
   }
 
   private buildArchiveCleanupMetadataSkippedResult(params: {
@@ -17495,7 +18374,7 @@ export class DesktopBackendRegistry {
       });
     }
     this.invalidateThreadListCache(backend);
-    this.invalidateArchiveCleanupReads(backend, undefined, true, result.threadId);
+    this.invalidateArchiveCleanupReads(backend, undefined, true, result.threadId, [], "active");
     this.clearArchivedMessagingCleanupCache({
       backend,
       threadId: result.threadId,
@@ -17541,7 +18420,7 @@ export class DesktopBackendRegistry {
     backendRegistryLog.info("thread archive mutation completed", {
       backend: params.backend, threadId: params.threadId, runtimeInstanceId: this.runtimeInstanceId, archivedAt,
     });
-    await this.overlayStore.observeArchivedThreads?.([{ backend: params.backend, threadId: params.threadId }], archivedAt, { promoteSubthreads: true });
+    await this.observeArchivedThreads([{ backend: params.backend, threadId: params.threadId }], archivedAt, { promoteSubthreads: true });
     this.invalidateThreadListCache(params.backend, true, params.threadId);
     // Archival on ACP is a local store write, with no provider to announce it.
     // Say it in the same words Codex uses, because everything downstream is
@@ -17663,6 +18542,14 @@ export class DesktopBackendRegistry {
 
     if (!snapshot) {
       throw new Error("No archived worktree snapshot is available for this thread.");
+    }
+    if (snapshot.state === "hibernated") {
+      // Same path, same branch: the restore a send would make.
+      this.undeliveredCheckoutRestoreFailures.delete(buildThreadIdentityKey(request.backend, request.threadId));
+      await this.restoreHibernatedCheckout(request);
+      const restored = (await this.overlayStore.getThreadOverlayState(request))?.worktreeSnapshots
+        ?.find((candidate) => candidate.id === snapshot.id) ?? snapshot;
+      return { backend: request.backend, threadId: request.threadId, restoredAt: restored.restoredAt ?? Date.now(), snapshot: restored };
     }
 
     const restoredSnapshot = await this.withArchiveWorkspaceWrite([request.worktreePath], async () => await this.worktreeArchiveService.restore({
@@ -18122,7 +19009,7 @@ export class DesktopBackendRegistry {
       gitBranch: thread?.gitBranch,
       observedGitBranch: thread?.observedGitBranch,
       worktreeSnapshots: overlay?.worktreeSnapshots ?? thread?.worktreeSnapshots,
-    }, { readBranch: readCurrentGitBranch });
+    }, { readBranch: readCurrentGitBranch, includeHibernated: true });
     return { directory, missing };
   }
 
@@ -18166,157 +19053,46 @@ export class DesktopBackendRegistry {
     });
   }
 
-  async renameThread(
-    request: RenameThreadRequest,
-    // Not on `RenameThreadRequest`: that type crosses IPC, and an operator
-    // rename must never be able to claim it was generated. Only this class's
-    // own title generator supplies a source.
-    options?: ThreadRenameOptions,
-  ): Promise<RenameThreadResponse> {
-    const backend = request.backend ?? "codex";
-    const key = buildThreadIdentityKey(backend, request.threadId);
-    // Clear helper eligibility before this rename waits on earlier requests or
-    // metadata, so a late title helper cannot enqueue after an operator rename.
-    this.systemPlaceholderTitleThreadKeys.delete(key);
-    const previous = this.threadRenameQueues.get(key) ?? Promise.resolve();
-    const operation = previous.then(() => this.applyThreadRename(request, options));
-    const settled = operation.then(() => {}, () => {});
-    this.threadRenameQueues.set(key, settled);
-    try {
-      return await operation;
-    } finally {
-      if (this.threadRenameQueues.get(key) === settled) this.threadRenameQueues.delete(key);
-    }
+  async renameThread(request: RenameThreadRequest, options?: ThreadRenameOptions): Promise<RenameThreadResponse> {
+    return await this.threadNaming.renameThread(request, options);
   }
 
-  private async applyThreadRename(
-    request: RenameThreadRequest,
-    options?: ThreadRenameOptions,
-  ): Promise<RenameThreadResponse> {
-    const backend = request.backend ?? "codex";
-    if (request.expectedName !== undefined || options?.renameOrigin === "agent_tool") {
-      const namePromise = backend === "codex"
-        ? this.withCodexThreadClient(request.threadId, async (client) => {
-            if (!client.readThreadName) throw new Error("Persisted thread names are unavailable.");
-            return await client.readThreadName(request.threadId);
-          })
-        : this.readThreadInspectionSummaryForMutation({ backend, threadId: request.threadId, fresh: true }).then((summary) => summary?.title);
-      const name = await namePromise.catch((error: unknown) => {
-        // The prior title is optional notice metadata. A failed metadata read
-        // must not prevent a requested rename; Undo must still fail closed.
-        if (request.expectedName !== undefined) throw error;
-        return undefined;
-      });
-      if (request.expectedName !== undefined && name !== request.expectedName) {
-        throw new Error(RENAME_THREAD_EXPECTED_NAME_MISMATCH);
+  private readonly threadNaming = new ThreadNamingLifecycle({
+    readName: async ({ backend, threadId }) => backend === "codex"
+      ? await this.withCodexThreadClient(threadId, async (client) => {
+          if (!client.readThreadName) throw new Error("Persisted thread names are unavailable.");
+          const title = await client.readThreadName(threadId);
+          const metadata = await this.overlayStore.getThreadMetadata?.({ backend, threadId });
+          return projectOwnerThreadTitle({ title: title ?? "", titleSource: title ? "explicit" : "fallback" }, metadata).title || undefined;
+        })
+      : (await this.readThreadInspectionSummaryForMutation({ backend, threadId, fresh: true }))?.title,
+    readTitle: async (identity) => await this.findThreadForTitleGeneration(identity),
+    renameProvider: async (request, titleSource) => {
+      const backend = request.backend ?? "codex";
+      if (isAcpBackendId(backend)) {
+        const nextName = request.name.trim();
+        if (!nextName) throw new Error("Thread name cannot be blank.");
+        const session = this.acpBackend.getSession(backend, request.threadId);
+        if (!session) throw new Error("Selected ACP thread was not found.");
+        this.acpBackend.upsertSession({
+          ...session,
+          title: nextName,
+          titleSource,
+          updatedAt: Math.max(session.updatedAt, Date.now()),
+        });
+        return { threadId: request.threadId };
       }
-      if (options?.renameOrigin === "agent_tool") {
-        options = { ...options, previousThreadName: name };
-      }
-    }
-    let result: { threadId: string };
-    if (isAcpBackendId(backend)) {
-      result = await this.renameAcpSession(
-        backend,
-        request.threadId,
-        request.name,
-        options,
-      );
-    } else if (backend === "claude") {
-      result = await this.claudeBackend.renameThread(request.threadId, request.name);
-    } else if (backend === "codex") {
-      result = await this.withCodexThreadClient(request.threadId, async (client) =>
-        await this.renameWithClient(client, request.threadId, request.name),
-      );
-    } else {
+      if (backend === "claude") return await this.claudeBackend.renameThread(request.threadId, request.name);
+      if (backend === "codex") return await this.withCodexThreadClient(request.threadId, async (client) =>
+        await this.renameWithClient(client, request.threadId, request.name));
       throw new Error(`Unsupported backend: ${backend}`);
-    }
-    const agent = await this.getThreadAgentMetadata({
-      backend,
-      threadId: result.threadId,
-    });
-    if (agent) {
-      await this.overlayStore.setThreadAgent({
-        backend,
-        threadId: result.threadId,
-        agent: {
-          name: request.name.trim(),
-          ...(agent.instructions ? { instructions: agent.instructions } : {}),
-        },
-      });
-    }
-    this.invalidateThreadListCache(backend);
-    if (!isAcpBackendId(backend)) {
-      await this.emit({
-        backend,
-        notification: {
-          method: "thread/name/updated",
-          params: {
-            threadId: result.threadId,
-            threadName: request.name.trim(),
-            // Only this class's title generator passes a source; any other
-            // rename was requested by the operator or an agent.
-            titleSource: options?.titleSource ?? "explicit",
-            ...(options?.renameOrigin ? { renameOrigin: options.renameOrigin } : {}),
-            ...(options?.previousThreadName ? { previousThreadName: options.previousThreadName } : {}),
-          },
-        },
-      });
-    }
-
-    return {
-      backend,
-      threadId: result.threadId,
-      renamedAt: Date.now(),
-    };
-  }
-
-  private async renameAcpSession(
-    backend: AcpBackendId,
-    threadId: string,
-    name: string,
-    options?: Omit<ThreadRenameOptions, "titleSource"> & { titleSource?: AppServerThreadTitleSource },
-  ): Promise<{ threadId: string }> {
-    const nextName = name.trim();
-    if (!nextName) {
-      throw new Error("Thread name cannot be blank.");
-    }
-    const session = this.acpBackend.getSession(backend, threadId);
-    if (!session) {
-      throw new Error("Selected ACP thread was not found.");
-    }
-    const updatedAt = Date.now();
-    const titleSource = options?.titleSource ?? "explicit";
-    this.acpBackend.upsertSession({
-      ...session,
-      title: nextName,
-      titleSource,
-      updatedAt: Math.max(session.updatedAt, updatedAt),
-    });
-    // The session store and the notification ask different questions of the
-    // same word. `fallback` there means "a better title may still replace
-    // this", which is how the prompt-derived stopgap keeps its name open to
-    // the agent's own (see updateSessionTitleFromAcpUpdate). On the wire it
-    // would mean "this thread has no name", and every consumer would discard
-    // the name being announced. The stopgap's title is real, so the rename
-    // announces the only two things a rename can be.
-    const announcedTitleSource: AppServerRenamedTitleSource | undefined =
-      titleSource === "fallback" ? undefined : titleSource;
-    await this.emit({
-      backend,
-      notification: {
-        method: "thread/name/updated",
-        params: {
-          threadId,
-          threadName: nextName,
-          ...(announcedTitleSource ? { titleSource: announcedTitleSource } : {}),
-          ...(options?.renameOrigin ? { renameOrigin: options.renameOrigin } : {}),
-          ...(options?.previousThreadName ? { previousThreadName: options.previousThreadName } : {}),
-        },
-      },
-    });
-    return { threadId };
-  }
+    },
+    getAgent: async (identity) => await this.getThreadAgentMetadata(identity),
+    setAgent: async (identity, agent) => { await this.overlayStore.setThreadAgent({ ...identity, agent }); },
+    invalidate: (backend) => this.invalidateThreadListCache(backend),
+    emit: async (event) => { await this.emit(event); },
+    now: () => Date.now(),
+  });
 
   async readSelectedWorkspaceGitStatus(path: string): Promise<NavigationDirectoryGitStatus | undefined> {
     return this.gitDirectoryService.readDirectoryStatus({ path });
@@ -18868,10 +19644,20 @@ export class DesktopBackendRegistry {
     acceptedPushedCommitShas: string[];
     worktreePath: string;
   } | undefined> {
-    const thread = await this.resolveThread({
+    const threadId = params.threadId.trim();
+    if (!threadId) return undefined;
+    let thread = await this.resolveThread({
       backend: params.backend,
-      threadId: params.threadId,
+      threadId,
     });
+    // Read-only Git access includes retained archived checkouts. Resolve the
+    // archive explicitly, independent of which thread list warmed the cache.
+    if (!thread) {
+      thread = (await this.listThreads({
+        backend: params.backend, archived: true, enrichDirectories: false,
+        forceRefresh: true, callerReason: "thread-id-lookup",
+      })).find((candidate) => candidate.id === threadId);
+    }
     if (!thread) {
       return undefined;
     }
@@ -20416,6 +21202,15 @@ export class DesktopBackendRegistry {
   }
 
   private async startThreadPrepared(params: Parameters<DesktopBackendRegistry["startThread"]>[0]): Promise<StartThreadResponse> {
+    return await new ThreadCreationLifecycle().prepare(async (resources) => await this.prepareThreadCreation(params, resources), (stage, error) => {
+      backendRegistryLog.warn("thread creation preparation cleanup failed", {
+        backend: params.backend, stage, error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }
+
+  private async prepareThreadCreation(params: Parameters<DesktopBackendRegistry["startThread"]>[0], resources: ThreadCreationPreparation): Promise<PreparedThreadCreation<Pick<StartThreadResponse, "executionMode" | "codexEnvironmentRuntime" | "codexEnvironmentStartupFailure">>> {
+    this.assertThreadOwnership();
     this.assertNotBootstrap("startThread");
     const {
       backend,
@@ -20453,7 +21248,6 @@ export class DesktopBackendRegistry {
         : request.cwd;
     let resolvedLinkedDirectories = linkedDirectories;
     let effectiveWorkMode = workMode;
-    let preparedWorkspaceRollback: (() => Promise<void>) | undefined;
     if (workMode === "worktree" && request.cwd?.trim()) {
       const preparedWorkspace =
         await this.gitDirectoryService.prepareLaunchpadWorkspace({
@@ -20465,7 +21259,7 @@ export class DesktopBackendRegistry {
           workMode: "worktree",
           ...(worktreeBase ? { worktreeBase } : {}),
         });
-      preparedWorkspaceRollback = preparedWorkspace.rollback;
+      resources.setWorkspaceRollback(preparedWorkspace.rollback);
       cwd = preparedWorkspace.cwd;
       effectiveWorkMode = preparedWorkspace.workMode;
       resolvedLinkedDirectories =
@@ -20481,7 +21275,7 @@ export class DesktopBackendRegistry {
       await refuseResolvedWorkMode({
         required: requiredWorkMode,
         resolved: effectiveWorkMode,
-        rollback: preparedWorkspaceRollback,
+        rollback: undefined,
         backend,
       });
     }
@@ -20506,15 +21300,6 @@ export class DesktopBackendRegistry {
             worktreeCleanupAvailable: effectiveWorkMode === "worktree",
           };
         } else {
-          await preparedWorkspaceRollback?.().catch((rollbackError) => {
-            backendRegistryLog.warn("startThread workspace rollback failed", {
-              backend,
-              error:
-                rollbackError instanceof Error
-                  ? rollbackError.message
-                  : String(rollbackError),
-            });
-          });
           throw error;
         }
       }
@@ -20564,7 +21349,7 @@ export class DesktopBackendRegistry {
       : undefined;
     const tokenMiserEnabled = backend === "codex"
       && this.resolveTokenMiserEnabledForOverride(tokenMiserOverride);
-    const runtimePreparation = tokenMiserEnabled ? this.prepareTokenMiserRuntime() : Promise.resolve();
+    const runtimePreparation = resources.track(tokenMiserEnabled ? this.prepareTokenMiserRuntime() : Promise.resolve());
     const agentToolCatalogs = resolveAgentToolCatalogs({
       appManagementHandler: this.appManagementHandler,
       automationInspectionHandler: this.automationInspectionHandler,
@@ -20588,17 +21373,17 @@ export class DesktopBackendRegistry {
       starMapHandler: this.starMapHandler,
       threadTodoHandler: this.threadTodoHandler,
     });
-    const pdfMcpPreparation =
+    const pdfMcpPreparation = resources.track(
       backend === "codex" && this.resolvePdfAnalysisEnabledFn()
         ? this.registerPdfMcpClient({})
-        : Promise.resolve(undefined);
-    const connectionPreparation = backend === "codex" || isAcpBackendId(backend)
+        : Promise.resolve(undefined));
+    const connectionPreparation = resources.registerConnections(backend === "codex" || isAcpBackendId(backend)
       ? this.registerMcpConnections(mcpConnectionIds, undefined, backend)
-      : Promise.resolve([]);
+      : Promise.resolve([]));
     const isolateFromInherited = backend === "codex" && mcpProviderServersEnabled === false;
-    const inventoryPreparation = backend === "codex" && (mcpConnectionIds?.length || isolateFromInherited)
+    const inventoryPreparation = resources.track(backend === "codex" && (mcpConnectionIds?.length || isolateFromInherited)
       ? this.readConfiguredCodexMcpServerNames(cwd)
-      : Promise.resolve(undefined);
+      : Promise.resolve(undefined));
     const resolvedDynamicTools =
       backend === "codex"
         ? withPwrAgentToolDiscovery(buildCodexParentDynamicToolSpecs(agentToolCatalogs), this.resolveCodexToolDiscoveryFn())
@@ -20671,20 +21456,32 @@ export class DesktopBackendRegistry {
       fastMode: modelSettings.fastMode ?? null,
     });
 
-    let result: { threadId: string };
-    try {
-      result = await this.withArchiveWorkspaceWrite([cwd ?? "", ...(resolvedLinkedDirectories ?? []).map((directory) => linkedDirectoryWorktreePath(directory) ?? directory.path)], async () => backend === "claude"
-        ? await this.claudeBackend.startThread({ cwd: cwd!, executionMode: effectiveExecutionMode, model: modelSettings.model, linkedDirectories: resolvedLinkedDirectories })
-        : isAcpBackendId(backend)
-        ? await this.startAcpSession({
-            backend,
-            cwd,
-            executionMode: effectiveExecutionMode,
-            acpRuntime,
-            reasoningEffort: modelSettings.reasoningEffort,
-            mcpRegistration: acpMcpRegistration,
-          })
-        : await (
+    const agentName = request.agent?.name?.trim();
+    let gitBranch: string | undefined;
+    let currentMigration: DesktopProviderThreadModelMigration | undefined;
+    return { options: {
+      backend,
+      systemPlaceholder: !agentName,
+      worktree: effectiveWorkMode === "worktree",
+      tokenMiserOverride,
+      pdfCatalog: Boolean(pdfMcpRegistration) && typeof this.overlayStore.setThreadMessagingPdfToolCatalogVersion === "function",
+      mcpSelection: Boolean(mcpConnectionIds?.length) || mcpProviderServersEnabled === false,
+      agent: Boolean(request.agent),
+      environment: Boolean(codexEnvironmentRuntime),
+      modelSettings,
+      parent: Boolean(parentThreadId?.trim()),
+    }, host: {
+      providers: {
+        claude: async () => await this.claudeBackend.startThread({ cwd: cwd!, executionMode: effectiveExecutionMode, model: modelSettings.model, linkedDirectories: resolvedLinkedDirectories }),
+        acp: async () => await this.startAcpSession({
+          backend: backend as AcpBackendId,
+          cwd,
+          executionMode: effectiveExecutionMode,
+          acpRuntime,
+          reasoningEffort: modelSettings.reasoningEffort,
+          mcpRegistration: acpMcpRegistration,
+        }),
+        codex: async () => await (
             client ?? this.getClient(backend, effectiveExecutionMode)
           ).startThread({
             ...request,
@@ -20706,218 +21503,102 @@ export class DesktopBackendRegistry {
                 }
               : {}),
             dynamicTools,
-          }));
-    } catch (error) {
-      for (const registration of mcpConnectionRegistrations) {
-        try {
-          registration.revoke();
-        } catch (revokeError) {
-          backendRegistryLog.warn("startThread MCP connection revocation failed", {
-            backend,
-            error:
-              revokeError instanceof Error
-                ? revokeError.message
-                : String(revokeError),
-          });
-        }
-      }
-      await preparedWorkspaceRollback?.().catch((rollbackError) => {
-        backendRegistryLog.warn("startThread workspace rollback failed", {
-          backend,
-          error:
-            rollbackError instanceof Error
-              ? rollbackError.message
-              : String(rollbackError),
-        });
-      });
-      throw userActionableMcpConnectionConfigError(
-        error,
-        mcpConnectionRegistrations,
-      );
-    }
-    pdfMcpRegistration?.bindThread(result.threadId);
-    for (const registration of mcpConnectionRegistrations) {
-      registration.bindThread(result.threadId);
-    }
-    const startedAt = Date.now();
-    const pendingThreadKey = buildThreadIdentityKey(backend, result.threadId);
-    const agentName = request.agent?.name?.trim();
-    const gitBranch = cwd ? await readCurrentGitBranch(cwd).catch(() => undefined) : undefined;
-    this.pendingStartedThreads.set(
-      pendingThreadKey,
-      {
-        id: result.threadId,
-        source: backend,
-        title: agentName || "Untitled thread",
-        titleSource: "fallback",
-        projectKey: cwd,
-        createdAt: startedAt,
-        updatedAt: startedAt,
-        executionMode: effectiveExecutionMode,
-        ...modelSettings,
-        acpRuntime,
-        codexEnvironmentRuntime,
-        linkedDirectories: dedupeLinkedDirectoriesByNormalizedIdentity(
-          (
-            resolvedLinkedDirectories?.length
-              ? resolvedLinkedDirectories
-              : buildLocalLinkedDirectory(cwd)
-          ).map(normalizeLinkedDirectoryKind),
-        ),
-        gitBranch,
-        ...(tokenMiserOverride !== undefined
-          ? { tokenMiserEnabled: tokenMiserOverride }
-          : {}),
+          }),
       },
-    );
-    if (!agentName) {
-      this.systemPlaceholderTitleThreadKeys.add(pendingThreadKey);
-    }
-    if (effectiveWorkMode === "worktree") {
-      await this.recordCodexWorktreeOwnerThread({
-        backend,
-        threadId: result.threadId,
-        worktreePath: cwd,
-      });
-    }
-    this.invalidateThreadListCache(backend, true, result.threadId, cwd ? [cwd] : []);
-
-    if (backend === "claude") {
-      await this.overlayStore.setThreadExecutionMode({ backend, threadId: result.threadId, executionMode: effectiveExecutionMode });
-    }
-    if (backend === "codex") {
-      await this.overlayStore.setThreadExecutionMode({
-        backend,
-        threadId: result.threadId,
-        executionMode: effectiveExecutionMode,
-      });
-      if (tokenMiserOverride !== undefined) {
-        await this.overlayStore.setThreadTokenMiser?.({
-          backend,
-          threadId: result.threadId,
-          enabled: tokenMiserOverride,
-        });
-      }
-      if (
-        pdfMcpRegistration &&
-        typeof this.overlayStore.setThreadMessagingPdfToolCatalogVersion === "function"
-      ) {
-        await this.overlayStore.setThreadMessagingPdfToolCatalogVersion({
-          backend,
-          threadId: result.threadId,
-          version: PWRAGENT_MESSAGING_PDF_TOOL_CATALOG_VERSION,
-        });
-      }
-      await this.updateThreadGitBranchMetadata({
-        backend,
-        threadId: result.threadId,
-        branch: gitBranch,
-      });
-    }
-    await this.overlayStore.setThreadPrAutoDispatchEnabled({
-      backend,
-      threadId: result.threadId,
-      enabled:
-        prAutoDispatchEnabled ?? this.resolveDefaultPrAutoDispatchEnabledFn(),
-    });
-    if (mcpConnectionIds?.length || mcpProviderServersEnabled === false) {
-      await this.overlayStore.setThreadMcpConnectionIds({
-        backend,
-        threadId: result.threadId,
-        connectionIds: mcpConnectionIds ?? [],
-        providerServersEnabled: mcpProviderServersEnabled,
-      });
-    }
-    if (request.agent) {
-      await this.overlayStore.setThreadAgent({
-        backend,
-        threadId: result.threadId,
-        agent: request.agent,
-      });
-      this.invalidateThreadListCache(backend);
-    }
-    if (codexEnvironmentRuntime) {
-      await this.overlayStore.setThreadCodexEnvironmentRuntime?.({
-        backend,
-        threadId: result.threadId,
-        codexEnvironmentRuntime,
-      });
-    }
-    const currentMigration =
-      this.resolveProviderThreadModelMigrationsFn()[backend];
-    if (
-      modelSettings.model !== undefined ||
-      modelSettings.reasoningEffort !== undefined ||
-      modelSettings.serviceTier !== undefined ||
-      modelSettings.fastMode !== undefined ||
-      currentMigration !== undefined
-    ) {
-      await this.overlayStore.setThreadModelSettings({
-        backend,
-        threadId: result.threadId,
-        ...modelSettings,
-        ...(currentMigration
-          ? {
-              modelMigrationRevision: currentMigration.revision,
-            }
-          : {}),
-      });
-    }
-
-    if (parentThreadId?.trim()) {
-      await this.overlayStore.setThreadParent?.({
-        backend,
-        threadId: result.threadId,
-        parentThreadId,
-        parentThreadBackend,
-        parentThreadInstanceId,
-      });
-      await this.emit({
-        backend,
-        notification: {
-          method: "thread/parent/set",
-          params: {
-            threadId: result.threadId,
-            parentThreadId,
-            parentThreadBackend,
-            parentThreadInstanceId,
+      withWorkspaceWrite: async (submit) => await this.withArchiveWorkspaceWrite(
+        [cwd ?? "", ...(resolvedLinkedDirectories ?? []).map((directory) => linkedDirectoryWorktreePath(directory) ?? directory.path)], submit,
+      ),
+      rejection: (error) => userActionableMcpConnectionConfigError(error, mcpConnectionRegistrations),
+      bindPdf: ({ threadId }) => { pdfMcpRegistration?.bindThread(threadId); },
+      rememberPending: async ({ threadId }) => {
+        const startedAt = Date.now();
+        const pendingThreadKey = buildThreadIdentityKey(backend, threadId);
+        gitBranch = cwd ? await readCurrentGitBranch(cwd).catch(() => undefined) : undefined;
+        this.pendingStartedThreads.set(
+          pendingThreadKey,
+          {
+            id: threadId,
+            source: backend,
+            title: agentName || "Untitled thread",
+            titleSource: "fallback",
+            projectKey: cwd,
+            createdAt: startedAt,
+            updatedAt: startedAt,
+            executionMode: effectiveExecutionMode,
+            ...modelSettings,
+            acpRuntime,
+            codexEnvironmentRuntime,
+            linkedDirectories: dedupeLinkedDirectoriesByNormalizedIdentity(
+              (
+                resolvedLinkedDirectories?.length
+                  ? resolvedLinkedDirectories
+                  : buildLocalLinkedDirectory(cwd)
+              ).map(normalizeLinkedDirectoryKind),
+            ),
+            gitBranch,
+            ...(tokenMiserOverride !== undefined
+              ? { tokenMiserEnabled: tokenMiserOverride }
+              : {}),
           },
-        },
-      });
-    }
-    const visibilityFinalization = await this.finalizeCreatedThreadVisibility({
-      backend,
-      directoryKey,
-      cwd,
-      linkedDirectories:
-        resolvedLinkedDirectories?.length
-          ? resolvedLinkedDirectories
-          : buildLocalLinkedDirectory(cwd),
-      parentThreadBackend,
-      parentThreadId,
-      threadId: result.threadId,
-    });
-    // Codex announces its own threads. Claude and ACP backends do not, so
-    // without this nothing told navigation listeners, such as the owner's PR
-    // primary-repository cache, about a new thread until its turn ended.
-    if (backend !== "codex") {
-      await this.emit({
-        backend,
-        notification: {
-          method: "thread/started",
-          params: { threadId: result.threadId },
-        },
-      });
-    }
-
-    return {
-      backend,
-      threadId: result.threadId,
-      executionMode: effectiveExecutionMode,
-      ...visibilityFinalization,
-      codexEnvironmentRuntime,
-      codexEnvironmentStartupFailure,
-    };
+        );
+      },
+      markPlaceholder: (identity) => { this.threadNaming.markSystemPlaceholder(identity); },
+      recordWorktreeOwner: async (identity) => {
+        await this.recordCodexWorktreeOwnerThread({ ...identity, worktreePath: cwd });
+      },
+      invalidate: ({ threadId }) => { this.invalidateThreadListCache(backend, true, threadId, cwd ? [cwd] : []); },
+      persistExecutionMode: async (identity) => await this.overlayStore.setThreadExecutionMode({ ...identity, executionMode: effectiveExecutionMode }),
+      persistTokenMiser: async (identity) => await this.overlayStore.setThreadTokenMiser?.({ ...identity, enabled: tokenMiserOverride! }),
+      persistPdfCatalog: async (identity) => await this.overlayStore.setThreadMessagingPdfToolCatalogVersion?.({
+        ...identity, version: PWRAGENT_MESSAGING_PDF_TOOL_CATALOG_VERSION,
+      }),
+      persistGitBranch: async (identity) => await this.updateThreadGitBranchMetadata({ ...identity, branch: gitBranch }),
+      persistPrAutoDispatch: async (identity) => await this.overlayStore.setThreadPrAutoDispatchEnabled({
+        ...identity, enabled: prAutoDispatchEnabled ?? this.resolveDefaultPrAutoDispatchEnabledFn(),
+      }),
+      persistMcpSelection: async (identity) => await this.overlayStore.setThreadMcpConnectionIds({
+        ...identity, connectionIds: mcpConnectionIds ?? [], providerServersEnabled: mcpProviderServersEnabled,
+      }),
+      persistAgent: async (identity) => {
+        await this.overlayStore.setThreadAgent({ ...identity, agent: request.agent! });
+        this.invalidateThreadListCache(backend);
+      },
+      persistEnvironment: async (identity) => await this.overlayStore.setThreadCodexEnvironmentRuntime?.({ ...identity, codexEnvironmentRuntime: codexEnvironmentRuntime! }),
+      readModelMigration: () => {
+        currentMigration = this.resolveProviderThreadModelMigrationsFn()[backend];
+        return currentMigration !== undefined;
+      },
+      persistModel: async (identity) => await this.overlayStore.setThreadModelSettings({
+        ...identity,
+        ...modelSettings,
+        ...(currentMigration ? { modelMigrationRevision: currentMigration.revision } : {}),
+      }),
+      persistParent: async ({ threadId }) => {
+        const saved = await this.overlayStore.setThreadParent?.({ backend, threadId, parentThreadId: parentThreadId!, parentThreadBackend, parentThreadInstanceId });
+        return saved?.parentThreadId
+          ? { parentThreadId: saved.parentThreadId, parentThreadBackend: saved.parentThreadBackend }
+          : undefined;
+      },
+      announceParent: async ({ threadId }) => {
+        await this.emit({ backend, notification: { method: "thread/parent/set", params: {
+          threadId, parentThreadId: parentThreadId!, parentThreadBackend, parentThreadInstanceId,
+        } } });
+      },
+      finalizeVisibility: async ({ threadId }, parent) => await this.finalizeCreatedThreadVisibility({
+        backend, directoryKey, cwd,
+        linkedDirectories: resolvedLinkedDirectories?.length ? resolvedLinkedDirectories : buildLocalLinkedDirectory(cwd),
+        ...parent, threadId,
+      }),
+      announceStarted: async ({ threadId }) => {
+        await this.emit({ backend, notification: { method: "thread/started", params: { threadId } } });
+      },
+      failed: (stage, error, identity) => {
+        backendRegistryLog.warn("thread creation lifecycle effect failed", {
+          backend, threadId: identity?.threadId, stage,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      },
+    }, metadata: { executionMode: effectiveExecutionMode, codexEnvironmentRuntime, codexEnvironmentStartupFailure } };
   }
 
   private async buildForkedCodexEnvironmentRuntime(params: {
@@ -21082,7 +21763,7 @@ export class DesktopBackendRegistry {
   private async withThreadHandoffWithoutArchiveLock<T>(threadId: string, work: () => Promise<T>): Promise<T> {
     const key = buildThreadIdentityKey("codex", threadId);
     this.assertThreadNotHandingOff("codex", threadId);
-    if (this.handoffTurnStarts.has(key)
+    if (this.threadStarts.hasPending({ backend: "codex", threadId })
       || !this.threadTurnQueue.canStartImmediately({ backend: "codex", threadId })
       || this.threadTurnQueue.getQueuedEntries({ backend: "codex", threadId }).length) {
       // A paused prompt never finishes on its own.
@@ -21117,6 +21798,7 @@ export class DesktopBackendRegistry {
     request: BackendRegistryForkThreadRequest,
   ): Promise<ForkThreadResponse> {
     this.assertNotBootstrap("forkThread");
+    this.assertThreadOwnership();
     const backend = request.backend ?? "codex";
     if (backend !== "codex" && backend !== "claude") {
       throw new Error("Thread forking is supported by the Codex and Claude backends.");
@@ -21492,6 +22174,8 @@ export class DesktopBackendRegistry {
     await this.assertRequestedThreadModelAvailable(params);
     await this.assertThreadNotLocked(params.backend, params.threadId);
     this.assertThreadNotHandingOff(params.backend, params.threadId);
+    // A hibernated checkout starts coming back now; the send queues behind it.
+    await this.wakeHibernatedCheckout(params);
     const { origin = "manual", queueEntryId, delivery, ...entry } = params;
     const hasTurnSettings = [
       entry.executionMode,
@@ -22314,21 +22998,34 @@ export class DesktopBackendRegistry {
   }): Promise<ThreadTurnQueueImmediateSubmissionResult> {
     this.assertThreadNotHandingOff(params.backend, params.threadId);
     const { origin = "manual", ...entry } = params;
+    const overlay = await this.overlayStore.getThreadOverlayState({ backend: params.backend, threadId: params.threadId });
+    // The durable archive observation also covers watches restored at startup,
+    // before provider listings have populated this process's information store.
+    const isArchived = () => this.getThreadInfo(params)?.archived
+      ?? (overlay?.archiveRetentionStartedAt !== undefined || overlay?.archiveTombstonedAt !== undefined);
     if (
       // A lock reads as busy, not as a failure: the PR watch and auto-fix
       // callers wait without spending an attempt, and resume once unlocked.
-      (await this.readThreadLock(params.backend, params.threadId))
+      overlay?.lock
+      // Retired PR work can still be in flight when archive completes.
+      // Discard its admission without resuming the thread or cancelling cleanup.
+      || isArchived()
       || this.threadHasActiveTurn(params.threadId, params.backend)
       || this.threadHasBlockingWorkspaceMove(params)
+      || this.checkoutRestores.has(buildThreadIdentityKey(params.backend, params.threadId))
     ) {
       return { status: "busy" };
     }
     try {
-      return await this.admitThreadAttachments(entry, (input, onAdmission) => this.threadTurnQueue.submitIfIdle({
-        ...entry,
-        input,
-        origin,
-      }, { onAdmission }));
+      return await this.admitThreadAttachments(entry, (input, onAdmission) => {
+        // Attachment preparation can yield to an archive notification.
+        if (isArchived()) return Promise.resolve({ status: "busy" as const });
+        return this.threadTurnQueue.submitIfIdle({
+          ...entry,
+          input,
+          origin,
+        }, { onAdmission });
+      });
     } catch (error) {
       // Turn preparation yields after the queue's idle check. If a backend
       // notification claimed the thread meanwhile, preserve the busy result
@@ -22451,28 +23148,33 @@ export class DesktopBackendRegistry {
       request.paused,
     );
     const entry = result.entry;
+    // A control can retire or replace this row while the shared mutation
+    // settles. Publish only its live state, including newer holds/revisions.
+    const current = entry && this.threadTurnQueue.getQueuedEntries(entry)
+      .find((candidate) => candidate.id === entry.id);
     if (result.disposition === "updated" && entry?.paused && !entry.projectHold) {
       // A sent wake-up the operator pauses again is an ordinary queued
       // message now; a restart must not bring it back as a project hold.
+      // This completed Pause owns cleanup even if a later control resumed it.
       this.forgetDurableProjectHeldWakeup(entry.id);
     }
-    if (result.disposition === "updated" && entry) {
+    if (result.disposition === "updated" && current) {
       this.refreshRestartQueuedEntries();
       await this.emit({
-        backend: entry.backend,
+        backend: current.backend,
         notification: {
           method: "thread/turnQueue/updated",
           params: {
-            threadId: entry.threadId,
-            queueEntryId: entry.id,
-            queueEntryCreatedAt: entry.createdAt,
-            origin: entry.origin,
-            status: entry.manualReleaseRequired ? "held" : "queued",
-            displayText: queuedTurnDisplayText(entry.input),
-            ...(entry.title ? { title: entry.title } : {}),
-            manualReleaseRequired: entry.manualReleaseRequired === true,
-            ...queuedTurnPauseParams(entry),
-            ...(entry.holdReason ? { errorMessage: entry.holdReason } : {}),
+            threadId: current.threadId,
+            queueEntryId: current.id,
+            queueEntryCreatedAt: current.createdAt,
+            origin: current.origin,
+            status: current.manualReleaseRequired ? "held" : "queued",
+            displayText: queuedTurnDisplayText(current.input),
+            ...(current.title ? { title: current.title } : {}),
+            manualReleaseRequired: current.manualReleaseRequired === true,
+            ...queuedTurnPauseParams(current),
+            ...(current.holdReason ? { errorMessage: current.holdReason } : {}),
           },
         },
       }).catch((error) => {
@@ -22492,6 +23194,18 @@ export class DesktopBackendRegistry {
   async releaseQueuedTurnWithDisposition(
     entryId: string,
   ): Promise<ReleaseQueuedTurnResponse> {
+    const entry = this.threadTurnQueue.getAllQueuedEntries().find((candidate) => candidate.id === entryId);
+    if (entry?.delivery === "queued-steer" && entry.manualReleaseRequired && this.getActiveTurnForThread(entry)) {
+      const backend = (await this.listBackends({ includeUnavailable: true })).backends
+        .find((candidate) => candidate.kind === entry.backend);
+      // The queue's live-owner check is optimistic. Confirm provider support
+      // before Retry clears review holds, then recheck the live FIFO after IO.
+      const head = this.threadTurnQueue.getQueuedEntries(entry).find((candidate) => !candidate.paused);
+      if (!backend?.capabilities.steerTurn && head?.id === entryId
+        && head.manualReleaseRequired && this.getActiveTurnForThread(head)) {
+        return { queueEntryId: entryId, disposition: "busy" };
+      }
+    }
     const result = await this.threadTurnQueue.releaseEntryWithDisposition(entryId);
     return {
       queueEntryId: entryId,
@@ -22511,15 +23225,19 @@ export class DesktopBackendRegistry {
     messageOrigin?: AppServerThreadMessageOrigin;
   }): Promise<StartTurnResponse & { queueStatus: "queued" }> {
     const input = await ownThreadInputAttachments(request.input, request, this.localFilePrivateStorageRoots);
-    // No await between lookup, ownership check, and replacement: admission
-    // cannot consume the entry between validation and the edit.
+    // The shared replacement rechecks waiting identity and sender ownership
+    // after earlier FIFO controls settle, then cancels before fresh admission.
+    const sender = request.messageOrigin?.sourceThread;
     const entry = this.threadTurnQueue.getQueuedEntries(request)
-      .find((candidate) => candidate.id === request.queueEntryId);
+      .find((candidate) => candidate.id === request.queueEntryId || (sender && candidate.agentMessages?.some(message => {
+        const source = message.origin?.sourceThread;
+        return message.replacementHandle === request.queueEntryId && source?.backend === sender.backend
+          && source.threadId === sender.threadId && source.instanceId === sender.instanceId;
+      })));
     if (!entry) throw new Error("Queued message not found or already started; no new turn was created.");
     if (entry.agentMessageOrigins && !entry.agentMessages) {
       throw new Error("The operator edited this batch; sender replacement would overwrite those edits.");
     }
-    const sender = request.messageOrigin?.sourceThread;
     const owners = entry.agentMessages?.map((message) => message.origin?.sourceThread)
       ?? [entry.messageOrigin?.sourceThread];
     if (
@@ -22534,17 +23252,14 @@ export class DesktopBackendRegistry {
     if (!request.input.some((item) => item.type === "text" && item.text.trim())) {
       throw new Error("Replacement input requires a non-empty prompt.");
     }
-    const updated = entry.agentMessages
-      ? this.threadTurnQueue.replaceQueuedAgentInput(entry.id, input, sender, request.messageOrigin)
-      : this.threadTurnQueue.updateQueuedEntryInput(entry.id, input, sender);
+    const updated = await this.threadTurnQueue.replaceQueuedAgentInput(request.queueEntryId, input, sender, request.messageOrigin);
     if (!updated) throw new Error("The sender's queued message is no longer waiting.");
-    this.emitQueuedTurnInputUpdated(updated);
     return {
-      backend: entry.backend,
-      threadId: entry.threadId,
-      turnId: entry.id,
+      backend: updated.backend,
+      threadId: updated.threadId,
+      turnId: updated.id,
       queueStatus: "queued",
-      queueEntryId: entry.id,
+      queueEntryId: updated.id,
     };
   }
 
@@ -23411,6 +24126,7 @@ export class DesktopBackendRegistry {
     fastMode?: boolean;
     messageOrigin?: AppServerThreadMessageOrigin;
   }): Promise<{ backend: AppServerBackendKind; threadId: string; turnId: string }> {
+    this.assertThreadOwnership();
     await this.assertRequestedThreadModelAvailable(params);
     const result = await this.startTurnNow(params);
     await this.publishIncomingWork({ ...params, threadId: result.threadId }, result.turnId);
@@ -23462,23 +24178,8 @@ export class DesktopBackendRegistry {
   }
 
   private async prepareAndStartTurn(params: Parameters<DesktopBackendRegistry["startTurnNow"]>[0]): Promise<{ backend: AppServerBackendKind; threadId: string; turnId: string }> {
-    this.assertThreadNotHandingOff(params.backend, params.threadId);
-    const key = buildThreadIdentityKey(params.backend, params.threadId);
-    this.handoffTurnStarts.set(key, (this.handoffTurnStarts.get(key) ?? 0) + 1);
-    try {
-      // Checked inside the lifecycle mutation, after the handoff count is
-      // raised: a start that waited behind a move or archive sees a lock
-      // that landed meanwhile. A queued entry that reaches here is held with
-      // this refusal as its reason until an unlock releases it.
-      return await this.withThreadLifecycleMutation(params, async () => {
-        await this.assertThreadNotLocked(params.backend, params.threadId);
-        return await this.startTurnWithoutHandoff(params);
-      });
-    } finally {
-      const count = (this.handoffTurnStarts.get(key) ?? 1) - 1;
-      if (count) this.handoffTurnStarts.set(key, count);
-      else this.handoffTurnStarts.delete(key);
-    }
+    this.assertThreadOwnership();
+    return await this.threadStarts.run(params, () => this.startTurnWithoutHandoff(params));
   }
 
   private async startTurnWithoutHandoff(params: {
@@ -23526,64 +24227,61 @@ export class DesktopBackendRegistry {
         privateStorageRoots: this.localFilePrivateStorageRoots,
       }), params, this.localFilePrivateStorageRoots);
       const registrations = await this.registerMcpConnections(overlay?.mcpConnectionIds, params.threadId, params.backend);
-      // Once handed over, the Claude session revokes them when it closes.
-      let handedOver = false;
-      let startingOrigin: StartingTurnOrigin | undefined;
-      let revoked = false;
-      const revokeConnections = () => {
-        if (revoked) return;
-        revoked = true;
-        for (const registration of registrations) registration.revoke();
-      };
-      try {
-        for (const registration of registrations) registration.bindThread(params.threadId);
-        // As for ACP, PwrAgent's own tools are optional: a server that cannot
-        // start must not block the operator's turn.
-        const owned = await this.claudeAgentToolMcpServer?.registerClient({ backend: "claude", threadId: params.threadId })
-          .catch((error: unknown) => {
-            backendRegistryLog.warn("agent_tool_mcp_start_failed", {
-              backend: "claude",
-              error: error instanceof Error ? error.message : String(error),
-              threadId: params.threadId,
+      let prepared!: Parameters<ClaudeBackend["startTurn"]>[0];
+      return await this.threadStarts.startClaude({
+        prepare: async () => {
+          for (const registration of registrations) registration.bindThread(params.threadId);
+          // As for ACP, PwrAgent's own tools are optional: a server that cannot
+          // start must not block the operator's turn.
+          const owned = await this.claudeAgentToolMcpServer?.registerClient({ backend: "claude", threadId: params.threadId })
+            .catch((error: unknown) => {
+              backendRegistryLog.warn("agent_tool_mcp_start_failed", {
+                backend: "claude",
+                error: error instanceof Error ? error.message : String(error),
+                threadId: params.threadId,
+              });
+              return undefined;
             });
-            return undefined;
-          });
-        const servers = [...registrations.map((registration) => ({
-          ...registration.server, name: buildCodexConnectionMcpServerName(registration.server),
-        })), ...(owned ? [owned.server] : [])];
-        const mcpServers = Object.fromEntries(servers.map((server) => [server.name, "url" in server
-          ? { type: "http" as const, url: server.url, headers: Object.fromEntries(server.headers.map(({ name, value }) => [name, value])) }
-          : { type: "stdio" as const, command: server.command, args: server.args, env: server.env }]));
-        const instructions = (await this.getThreadAgentMetadata(params))?.instructions;
-        handedOver = true;
-        const messageOrigin = resolveThreadMessageOrigin(params);
-        startingOrigin = this.beginStartingTurnOrigin({ backend: "claude", threadId: params.threadId, origin: messageOrigin });
-        const result = await this.claudeBackend.startTurn({
-          ...params, input, model: modelSettings.model, reasoningEffort: modelSettings.reasoningEffort,
-          messageOrigin,
-          executionMode: params.executionMode ?? overlay?.executionMode,
-          instructions,
-          mcpServers,
-          ...(this.taskMonitorForThread(params) ? { strictMcpConfig: true } : {}),
-          // Directories attached to the thread, so Claude can work in them too.
-          attachedDirectories: overlay?.extraLinkedDirectories,
-          shellEnvironment: setupVariablesForAgent(
-            overlay?.codexEnvironmentRuntime,
-            this.resolvePassSetupVariablesToAgentsFn(),
-          ),
-          onSessionClosed: revokeConnections,
-        });
-        this.bindStartingTurnOrigin(startingOrigin, { threadId: params.threadId, turnId: result.turnId });
-        await this.persistStartingTurnOrigin(startingOrigin);
-        return result;
-      } catch (error) {
-        // A live session shares the thread's grants, so it alone revokes them.
-        if (!handedOver) revokeConnections();
-        if (error instanceof ClaudeTurnActiveError) throw new ThreadAlreadyActiveError(error.message);
-        throw error;
-      } finally {
-        this.dropStartingTurnOrigin(startingOrigin);
-      }
+          const servers = [...registrations.map((registration) => ({
+            ...registration.server, name: buildCodexConnectionMcpServerName(registration.server),
+          })), ...(owned ? [owned.server] : [])];
+          const mcpServers = Object.fromEntries(servers.map((server) => [server.name, "url" in server
+            ? { type: "http" as const, url: server.url, headers: Object.fromEntries(server.headers.map(({ name, value }) => [name, value])) }
+            : { type: "stdio" as const, command: server.command, args: server.args, env: server.env }]));
+          const instructions = (await this.getThreadAgentMetadata(params))?.instructions;
+          const messageOrigin = resolveThreadMessageOrigin(params);
+          prepared = {
+            ...params, input, model: modelSettings.model, reasoningEffort: modelSettings.reasoningEffort,
+            messageOrigin,
+            executionMode: params.executionMode ?? overlay?.executionMode,
+            instructions,
+            mcpServers,
+            ...(this.taskMonitorForThread(params) ? { strictMcpConfig: true } : {}),
+            // Directories attached to the thread, so Claude can work in them too.
+            attachedDirectories: overlay?.extraLinkedDirectories,
+            shellEnvironment: setupVariablesForAgent(
+              overlay?.codexEnvironmentRuntime,
+              this.resolvePassSetupVariablesToAgentsFn(),
+            ),
+          };
+        },
+        beginOrigin: () => this.beginStartingTurnOrigin({ ...params, origin: prepared.messageOrigin }),
+        submit: async (onSessionClosed) => {
+          try { return await this.claudeBackend.startTurn({ ...prepared, onSessionClosed }); }
+          catch (error) {
+            if (error instanceof ClaudeTurnActiveError) throw new ThreadAlreadyActiveError(error.message);
+            throw error;
+          }
+        },
+        bindOrigin: (origin, result) => this.bindStartingTurnOrigin(origin, result),
+        persistOrigin: (origin) => this.persistStartingTurnOrigin(origin),
+        disposeOrigin: (origin) => this.dropStartingTurnOrigin(origin),
+        revokeConnections: () => { for (const registration of registrations) registration.revoke(); },
+        failed: (stage, error, turn) => backendRegistryLog.warn("claude_turn_start_finalization_failed", {
+          backend: params.backend, threadId: params.threadId, turnId: turn?.turnId, stage,
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      });
     }
     // A selection already in flight must finish before this turn reads its runtime.
     await this.withCodexEnvironmentRuntimeLock(
@@ -23623,266 +24321,229 @@ export class DesktopBackendRegistry {
           : params.reasoningEffort ?? overlay?.reasoningEffort,
         reasoningEffortsByModel: overlay?.reasoningEffortsByModel,
       });
-      const reservationKey = buildTurnStartReservationKey(
-        params.backend,
-        params.threadId,
-      );
-      if (this.threadHasActiveTurn(params.threadId, params.backend)) {
-        throw new ThreadAlreadyActiveError("A turn is already active for this thread.");
-      }
-      this.reservedAcpStartThreadKeys.add(reservationKey);
-      let pendingMessageContextId: string | undefined;
-      let startingOrigin: StartingTurnOrigin | undefined;
-      try {
-        const preparedPdfInput = await preparePdfTurnInput({
-          handling: this.resolvePdfTurnInputHandling({
-            backend: params.backend,
-            overlay,
-          }),
-          input: params.input,
-        });
-        // ACP adapters already accept data-URL image parts. Keeping those
-        // intact avoids changing their established image payload contract.
-        const userInput = await ownThreadInputAttachments(
-          await enrichLocalFileInputs(preparedPdfInput.input, {
-            privateStorageRoots: this.localFilePrivateStorageRoots,
-          }),
-          params,
-          this.localFilePrivateStorageRoots,
-        );
-        const input = pendingManagedReviewContexts.length > 0
-          ? [
-              {
-                type: "text" as const,
-                text: buildManagedReviewContextInput(
-                  pendingManagedReviewContexts,
-                ),
-              },
-              ...userInput,
-            ]
-          : userInput;
-        if (this.usesSlashControlledAcpExecutionModes(params.backend)) {
-          await this.flushQueuedExecutionModeIfPresent(
-            params.threadId,
-            params.backend,
+      const identity = { backend: params.backend, threadId: params.threadId };
+      const reservationKey = buildTurnStartReservationKey(params.backend, params.threadId);
+      let preparedPdfInput!: Awaited<ReturnType<typeof preparePdfTurnInput>>;
+      let userInput!: AppServerTurnInputItem[];
+      let input!: AppServerTurnInputItem[];
+      return await this.threadStarts.startAcp({
+        reserve: () => {
+          if (this.threadHasActiveTurn(params.threadId, params.backend)) {
+            throw new ThreadAlreadyActiveError("A turn is already active for this thread.");
+          }
+          this.reservedAcpStartThreadKeys.add(reservationKey);
+        },
+        prepare: async () => {
+          preparedPdfInput = await preparePdfTurnInput({
+            handling: this.resolvePdfTurnInputHandling({
+              backend: params.backend,
+              overlay,
+            }),
+            input: params.input,
+          });
+          // ACP adapters already accept data-URL image parts. Keeping those
+          // intact avoids changing their established image payload contract.
+          userInput = await ownThreadInputAttachments(
+            await enrichLocalFileInputs(preparedPdfInput.input, {
+              privateStorageRoots: this.localFilePrivateStorageRoots,
+            }),
+            params,
+            this.localFilePrivateStorageRoots,
           );
-        }
-        await this.flushQueuedAcpRuntimeOptionIfPresent(
-          params.backend,
-          params.threadId,
-        );
-        pendingMessageContextId = await this.registerPendingThreadMessageContext({
-          backend: params.backend,
-          input,
-          threadId: params.threadId,
+          input = pendingManagedReviewContexts.length > 0
+            ? [
+                {
+                  type: "text" as const,
+                  text: buildManagedReviewContextInput(
+                    pendingManagedReviewContexts,
+                  ),
+                },
+                ...userInput,
+              ]
+            : userInput;
+          if (this.usesSlashControlledAcpExecutionModes(params.backend)) {
+            await this.flushQueuedExecutionModeIfPresent(
+              params.threadId,
+              params.backend,
+            );
+          }
+          await this.flushQueuedAcpRuntimeOptionIfPresent(
+            identity.backend,
+            params.threadId,
+          );
+        },
+        registerContext: () => this.registerPendingThreadMessageContext({
+          ...identity, input,
           origin: resolveThreadMessageOrigin(params),
           text: extractFirstMeaningfulTextInput(params.input),
-        });
-        startingOrigin = this.beginStartingTurnOrigin({
-          backend: params.backend,
-          threadId: params.threadId,
-          origin: resolveThreadMessageOrigin(params),
-        });
-        const result = await this.startAcpTurn({
-          backend: params.backend,
-          threadId: params.threadId,
-          input,
+        }),
+        beginOrigin: () => this.beginStartingTurnOrigin({ ...identity, origin: resolveThreadMessageOrigin(params) }),
+        submit: () => this.startAcpTurn({
+          ...identity, input,
           model: modelSettings.model,
           reasoningEffort: modelSettings.reasoningEffort,
-        });
-        this.bindStartingTurnOrigin(startingOrigin, result);
-        await this.overlayStore.consumeManagedReviewContexts({
-          backend: params.backend,
-          threadId: params.threadId,
-          entryIds: pendingManagedReviewContextEntryIds,
-        });
-        this.pdfAttachmentStore.bindTurn(
-          {
-            backend: params.backend,
-            threadId: result.threadId,
-            turnId: result.turnId,
-          },
+        }),
+        bindOrigin: (origin, result) => this.bindStartingTurnOrigin(origin, result),
+        consumeReviewContexts: () => this.overlayStore.consumeManagedReviewContexts({
+          ...identity, entryIds: pendingManagedReviewContextEntryIds,
+        }),
+        bindPdf: (result) => this.pdfAttachmentStore.bindTurn(
+          { backend: params.backend, threadId: result.threadId, turnId: result.turnId },
           preparedPdfInput.pdfAttachments,
-        );
-        this.scheduleThreadTitleGeneration({
+        ),
+        scheduleTitle: (result) => this.scheduleThreadTitleGeneration({
           backend: params.backend,
           threadId: result.threadId,
           input: userInput,
-        });
-        this.bindPendingThreadMessageContext(
-          pendingMessageContextId,
-          result.turnId,
-        );
-        await this.persistStartingTurnOrigin(startingOrigin);
-        await this.rememberTurnInputAttachments({
+        }),
+        bindContext: (context, result) => this.bindPendingThreadMessageContext(context, result.turnId),
+        persistOrigin: (origin) => this.persistStartingTurnOrigin(origin),
+        retainAttachments: (result) => this.rememberTurnInputAttachments({
           backend: params.backend,
           threadId: result.threadId,
           turnId: result.turnId,
           input: userInput,
-        });
-        this.forgetPendingThreadMessageContext(pendingMessageContextId);
-        return result;
-      } catch (error) {
-        this.forgetPendingThreadMessageContext(pendingMessageContextId);
-        throw error;
-      } finally {
-        this.dropStartingTurnOrigin(startingOrigin);
-        this.reservedAcpStartThreadKeys.delete(reservationKey);
-      }
+        }),
+        forgetContext: (context) => this.forgetPendingThreadMessageContext(context),
+        disposeOrigin: (origin) => this.dropStartingTurnOrigin(origin),
+        release: () => { this.reservedAcpStartThreadKeys.delete(reservationKey); },
+        failed: (stage, error, turn) => backendRegistryLog.warn("acp_turn_start_finalization_failed", {
+          ...identity, turnId: turn?.turnId, stage,
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      });
     }
 
     let input: AppServerTurnInputItem[] = [];
-    let pdfAttachments: PendingPdfAttachment[];
+    let pdfAttachments!: PendingPdfAttachment[];
     const reserveCodexStart = params.backend === "codex";
-    if (reserveCodexStart) {
-      if (this.threadHasActiveTurn(params.threadId)) {
-        throw new ThreadAlreadyActiveError("A turn is already active for this thread.");
-      }
-      this.reservedCodexStartThreadIds.add(params.threadId);
-    }
-    // Race-safe flush: if a queued permission-mode change is still
-    // pending when the user fires off the next turn (e.g. submit
-    // immediately after the previous turn ended), apply it before
-    // codex sees the new turn so the new turn runs under the
-    // intended profile. The emit-listener flush in `emit()` is the
-    // faster path when no immediate user action follows; this is the
-    // belt-and-suspenders guarantee. Idempotent — a no-op when no
-    // queue is present.
-    const syntheticStartedTurnId = `pending:${params.threadId}`;
     let overlay: ThreadOverlayState | undefined;
     let turnParams!: ModelSettings;
     let cwd: string | undefined;
     let activeTurnMode: ThreadExecutionMode | undefined;
     let codexThreadConfig: CodexThreadStartParams["config"] | undefined;
     let tokenMiserEnabledForThread = false;
-    try {
-      if (params.backend === "codex") {
-        await this.flushQueuedAgentChange(params.threadId, true);
-        await this.flushQueuedExecutionModeIfPresent(params.threadId);
-      }
-      overlay = await this.overlayStore.getThreadOverlayState({
-        backend: params.backend,
-        threadId: params.threadId,
-      });
-      if (params.backend === "codex") {
-        tokenMiserEnabledForThread = this.resolveTokenMiserEnabledForOverride(
-          overlay?.tokenMiserEnabled,
-        );
-      }
-      // Permission/agent changes above own the lifecycle boundary. Everything
-      // here uses that resulting overlay; only input preparation needs the PDF
-      // bridge result, and only config inventory needs the resolved cwd.
-      const cwdPreparation =
-        params.backend === "codex"
-          ? this.resolveThreadEnvironmentCwd(
-              params.backend,
-              params.threadId,
-              overlay,
-            )
-          : Promise.resolve(undefined);
-      const runtimePreparation = tokenMiserEnabledForThread
-        ? this.prepareTokenMiserRuntime()
-        : Promise.resolve();
-      const hasPdfMcpToolCatalog =
-        params.backend === "codex" && this.hasPdfMcpToolCatalog(overlay);
-      const pdfPreparation = hasPdfMcpToolCatalog && this.resolvePdfAnalysisEnabledFn()
-        ? this.registerPdfMcpClient({ threadId: params.threadId })
-        : Promise.resolve(undefined);
-      // Re-read per turn so a mid-thread change to the selection or the
-      // provider policy lands on the operator's next message.
-      const isolateFromInherited =
-        params.backend === "codex"
-        && overlay?.mcpProviderServersEnabled === false;
-      const connectionPreparation = (async () => {
-        if (params.backend !== "codex" || !(overlay?.mcpConnectionIds?.length || isolateFromInherited)) return undefined;
-        const [registrations, inheritedNames] = await joinConcurrent([
-          this.registerMcpConnections(overlay?.mcpConnectionIds ?? [], params.threadId, params.backend),
-          cwdPreparation.then((resolvedCwd) => this.readConfiguredCodexMcpServerNames(resolvedCwd)),
-        ]);
-        if (isolateFromInherited && inheritedNames === undefined) throw codexMcpIsolationUnavailableError();
-        return buildCodexConnectionMcpConfig(registrations, inheritedNames, { isolateFromInherited });
-      })();
-      const inputPreparation = listingDiagnostics.trace("workflow", { query: "input-preparation" }, async () => {
-        const registration = await pdfPreparation;
-        const preparedPdfInput = await preparePdfTurnInput({
-          handling: this.resolvePdfTurnInputHandling({ backend: params.backend, overlay, pdfMcpAvailable: registration !== undefined }),
-          input: params.input,
-        });
-        const owned = await ownThreadInputAttachments(
-          await enrichLocalFileInputs(preparedPdfInput.input, { privateStorageRoots: this.localFilePrivateStorageRoots }),
-          params,
-          this.localFilePrivateStorageRoots,
-        );
-        return { input: owned, pdfAttachments: preparedPdfInput.pdfAttachments };
-      });
-      const settingsPreparation = this.resolveModelSettings(params.backend, {
-        ...params,
-        model: migrationApplied
-          ? overlay?.model
-          : params.model ?? overlay?.model,
-        serviceTier: params.serviceTier ?? overlay?.serviceTier,
-        reasoningEffort: migrationApplied
-          ? overlay?.reasoningEffort
-          : params.reasoningEffort ?? overlay?.reasoningEffort,
-        fastMode: params.backend === "codex" ? params.fastMode ?? overlay?.fastMode : undefined,
-      });
-      const [, connectionConfig, preparedInput, settings, resolvedCwd, pdfRegistration] = await joinConcurrent([
-        runtimePreparation, connectionPreparation, inputPreparation, settingsPreparation, cwdPreparation, pdfPreparation,
-      ]);
-      cwd = resolvedCwd;
-      turnParams = settings;
-      input = preparedInput.input;
-      pdfAttachments = preparedInput.pdfAttachments;
-      codexThreadConfig = mergeCodexThreadConfigs(
-        hasPdfMcpToolCatalog ? (pdfRegistration ? buildCodexPdfMcpConfig(pdfRegistration) : buildCodexPdfMcpDisabledConfig()) : undefined,
-        connectionConfig,
-      );
-      await this.emit({
-        backend: params.backend,
-        notification: {
-          method: "turn/started",
-          params: {
-            threadId: params.threadId,
-            turnId: syntheticStartedTurnId,
-            turn: {
-              id: syntheticStartedTurnId,
-              status: "in_progress",
-              startedAt: Date.now(),
-            },
-          },
-        },
-      });
-    } catch (error) {
-      await this.drainPendingReviewStartsForTerminalTurn({
-        backend: params.backend,
-        threadId: params.threadId,
-        turnId: syntheticStartedTurnId,
-        method: "turn/failed",
-      });
-      this.activeCodexTurnModes.delete(
-        buildActiveTurnModeKey(params.threadId, syntheticStartedTurnId),
-      );
-      if (reserveCodexStart) {
-        this.reservedCodexStartThreadIds.delete(params.threadId);
-      }
-      throw error;
-    }
-
-    let result: { threadId: string; turnId: string };
-    const titleGenerationKey = buildTitleGenerationKey(
-      params.backend,
-      params.threadId,
-    );
-    // Title generation can be scheduled from a lifecycle event before this
-    // turn/start call resolves. It must receive the same prepared input that
-    // goes to the agent, not raw local PDF references from the composer.
-    this.pendingTitleGenerationInputs.set(titleGenerationKey, input);
-    const pendingMessageContextId = await this.registerPendingThreadMessageContext({
-      backend: params.backend,
-      input,
+    let codexStartObservation: { sequence: number; previous?: { sequence: number; status: AppServerThreadStatus } } | undefined;
+    const { pendingTurnId: syntheticStartedTurnId, context: pendingMessageContextId } = await this.threadStarts.prepareCodex({
       threadId: params.threadId,
-      origin: resolveThreadMessageOrigin(params),
-      text: extractFirstMeaningfulTextInput(input),
+      reserve: (pendingTurnId) => {
+        if (!reserveCodexStart) return;
+        if (this.threadHasActiveTurn(params.threadId)) {
+          throw new ThreadAlreadyActiveError("A turn is already active for this thread.");
+        }
+        this.reservedCodexStartThreadIds.add(params.threadId);
+        this.activeCodexTurnCollaborationModes.set(
+          buildActiveTurnKey("codex", params.threadId, pendingTurnId),
+          params.collaborationMode?.mode ?? "default",
+        );
+      },
+      prepare: async () => {
+        if (params.backend === "codex") {
+          await this.flushQueuedAgentChange(params.threadId, true);
+          await this.flushQueuedExecutionModeIfPresent(params.threadId);
+        }
+        overlay = await this.overlayStore.getThreadOverlayState({
+          backend: params.backend,
+          threadId: params.threadId,
+        });
+        if (params.backend === "codex") {
+          tokenMiserEnabledForThread = this.resolveTokenMiserEnabledForOverride(
+            overlay?.tokenMiserEnabled,
+          );
+        }
+        // Permission/agent changes above own the lifecycle boundary. Everything
+        // here uses that resulting overlay; only input preparation needs the PDF
+        // bridge result, and only config inventory needs the resolved cwd.
+        const cwdPreparation =
+          params.backend === "codex"
+            ? this.resolveThreadEnvironmentCwd(
+                params.backend,
+                params.threadId,
+                overlay,
+              )
+            : Promise.resolve(undefined);
+        const runtimePreparation = tokenMiserEnabledForThread
+          ? this.prepareTokenMiserRuntime()
+          : Promise.resolve();
+        const hasPdfMcpToolCatalog =
+          params.backend === "codex" && this.hasPdfMcpToolCatalog(overlay);
+        const pdfPreparation = hasPdfMcpToolCatalog && this.resolvePdfAnalysisEnabledFn()
+          ? this.registerPdfMcpClient({ threadId: params.threadId })
+          : Promise.resolve(undefined);
+        // Re-read per turn so a mid-thread change to the selection or the
+        // provider policy lands on the operator's next message.
+        const isolateFromInherited =
+          params.backend === "codex"
+          && overlay?.mcpProviderServersEnabled === false;
+        const connectionPreparation = (async () => {
+          if (params.backend !== "codex" || !(overlay?.mcpConnectionIds?.length || isolateFromInherited)) return undefined;
+          const [registrations, inheritedNames] = await joinConcurrent([
+            this.registerMcpConnections(overlay?.mcpConnectionIds ?? [], params.threadId, params.backend),
+            cwdPreparation.then((resolvedCwd) => this.readConfiguredCodexMcpServerNames(resolvedCwd)),
+          ]);
+          if (isolateFromInherited && inheritedNames === undefined) throw codexMcpIsolationUnavailableError();
+          return buildCodexConnectionMcpConfig(registrations, inheritedNames, { isolateFromInherited });
+        })();
+        const inputPreparation = listingDiagnostics.trace("workflow", { query: "input-preparation" }, async () => {
+          const registration = await pdfPreparation;
+          const preparedPdfInput = await preparePdfTurnInput({
+            handling: this.resolvePdfTurnInputHandling({ backend: params.backend, overlay, pdfMcpAvailable: registration !== undefined }),
+            input: params.input,
+          });
+          const owned = await ownThreadInputAttachments(
+            await enrichLocalFileInputs(preparedPdfInput.input, { privateStorageRoots: this.localFilePrivateStorageRoots }),
+            params,
+            this.localFilePrivateStorageRoots,
+          );
+          return { input: owned, pdfAttachments: preparedPdfInput.pdfAttachments };
+        });
+        const settingsPreparation = this.resolveModelSettings(params.backend, {
+          ...params,
+          model: migrationApplied
+            ? overlay?.model
+            : params.model ?? overlay?.model,
+          serviceTier: params.serviceTier ?? overlay?.serviceTier,
+          reasoningEffort: migrationApplied
+            ? overlay?.reasoningEffort
+            : params.reasoningEffort ?? overlay?.reasoningEffort,
+          fastMode: params.backend === "codex" ? params.fastMode ?? overlay?.fastMode : undefined,
+        });
+        const [, connectionConfig, preparedInput, settings, resolvedCwd, pdfRegistration] = await joinConcurrent([
+          runtimePreparation, connectionPreparation, inputPreparation, settingsPreparation, cwdPreparation, pdfPreparation,
+        ]);
+        cwd = resolvedCwd;
+        turnParams = settings;
+        input = preparedInput.input;
+        pdfAttachments = preparedInput.pdfAttachments;
+        codexThreadConfig = mergeCodexThreadConfigs(
+          hasPdfMcpToolCatalog ? (pdfRegistration ? buildCodexPdfMcpConfig(pdfRegistration) : buildCodexPdfMcpDisabledConfig()) : undefined,
+          connectionConfig,
+        );
+      },
+      announce: (pendingTurnId) => {
+        codexStartObservation = { sequence: this.reserveCodexThreadStatusObservationSequence(),
+          previous: this.observedCodexThreadStatuses.get(params.threadId) };
+        return this.emit(buildTurnStartEvent(params, pendingTurnId), codexStartObservation.sequence);
+      },
+      rememberInput: () => this.threadTitles.rememberPendingInput(params, input),
+      registerContext: () => this.registerPendingThreadMessageContext({
+        backend: params.backend,
+        input,
+        threadId: params.threadId,
+        origin: resolveThreadMessageOrigin(params),
+        text: extractFirstMeaningfulTextInput(input),
+      }),
+      forgetContext: (context) => this.forgetPendingThreadMessageContext(context),
+      fail: async (pendingTurnId, error, announced) => {
+        if (announced) await this.emit(buildTurnStartFailureEvent(params, pendingTurnId, error), codexStartObservation?.sequence);
+        else await this.drainPendingReviewStartsForTerminalTurn({
+          backend: params.backend,
+          threadId: params.threadId,
+          turnId: pendingTurnId,
+          method: "turn/failed",
+        });
+      },
+      retire: (pendingTurnId) => this.retireCodexTurnStart(params, pendingTurnId, reserveCodexStart, codexStartObservation),
     });
     const retryableCodexTurnStart: CodexRetryableTurnStart | undefined =
       params.backend === "codex" && !params.invalidIdRecoveryAttempted
@@ -23919,8 +24580,10 @@ export class DesktopBackendRegistry {
       threadId: params.threadId,
       origin: resolveThreadMessageOrigin(params),
     });
-    try {
-      result = await this.withCodexThreadClient(
+    const submitted = await this.threadStarts.submitCodex({
+      identity: params,
+      pendingTurnId: syntheticStartedTurnId,
+      submit: async () => await this.withCodexThreadClient(
         params.threadId,
         async (client, mode) => {
           if (this.closed) {
@@ -23981,151 +24644,120 @@ export class DesktopBackendRegistry {
           return started;
         },
         params.executionMode,
-      );
-    } catch (error) {
-      this.dropStartingTurnOrigin(startingOrigin);
-      await this.emit({
-        backend: params.backend,
-        notification: {
-          method: "turn/failed",
-          params: {
-            threadId: params.threadId,
-            turnId: syntheticStartedTurnId,
-            turn: {
-              id: syntheticStartedTurnId,
-              status: "failed",
-              completedAt: Date.now(),
-              error: {
-                message: error instanceof Error ? error.message : String(error),
-              },
-            },
-          },
-        },
-      });
-      this.activeCodexTurnModes.delete(
-        buildActiveTurnModeKey(params.threadId, syntheticStartedTurnId),
-      );
-      if (reserveCodexStart) {
-        this.reservedCodexStartThreadIds.delete(params.threadId);
-      }
-      this.pendingTitleGenerationInputs.delete(titleGenerationKey);
-      this.forgetPendingThreadMessageContext(pendingMessageContextId);
-      if (
-        retryableCodexTurnStart
-        && this.codexClient.recoverInvalidPersistedResponseMessageIds
-        && isCodexInvalidResponseMessageIdError(error)
-      ) {
-        try {
+      ),
+      activeTurns: () => [...this.activeTurnKeys].flatMap((key) => {
+        const active = parseActiveTurnKey(key);
+        return active ? [active] : [];
+      }),
+      fail: async (error) => {
+        this.dropStartingTurnOrigin(startingOrigin);
+        await this.emit(buildTurnStartFailureEvent(params, syntheticStartedTurnId, error), codexStartObservation?.sequence);
+      },
+      retireFailed: () => {
+        this.retireCodexTurnStart(params, syntheticStartedTurnId, reserveCodexStart, codexStartObservation);
+        this.forgetPendingThreadMessageContext(pendingMessageContextId);
+      },
+      discardRetry: () => {
+        if (retryableCodexTurnStart && this.codexRetryableOperations.get(params.threadId) === retryableCodexTurnStart) {
+          this.codexRetryableOperations.delete(params.threadId);
+        }
+      },
+      recovery: retryableCodexTurnStart && this.codexClient.recoverInvalidPersistedResponseMessageIds ? {
+        accepts: isCodexInvalidResponseMessageIdError,
+        run: async (failureMessage) => {
           const recovery = await this.queueCodexInvalidIdRecovery(
             retryableCodexTurnStart,
-            error instanceof Error ? error.message : String(error),
+            failureMessage,
           );
           this.maybeDrainCodexInvalidIdRecoveries();
           return await recovery.completion;
-        } catch (recoveryError) {
-          await this.emitCodexInvalidIdRecoveryUpdate({
-            failureMessage: error instanceof Error ? error.message : String(error),
-            recoveryError:
-              recoveryError instanceof Error
-                ? recoveryError.message
-                : String(recoveryError),
-            status: "failed",
-            threadId: params.threadId,
-            turnId: syntheticStartedTurnId,
-          });
-        }
-      }
-      if (retryableCodexTurnStart) {
-        this.codexRetryableOperations.delete(params.threadId);
-      }
-      throw error;
-    }
-    this.bindStartingTurnOrigin(startingOrigin, result);
-    if (retryableCodexTurnStart) {
-      retryableCodexTurnStart.turnId = result.turnId;
-    }
-    this.pdfAttachmentStore.bindTurn(
-      {
-        backend: params.backend,
-        threadId: result.threadId,
-        turnId: result.turnId,
-      },
-      pdfAttachments,
-    );
-    this.bindPendingThreadMessageContext(pendingMessageContextId, result.turnId);
-    await this.persistStartingTurnOrigin(startingOrigin);
-    this.rebindPendingReviewStartsForStartedTurn({
-      backend: params.backend,
-      threadId: params.threadId,
-      pendingTurnId: syntheticStartedTurnId,
-      turnId: result.turnId,
+        },
+        failed: (details) => this.emitCodexInvalidIdRecoveryUpdate(details),
+      } : undefined,
     });
-    this.activeCodexTurnModes.delete(
-      buildActiveTurnModeKey(params.threadId, syntheticStartedTurnId),
-    );
-    this.activeTurnKeys.delete(
-      buildActiveTurnKey(params.backend, params.threadId, syntheticStartedTurnId),
-    );
-    if (
-      params.backend === "codex"
-      && activeTurnMode
-      && !retryableCodexTurnStart?.terminalObserved
-    ) {
-      this.activeCodexTurnModes.set(
-        buildActiveTurnModeKey(result.threadId, result.turnId),
-        activeTurnMode,
-      );
-    }
-    if (reserveCodexStart) {
-      this.reservedCodexStartThreadIds.delete(params.threadId);
-      this.maybeDrainCodexInvalidIdRecoveries();
-    }
-
-    if (
-      turnParams.model !== undefined ||
-      turnParams.reasoningEffort !== undefined ||
-      turnParams.serviceTier !== undefined ||
-      turnParams.fastMode !== undefined
-    ) {
-      await this.overlayStore.setThreadModelSettings({
+    if (submitted.kind === "recovered") return submitted.response;
+    const result = submitted.turn;
+    return await this.threadStarts.finalizeCodex({
+      identity: params, turn: result, settings: turnParams, executionMode: params.executionMode,
+      bindOrigin: () => this.bindStartingTurnOrigin(startingOrigin, result),
+      bindRetry: () => { if (retryableCodexTurnStart) retryableCodexTurnStart.turnId = result.turnId; },
+      bindPdf: () => this.pdfAttachmentStore.bindTurn(
+        { backend: params.backend, threadId: result.threadId, turnId: result.turnId }, pdfAttachments,
+      ),
+      bindContext: () => this.bindPendingThreadMessageContext(pendingMessageContextId, result.turnId),
+      persistOrigin: () => this.persistStartingTurnOrigin(startingOrigin),
+      disposeOrigin: () => this.dropStartingTurnOrigin(startingOrigin),
+      handoff: {
+        identity: params, pendingTurnId: syntheticStartedTurnId, turn: result,
+        get terminalObserved() { return retryableCodexTurnStart?.terminalObserved ?? false; },
+        executionMode: activeTurnMode, reserved: reserveCodexStart,
+        bindReview: () => this.rebindPendingReviewStartsForStartedTurn({
+          backend: params.backend, threadId: params.threadId,
+          pendingTurnId: syntheticStartedTurnId, turnId: result.turnId,
+        }),
+        activateCollaboration: () => this.activeCodexTurnCollaborationModes.set(
+          buildActiveTurnKey("codex", result.threadId, result.turnId), params.collaborationMode?.mode ?? "default",
+        ),
+        retirePending: () => {
+          this.activeCodexTurnModes.delete(buildActiveTurnModeKey(params.threadId, syntheticStartedTurnId));
+          this.activeTurnKeys.delete(buildActiveTurnKey(params.backend, params.threadId, syntheticStartedTurnId));
+        },
+        activateExecutionMode: (mode) => this.activeCodexTurnModes.set(buildActiveTurnModeKey(result.threadId, result.turnId), mode),
+        release: () => {
+          this.reservedCodexStartThreadIds.delete(params.threadId);
+          this.maybeDrainCodexInvalidIdRecoveries();
+        },
+      },
+      persistModel: () => this.overlayStore.setThreadModelSettings({
         backend: params.backend,
         threadId: result.threadId,
         ...turnParams,
-      });
-    }
-    if (params.backend === "codex" && params.executionMode) {
-      await this.overlayStore.setThreadExecutionMode({
+      }),
+      persistExecutionMode: () => this.overlayStore.setThreadExecutionMode({
         backend: params.backend,
         threadId: result.threadId,
-        executionMode: params.executionMode,
-      });
-    }
-    const response = {
-      backend: params.backend,
-      threadId: result.threadId,
-      turnId: result.turnId,
-    };
-    await this.rememberTurnInputAttachments({
-      backend: params.backend,
-      threadId: result.threadId,
-      turnId: result.turnId,
-      input,
-    });
-    this.scheduleCompletedTurnFromReplay({
-      backend: params.backend,
-      threadId: result.threadId,
-      turnId: result.turnId,
-    });
-    if (!isAcpBackendId(params.backend)) {
-      this.pendingTitleGenerationInputs.delete(titleGenerationKey);
-      this.scheduleThreadTitleGeneration({
+        executionMode: params.executionMode!,
+      }),
+      retainAttachments: () => this.rememberTurnInputAttachments({
         backend: params.backend,
         threadId: result.threadId,
+        turnId: result.turnId,
         input,
-      });
-    }
+      }),
+      scheduleReplay: () => this.scheduleCompletedTurnFromReplay({
+        backend: params.backend, threadId: result.threadId, turnId: result.turnId,
+      }),
+      forgetTitleInput: () => this.threadTitles.forgetPendingInput(params),
+      scheduleTitle: () => this.scheduleThreadTitleGeneration({ backend: params.backend, threadId: result.threadId, input }),
+      failed: (stage, error) => backendRegistryLog.warn("accepted_turn_finalization_failed", {
+        backend: params.backend, threadId: result.threadId, turnId: result.turnId, stage,
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    });
+  }
 
-    return response;
+  private retireCodexTurnStart(params: { backend: AppServerBackendKind; threadId: string }, pendingTurnId: string, reserved: boolean,
+    observation?: { sequence: number; previous?: { sequence: number; status: AppServerThreadStatus } },
+  ): void {
+    this.activeCodexTurnCollaborationModes.delete(buildActiveTurnKey(params.backend, params.threadId, pendingTurnId));
+    this.activeCodexTurnModes.delete(buildActiveTurnModeKey(params.threadId, pendingTurnId));
+    this.activeTurnKeys.delete(buildActiveTurnKey(params.backend, params.threadId, pendingTurnId));
+    if (reserved) this.reservedCodexStartThreadIds.delete(params.threadId);
+    // A list read during terminal delivery can project the still-reserved
+    // start as active. Once released, restore the latest status observation;
+    // a newer provider status or another real turn retains its authority.
+    if (reserved && observation && this.observedCodexThreadStatuses.get(params.threadId)?.sequence === observation.sequence) {
+      // Restore only the observation owned by this synthetic start. Genuine
+      // status/turn events have a newer sequence and remain authoritative.
+      if (observation.previous) this.observedCodexThreadStatuses.set(params.threadId, observation.previous);
+      else {
+        this.observedCodexThreadStatuses.delete(params.threadId);
+        this.backendActiveCodexThreadIds.delete(params.threadId);
+      }
+    }
+    const observedStatus = this.observedCodexThreadStatuses.get(params.threadId)?.status;
+    if (reserved && observedStatus) this.seedBackendCodexThreadStatus(params.threadId, observedStatus);
+    this.threadTitles.forgetPendingInput(params);
   }
 
   private async registerPendingThreadMessageContext(params: {
@@ -24137,6 +24769,9 @@ export class DesktopBackendRegistry {
     turnId?: string;
     retainAttachments?: boolean;
   }): Promise<string | undefined> {
+    const admittedCodexTurnSequence = params.backend === "codex" && !params.turnId
+      ? this.codexMessageContextTurnSequence
+      : undefined;
     const imageParts = await pendingThreadMessageImageParts(params.input, params);
     const retainedInput = params.retainAttachments
       ? await stageTurnInputAttachmentsForRetention(
@@ -24158,6 +24793,7 @@ export class DesktopBackendRegistry {
     this.pendingThreadMessageContexts.set(id, {
       backend: params.backend,
       createdAt: Date.now(),
+      ...(admittedCodexTurnSequence !== undefined ? { admittedCodexTurnSequence } : {}),
       id,
       ...(imageParts.length > 0 ? { imageParts } : {}),
       ...(retainedInput.length > 0 ? { retainedInput } : {}),
@@ -24208,6 +24844,9 @@ export class DesktopBackendRegistry {
     text?: string;
     turnId?: string;
   }): PendingThreadMessageContext | undefined {
+    const observedCodexTurnSequence = params.backend === "codex" && params.turnId
+      ? this.codexMessageContextTurnObservations.get(params.threadId)?.get(params.turnId)
+      : undefined;
     const candidates = [...this.pendingThreadMessageContexts.values()]
       .filter(
         (pending) =>
@@ -24225,6 +24864,15 @@ export class DesktopBackendRegistry {
             !pending.turnId
             || !params.turnId
             || pending.turnId === params.turnId
+          )
+          // An unbound start may receive its real user item before the start
+          // response. Identical text from a previously observed turn cannot
+          // claim that context while the new provider identity is unknown.
+          && (
+            pending.turnId
+            || pending.admittedCodexTurnSequence === undefined
+            || observedCodexTurnSequence === undefined
+            || observedCodexTurnSequence > pending.admittedCodexTurnSequence
           ),
       )
       .sort((left, right) => left.createdAt - right.createdAt);
@@ -24257,17 +24905,19 @@ export class DesktopBackendRegistry {
           turn: { id: string };
         };
       };
+      const turnId = notification.params.turnId ?? notification.params.turn.id;
+      // An optimistic start owns admission, not a provider turn. Context is
+      // staged before it now, and must stay unbound for provider user items
+      // that can arrive before the start response or provider turn/started.
+      if (event.backend === "codex" && turnId === `pending:${notification.params.threadId}`) {
+        return event;
+      }
       const pending = this.findPendingThreadMessageContext({
         backend: event.backend,
         threadId: notification.params.threadId,
-        turnId:
-          notification.params.turnId
-          ?? notification.params.turn.id,
+        turnId,
       });
       if (pending && !pending.turnId) {
-        const turnId =
-          notification.params.turnId
-          ?? notification.params.turn.id;
         pending.turnId = turnId;
         this.mergeTurnInputAttachments({
           backend: pending.backend,
@@ -24527,11 +25177,22 @@ export class DesktopBackendRegistry {
     trustedSnapshot = false,
     turnAttribution?: ReturnType<typeof delegatedTurnAttribution>,
   ): Promise<StartReviewResponse> {
+    this.assertThreadOwnership();
     // Retain terminal evidence only for the lifetime of this start request.
     const terminals = new Map<string, ReviewTerminal>();
     this.pendingReviewTerminals.add(terminals);
+    // Armed before the start, so a review that lands at once still fixes.
+    const autoFix = getReviewAutoFixArming().starting(
+      { backend: params.backend, threadId: params.threadId },
+      params.afterReview,
+    );
     try {
-      return await this.startReviewWithTerminalEvidence(params, terminals, trustedSnapshot, turnAttribution);
+      const response = await this.startReviewWithTerminalEvidence(params, terminals, trustedSnapshot, turnAttribution);
+      autoFix.accepted(response.turnId);
+      return response;
+    } catch (error) {
+      autoFix.refused();
+      throw error;
     } finally {
       this.pendingReviewTerminals.delete(terminals);
     }
@@ -24545,6 +25206,8 @@ export class DesktopBackendRegistry {
   ): Promise<StartReviewResponse> {
     this.assertNotBootstrap("startReview");
     await this.assertThreadNotLocked(params.backend, params.threadId);
+    // A review reads the checkout, so a hibernated one comes back first.
+    await this.ensureCheckoutAwake(params);
     params = await this.prepareReviewRequest(params, trustedSnapshot);
     const acpManagedMode =
       isAcpBackendId(params.backend)
@@ -25833,107 +26496,58 @@ export class DesktopBackendRegistry {
     threadId: string;
     turnId: string;
   }): Promise<{ backend: AppServerBackendKind; threadId: string; turnId: string }> {
-    this.mcpGatewayTools?.cancel(params.backend, params.threadId, params.turnId);
-    if (params.backend === "claude") return { backend: "claude", ...await this.claudeBackend.interruptTurn(params) };
-    const review = this.findReviewForParentTurn({
-      backend: params.backend,
-      parentThreadId: params.threadId,
-      turnId: params.turnId,
-    });
-    if (review) {
-      if (isAcpBackendId(review.backend)) {
-        const childLockKey = executionModeQueueKey(
-          review.backend,
-          review.reviewThreadId,
-        );
-        await this.acpSessionPromptLocks.run(
-          childLockKey,
-          async () => await this.interruptAcpTurn({
-            backend: review.backend,
-            threadId: review.reviewThreadId,
-            turnId: review.turnId,
-          }),
-        );
-        backendRegistryLog.info("managed ACP review interrupt requested", {
-          parentThreadId: review.parentThreadId,
-          reviewThreadId: review.reviewThreadId,
-          turnId: review.turnId,
-        });
-        return params;
-      }
-      const activeMode = this.activeCodexTurnModes.get(
-        buildActiveTurnModeKey(
-          review.reviewThreadId,
-          review.turnId,
-        ),
-      );
-      const client = activeMode
-        ? this.getClient("codex", activeMode)
-        : this.codexClient;
-      await client.interruptTurn({
-        threadId: review.reviewThreadId,
-        turnId: this.activeCodexReviewInterruptTurnIds.get(
-          buildActiveTurnModeKey(review.reviewThreadId, review.turnId),
-        ) ?? review.turnId,
+    return await this.threadInterruption.interruptTurn(params);
+  }
+
+  private readonly threadInterruption = new ThreadInterruptionLifecycle({
+    cancelTools: (target) => { this.mcpGatewayTools?.cancel(target.backend, target.threadId, target.turnId); },
+    findReview: (target) => {
+      const review = this.findReviewForParentTurn({
+        backend: target.backend, parentThreadId: target.threadId, turnId: target.turnId,
       });
-      backendRegistryLog.info("review interrupt requested", {
-        parentThreadId: review.parentThreadId,
-        reviewThreadId: review.reviewThreadId,
+      return review ? { backend: review.backend, threadId: review.reviewThreadId, turnId: review.turnId } : undefined;
+    },
+    readCodexInterruptTurnId: (target) => this.activeCodexReviewInterruptTurnIds.get(
+      buildActiveTurnModeKey(target.threadId, target.turnId),
+    ),
+    interruptClaude: async (target) => await this.claudeBackend.interruptTurn(target),
+    interruptAcp: async (target, serializePrompt) => serializePrompt
+      ? await this.acpSessionPromptLocks.run(executionModeQueueKey(target.backend, target.threadId),
+          async () => await this.interruptAcpTurn(target))
+      : await this.interruptAcpTurn(target),
+    interruptCodex: async (target, routing) => {
+      const requestedKey = buildActiveTurnModeKey(target.threadId, routing.requestedTurnId);
+      const activeMode = routing.review
+        ? this.activeCodexTurnModes.get(requestedKey)
+        : this.activeCodexTurnModes.get(buildActiveTurnModeKey(target.threadId, target.turnId))
+          ?? this.activeCodexTurnModes.get(requestedKey);
+      if (routing.review) {
+        const client = activeMode ? this.getClient("codex", activeMode) : this.codexClient;
+        return await client.interruptTurn({ threadId: target.threadId, turnId: target.turnId });
+      }
+      return activeMode
+        ? await this.getClient("codex", activeMode).interruptTurn(target)
+        : await this.withCodexThreadClient(target.threadId, async (client) => await client.interruptTurn(target));
+    },
+    retireCodexTurn: (requested, result) => {
+      const requestedKey = buildActiveTurnModeKey(requested.threadId, requested.turnId);
+      const activeKey = buildActiveTurnModeKey(result.threadId, result.turnId);
+      this.activeCodexTurnModes.delete(activeKey);
+      this.activeCodexReviewTurnKeys.delete(activeKey);
+      if (requestedKey !== activeKey) {
+        this.activeCodexTurnModes.delete(requestedKey);
+        this.activeCodexReviewTurnKeys.delete(requestedKey);
+      }
+    },
+    reviewInterrupted: (parent, review) => {
+      backendRegistryLog.info(isAcpBackendId(review.backend)
+        ? "managed ACP review interrupt requested" : "review interrupt requested", {
+        parentThreadId: parent.threadId,
+        reviewThreadId: review.threadId,
         turnId: review.turnId,
       });
-      return params;
-    }
-
-    if (isAcpBackendId(params.backend)) {
-      return await this.interruptAcpTurn(params);
-    }
-
-    const requestedCodexTurnModeKey =
-      params.backend === "codex"
-        ? buildActiveTurnModeKey(params.threadId, params.turnId)
-        : undefined;
-    const codexInterruptTurnId =
-      requestedCodexTurnModeKey
-        ? this.activeCodexReviewInterruptTurnIds.get(requestedCodexTurnModeKey) ??
-          params.turnId
-        : params.turnId;
-    const interruptParams =
-      params.backend === "codex" && codexInterruptTurnId !== params.turnId
-        ? { ...params, turnId: codexInterruptTurnId }
-        : params;
-    const activeCodexTurnMode =
-      params.backend === "codex"
-        ? this.activeCodexTurnModes.get(
-            buildActiveTurnModeKey(params.threadId, codexInterruptTurnId),
-          ) ??
-          (requestedCodexTurnModeKey
-            ? this.activeCodexTurnModes.get(requestedCodexTurnModeKey)
-            : undefined)
-        : undefined;
-    const result = activeCodexTurnMode
-      ? await this.getClient("codex", activeCodexTurnMode).interruptTurn(
-          interruptParams,
-        )
-      : await this.withCodexThreadClient(params.threadId, async (client) =>
-          await client.interruptTurn(interruptParams),
-        );
-
-    if (params.backend === "codex") {
-      const activeTurnModeKey = buildActiveTurnModeKey(result.threadId, result.turnId);
-      this.activeCodexTurnModes.delete(activeTurnModeKey);
-      this.activeCodexReviewTurnKeys.delete(activeTurnModeKey);
-      if (requestedCodexTurnModeKey && requestedCodexTurnModeKey !== activeTurnModeKey) {
-        this.activeCodexTurnModes.delete(requestedCodexTurnModeKey);
-        this.activeCodexReviewTurnKeys.delete(requestedCodexTurnModeKey);
-      }
-    }
-
-    return {
-      backend: params.backend,
-      threadId: result.threadId,
-      turnId: result.turnId,
-    };
-  }
+    },
+  });
 
   /**
    * Turns a backend scheduled in its own live process, from memory. Only
@@ -26110,6 +26724,28 @@ export class DesktopBackendRegistry {
       };
     }
 
+    if (isClaudeNativeSubAgent(subAgent)) {
+      const taskId = subAgent.monitorId.slice(CLAUDE_NATIVE_SUBAGENT_MONITOR_ID_PREFIX.length);
+      if (this.claudeBackend.runsTask(params.threadId, taskId)) {
+        // Claude stops the task; its notification then settles the card.
+        await this.claudeBackend.stopBackgroundTask(params.threadId, taskId);
+      } else {
+        // Claude's process is gone and the card missed its end. Nothing runs
+        // to stop, so end the card here rather than refuse forever.
+        await this.recordClaudeSubAgents({ threadId: params.threadId, subAgents: [{
+          monitorId: subAgent.monitorId, taskId, task: subAgent.task, status: "cancelled",
+          lastMessage: "Stopped by user.",
+          ...(subAgent.agentName ? { agentName: subAgent.agentName } : {}),
+        }] });
+      }
+      return {
+        backend: params.backend,
+        threadId: params.threadId,
+        monitorId: params.monitorId,
+        stoppedAt: Date.now(),
+      };
+    }
+
     if (!subAgent.monitorThreadId || !subAgent.monitorTurnId) {
       throw new Error("Sub-agent does not expose an active turn to stop.");
     }
@@ -26207,6 +26843,7 @@ export class DesktopBackendRegistry {
     if (this.closed) throw new Error("Desktop backend registry is closed");
     // Compaction runs a backend turn, so a lock refuses it like any other.
     await this.assertThreadNotLocked(params.backend, params.threadId);
+    await this.ensureCheckoutAwake(params);
     if (
       this.reservedCodexStartThreadIds.has(params.threadId)
       || this.threadHasActiveTurn(params.threadId, "codex")
@@ -26394,42 +27031,32 @@ export class DesktopBackendRegistry {
     params: SteerTurnRequest,
     messageOrigin?: AppServerThreadMessageOrigin,
   ): Promise<SteerTurnResponse> {
-    const requestKey = buildSteerRequestKey(params);
-    const signature = buildSteerRequestSignature(params, messageOrigin);
-    const accepted = this.acceptedSteerRequests.get(requestKey);
-    if (accepted) {
-      if (accepted.signature !== signature) {
-        throw new Error(
-          `Steer request id ${params.requestId} was reused with different input`,
-        );
-      }
-      return await accepted.promise;
-    }
+    return await this.threadSteering.steerTurn(params, messageOrigin);
+  }
 
-    const promise = this.submitSteerTurn(params, messageOrigin);
-    this.acceptedSteerRequests.set(requestKey, { promise, signature });
-    try {
-      const result = await promise;
-      if (result.disposition === "steered" && messageOrigin) {
-        const turn = { backend: params.backend, threadId: params.threadId, turnId: result.turnId };
-        // Read-modify-write: overlapping steers must merge, not overwrite.
-        await this.turnCausalContextLocks.run(`${turn.backend}:${turn.threadId}:${turn.turnId}`, async () => {
-          const previous = await this.readTurnCausalMessagingOrigin(turn);
-          if (isCausalMessagingContext(previous) || isCausalMessagingContext(messageOrigin)) {
-            // `user:<turnId>` is also the first prompt's displayed origin, and
-            // the steerer did not write that prompt. Keep routing in its own row.
-            await this.persistThreadMessageOrigin({ backend: turn.backend, threadId: turn.threadId,
-              messageId: buildTurnCausalMessagingContextId(turn.turnId),
-              origin: { kind: messageOrigin.kind, ...mergeCausalMessagingContext([previous, messageOrigin]) } });
-          }
-        });
-      }
-      return result;
-    } catch (error) {
-      if (this.acceptedSteerRequests.get(requestKey)?.promise === promise) {
-        this.acceptedSteerRequests.delete(requestKey);
-      }
-      throw error;
+  private readonly threadSteering = new ThreadSteeringLifecycle({
+    submit: (params, origin) => this.submitSteerTurn(params, origin),
+    complete: (params, result, origin) => this.completeSteerTurn(params, result, origin),
+  });
+
+  private async completeSteerTurn(
+    params: SteerTurnRequest,
+    result: SteerTurnResponse,
+    messageOrigin?: AppServerThreadMessageOrigin,
+  ): Promise<void> {
+    if (result.disposition === "steered" && messageOrigin) {
+      const turn = { backend: params.backend, threadId: params.threadId, turnId: result.turnId };
+      // Read-modify-write: overlapping steers must merge, not overwrite.
+      await this.turnCausalContextLocks.run(`${turn.backend}:${turn.threadId}:${turn.turnId}`, async () => {
+        const previous = await this.readTurnCausalMessagingOrigin(turn);
+        if (isCausalMessagingContext(previous) || isCausalMessagingContext(messageOrigin)) {
+          // `user:<turnId>` is also the first prompt's displayed origin, and
+          // the steerer did not write that prompt. Keep routing in its own row.
+          await this.persistThreadMessageOrigin({ backend: turn.backend, threadId: turn.threadId,
+            messageId: buildTurnCausalMessagingContextId(turn.turnId),
+            origin: { kind: messageOrigin.kind, ...mergeCausalMessagingContext([previous, messageOrigin]) } });
+        }
+      });
     }
   }
 
@@ -26550,6 +27177,18 @@ export class DesktopBackendRegistry {
       ...(result.promptText ? { promptText: result.promptText } : {}),
       ...(result.restoredFileCount !== undefined ? { restoredFileCount: result.restoredFileCount } : {}),
     };
+  }
+
+  /** A Claude thread whose session Claude Code deleted continues in a new
+   * one, primed with the thread's own record of the conversation. */
+  async continueClaudeThreadInNewSession(request: { threadId: string }): Promise<{ threadId: string }> {
+    await this.assertThreadNotLocked("claude", request.threadId);
+    try {
+      return await this.claudeBackend.continueInNewSession(request.threadId);
+    } finally {
+      // A message queued behind the failed turn can go now.
+      this.threadTurnQueue.scheduleThreadDrain({ backend: "claude", threadId: request.threadId });
+    }
   }
 
   /**
@@ -26688,21 +27327,14 @@ export class DesktopBackendRegistry {
   private async submitSteerTurn(
     params: SteerTurnRequest,
     messageOrigin?: AppServerThreadMessageOrigin,
-  ): Promise<SteerTurnResponse> {
-    // Refuse before any attachment is copied into private storage.
-    if (params.delivery === "now" && params.backend !== "claude") {
-      throw new Error("This backend cannot interrupt a running response. Steer or queue the message instead.");
-    }
-    await this.assertThreadNotLocked(params.backend, params.threadId);
-    // While the restart gate is shut, a steer that did not come from the
-    // operator (messaging, another thread, a monitor) waits in the queue
-    // like any other automatic message. The quiet restart's own steer and
-    // the operator's go through.
-    if (
-      this.isRestartGateClosed()
-      && messageOrigin
-      && messageOrigin.systemReason !== "app-restart"
-    ) {
+  ): Promise<ThreadSteeringSubmission> {
+    return await this.threadSteerSubmission.submit(params, messageOrigin);
+  }
+
+  private readonly threadSteerSubmission = new ThreadSteerSubmissionLifecycle({
+    assertUnlocked: (request) => this.assertThreadNotLocked(request.backend, request.threadId),
+    isRestartGateClosed: () => this.isRestartGateClosed(),
+    queue: async (params, messageOrigin, origin) => {
       const queued = await this.admitThreadAttachments(
         { backend: params.backend, threadId: params.threadId, input: params.input },
         (input, onAdmission) => this.threadTurnQueue.submitSteer({
@@ -26710,100 +27342,84 @@ export class DesktopBackendRegistry {
           threadId: params.threadId,
           input,
           messageOrigin,
-          origin: messageOrigin.kind === "messaging" ? "messaging" : "manual",
+          origin,
         }, { onAdmission }),
       );
-      return {
-        backend: params.backend,
-        threadId: params.threadId,
-        turnId: params.expectedTurnId,
-        disposition: "queued",
-        queueEntryId: queued.entry.id,
-        queueEntryCreatedAt: queued.entry.createdAt,
-      };
-    }
-    const review = this.findReviewForParentTurn({
-      backend: params.backend,
-      parentThreadId: params.threadId,
-    });
-    if (review?.mode === "native") {
-      throw new Error("Native review steering is unsupported; queue a follow-up instead.");
-    }
-    const input = await ownThreadInputAttachments(
+      return queued.entry;
+    },
+    reviewMode: (params) => this.findReviewForParentTurn({
+      backend: params.backend, parentThreadId: params.threadId,
+    })?.mode,
+    prepareInput: async (params) => await ownThreadInputAttachments(
       await enrichLocalFileInputs(params.input, {
         privateStorageRoots: this.localFilePrivateStorageRoots,
       }),
       params,
       this.localFilePrivateStorageRoots,
-    );
-    if (params.backend === "claude") {
-      const result = await this.claudeBackend.steerTurn({ ...params, input, messageOrigin });
+    ),
+    steerClaude: (params, input, messageOrigin) => this.claudeBackend.steerTurn({ ...params, input, messageOrigin }),
+    retainClaude: async (params, messageId, messageOrigin) => {
       await this.persistThreadMessageOrigin({ backend: "claude", threadId: params.threadId,
-        messageId: result.messageId, origin: messageOrigin });
-      return { backend: "claude", threadId: result.threadId, turnId: result.turnId, disposition: "steered" };
+        messageId, origin: messageOrigin });
+    },
+    prepareAcp: (params, input, origin) => this.prepareAcpSteer(params, input, origin),
+    prepareCodex: (params, input, origin) => this.prepareCodexSteer(params, input, origin),
+  });
+
+  private async prepareAcpSteer(
+    params: SteerTurnRequest & { backend: AcpBackendId },
+    input: AppServerTurnInputItem[],
+    messageOrigin?: AppServerThreadMessageOrigin,
+  ): Promise<PreparedAcpSteer> {
+    const acpBackend = params.backend;
+    const promptPayload = await inputToAcpPrompt(input, {
+      owner: { backend: acpBackend, threadId: params.threadId },
+      privateStorageRoots: this.localFilePrivateStorageRoots,
+    });
+    if (!promptPayload) {
+      throw new Error("ACP steering requires text or image input");
     }
-    if (isAcpBackendId(params.backend)) {
-      const acpBackend = params.backend;
-      const promptPayload = await inputToAcpPrompt(input, {
-        owner: { backend: acpBackend, threadId: params.threadId },
-        privateStorageRoots: this.localFilePrivateStorageRoots,
-      });
-      if (!promptPayload) {
-        throw new Error("ACP steering requires text or image input");
-      }
-      const pendingMessageContextId = await this.registerPendingThreadMessageContext({
-        backend: params.backend,
-        input,
-        threadId: params.threadId,
-        origin: messageOrigin,
-        text: extractFirstMeaningfulTextInput(params.input),
-        retainAttachments: true,
-      });
-      const text = promptPayload.prompt
-        || promptPayload.promptContent.flatMap((block) =>
-          block.type === "text" && block.text.trim() ? [block.text] : []
-        )[0]
-        || "Additional image context.";
-      let result: { delivery: "currentTurn" | "nextTurn" };
-      try {
-        result = await this.acpSessionPromptLocks.run(
-          executionModeQueueKey(acpBackend, params.threadId),
-          async () => {
-            this.assertExpectedAcpSteerTurn({
-              backend: acpBackend,
-              threadId: params.threadId,
-              expectedTurnId: params.expectedTurnId,
-            });
-            return await this.acpBackend.steerSession({
-              backend: acpBackend,
-              content: promptPayload.promptContent,
-              interjectionId: params.requestId,
-              sessionId: params.threadId,
-              text,
-            });
-          },
-        );
-      } catch (error) {
-        this.forgetPendingThreadMessageContext(pendingMessageContextId);
-        throw error;
-      }
-      if (result.delivery === "currentTurn") {
-        this.bindPendingThreadMessageContext(
-          pendingMessageContextId,
-          params.expectedTurnId,
-        );
-      }
-      // A next-turn steer has no turn id yet. Leave its message context
-      // unbound so the next turn/started or matching user item can claim its
-      // origin and image parts instead of attaching them to the finished turn.
-      return {
-        backend: params.backend,
-        threadId: params.threadId,
-        turnId: params.expectedTurnId,
-        disposition:
-          result.delivery === "nextTurn" ? "queued" : "steered",
-      };
-    }
+    const pendingMessageContextId = await this.registerPendingThreadMessageContext({
+      backend: params.backend,
+      input,
+      threadId: params.threadId,
+      origin: messageOrigin,
+      text: extractFirstMeaningfulTextInput(params.input),
+      retainAttachments: true,
+    });
+    const text = promptPayload.prompt
+      || promptPayload.promptContent.flatMap((block) =>
+        block.type === "text" && block.text.trim() ? [block.text] : []
+      )[0]
+      || "Additional image context.";
+    return {
+      submit: () => this.acpSessionPromptLocks.run(
+        executionModeQueueKey(acpBackend, params.threadId),
+        async () => {
+          this.assertExpectedAcpSteerTurn({
+            backend: acpBackend,
+            threadId: params.threadId,
+            expectedTurnId: params.expectedTurnId,
+          });
+          return await this.acpBackend.steerSession({
+            backend: acpBackend,
+            content: promptPayload.promptContent,
+            interjectionId: params.requestId,
+            sessionId: params.threadId,
+            text,
+          });
+        },
+      ),
+      forget: () => this.forgetPendingThreadMessageContext(pendingMessageContextId),
+      bindCurrentTurn: () => this.bindPendingThreadMessageContext(pendingMessageContextId, params.expectedTurnId),
+    };
+  }
+
+  private async prepareCodexSteer(
+    params: SteerTurnRequest,
+    input: AppServerTurnInputItem[],
+    messageOrigin?: AppServerThreadMessageOrigin,
+  ): Promise<PreparedCodexSteer> {
     const pendingMessageContextId = await this.registerPendingThreadMessageContext({
       backend: params.backend,
       input,
@@ -26812,47 +27428,31 @@ export class DesktopBackendRegistry {
       origin: messageOrigin,
       text: extractFirstMeaningfulTextInput(params.input),
     });
-    const steerWithClient = async (
-      client: BackendClient,
-    ): Promise<{ threadId: string; turnId: string }> => {
-      if (!client.steerTurn) {
-        throw new Error("Selected backend does not support turn/steer");
-      }
-      return await client.steerTurn({
-        threadId: params.threadId,
-        input,
-        ...(pendingMessageContextId ? {
-          onInputTextPrepared: (text: string | undefined) => {
-            this.updatePendingThreadMessageText(pendingMessageContextId, text);
-          },
-        } : {}),
-        expectedTurnId: params.expectedTurnId,
-      });
-    };
-
-    let result: { threadId: string; turnId: string };
-    try {
-      result = await this.withActiveCodexThreadClient(
-        params.threadId,
-        steerWithClient,
-      );
-    } catch (error) {
-      this.forgetPendingThreadMessageContext(pendingMessageContextId);
-      throw error;
-    }
-
-    await this.rememberTurnInputAttachments({
-      backend: params.backend,
-      threadId: result.threadId,
-      turnId: result.turnId,
-      input,
-    });
-
     return {
-      backend: params.backend,
-      threadId: result.threadId,
-      turnId: result.turnId,
-      disposition: "steered",
+      submit: () => this.withActiveCodexThreadClient(params.threadId, async (client) => {
+        if (!client.steerTurn) {
+          throw new Error("Selected backend does not support turn/steer");
+        }
+        return await client.steerTurn({
+          threadId: params.threadId,
+          input,
+          ...(pendingMessageContextId ? {
+            onInputTextPrepared: (text: string | undefined) => {
+              this.updatePendingThreadMessageText(pendingMessageContextId, text);
+            },
+          } : {}),
+          expectedTurnId: params.expectedTurnId,
+        });
+      }),
+      forget: () => this.forgetPendingThreadMessageContext(pendingMessageContextId),
+      retain: async (result) => {
+        await this.rememberTurnInputAttachments({
+          backend: params.backend,
+          threadId: result.threadId,
+          turnId: result.turnId,
+          input,
+        });
+      },
     };
   }
 
@@ -29891,6 +30491,15 @@ export class DesktopBackendRegistry {
     );
   }
 
+  /**
+   * The backend tasks a thread waits on, for Waiting For. Only Claude takes
+   * another turn when one ends, and its sub-agents count: the Actions list
+   * leaves them out because they have Sub-agents cards.
+   */
+  listBackendTaskWakes(thread: { backend: AppServerBackendKind; threadId: string }): AppServerBackgroundTask[] {
+    return thread.backend === "claude" ? this.claudeBackend.listWaitingTasks(thread.threadId) : [];
+  }
+
   async listBackgroundTerminals(request: ListBackgroundTerminalsRequest): Promise<ListBackgroundTerminalsResponse> {
     // Claude's running tasks live with its session, which counts as work for
     // quit and auto-archive like a Codex background terminal.
@@ -31267,6 +31876,11 @@ export class DesktopBackendRegistry {
     return this.closeOperation;
   }
 
+  private assertThreadOwnership(): void {
+    if (this.closed || this.shutdownRequested) throw new Error("Desktop backend registry is closed");
+    this.ownerAdmission?.assertOwnership();
+  }
+
   private async closeResources(): Promise<void> {
     this.tryCheckpointArchiveCleanupsForQuit("before-drain");
     // Before anything unsubscribes or closes, so each turn's own terminal
@@ -31289,6 +31903,7 @@ export class DesktopBackendRegistry {
     this.flushCodexEnvironmentActionLiveOutputsForShutdown();
     this.threadTurnQueue.close();
     this.queuedMessageTitler.close();
+    for (const key of [...this.archiveCleanupOverflow.keys()]) this.cancelArchiveCleanupOverflow(key);
     await this.archiveCleanupQueue.close();
     this.tryCheckpointArchiveCleanupsForQuit("after-drain");
     this.backgroundTerminalGeneration += 1;
@@ -31304,7 +31919,7 @@ export class DesktopBackendRegistry {
     // entry, so waiting it cannot miss work still deriving its sqlite row.
     const liveThreadUsageEmitBarrier =
       this.waitForLiveThreadUsageEmitWork();
-    this.acceptedSteerRequests.clear();
+    this.threadSteering.clear();
     this.acceptedThreadControlRequests.clear();
     this.acceptedHandoffTaskRequests.clear();
     this.acceptedDynamicToolCalls.clear();
@@ -31441,6 +32056,7 @@ export class DesktopBackendRegistry {
           .join(", ")}`,
       );
     }
+    this.ownerAdmission?.close();
   }
 
   private async assertRequestedThreadModelAvailable(params: {
@@ -31963,6 +32579,7 @@ export class DesktopBackendRegistry {
     ) {
       return;
     }
+    this.assertThreadOwnership();
     try {
       await this.tokenMiserLedgerReconciliation;
       await this.tokenMiserHookBridge.start();
@@ -32935,7 +33552,7 @@ export class DesktopBackendRegistry {
           this.invalidateThreadListCache(backend);
         }
         if (notification.method === "thread/archived") {
-          await this.overlayStore.observeArchivedThreads?.(
+          await this.observeArchivedThreads(
             [{ backend, threadId: notification.params.threadId }], Date.now(), { promoteSubthreads: true },
           );
           if (backend === "codex") await this.archiveTokenMiserThread(notification.params.threadId);
@@ -34096,23 +34713,22 @@ export class DesktopBackendRegistry {
       Object.assign(overlaysByThreadId, updatedOverlaysByThreadId);
     }
 
-    const enrichedThreads = await Promise.all(
-      visibleThreads.map(async (thread) => {
-        const overlay = overlaysByThreadId[thread.id];
-        return {
-          ...thread,
-          ...this.persistedCodexNativeSubAgentDisclosure(thread, nativeCardsByThreadId[thread.id]),
-          executionMode: overlay?.executionMode ?? thread.executionMode,
-          model: overlay?.model ?? thread.model,
-          reasoningEffort: overlay?.reasoningEffort ?? thread.reasoningEffort,
-          serviceTier: overlay?.serviceTier ?? thread.serviceTier,
-          fastMode: overlay?.fastMode ?? thread.fastMode,
-          linkedDirectories: dedupeLinkedDirectoriesByNormalizedIdentity(
-            thread.linkedDirectories,
-          ),
-        };
-      }),
-    );
+    const enrichedThreads = visibleThreads.map((thread) => {
+      const overlay = overlaysByThreadId[thread.id];
+      return {
+        ...thread,
+        ...projectOverlayThreadTitle(thread, overlay),
+        ...this.persistedCodexNativeSubAgentDisclosure(thread, nativeCardsByThreadId[thread.id]),
+        executionMode: overlay?.executionMode ?? thread.executionMode,
+        model: overlay?.model ?? thread.model,
+        reasoningEffort: overlay?.reasoningEffort ?? thread.reasoningEffort,
+        serviceTier: overlay?.serviceTier ?? thread.serviceTier,
+        fastMode: overlay?.fastMode ?? thread.fastMode,
+        linkedDirectories: dedupeLinkedDirectoriesByNormalizedIdentity(
+          thread.linkedDirectories,
+        ),
+      };
+    });
 
     const statusReconciledThreads = enrichedThreads
       .map((thread) => this.reconcileCodexThreadListStatus(thread))
@@ -34187,14 +34803,7 @@ export class DesktopBackendRegistry {
       ) {
         continue;
       }
-      const agent: CodexNativeSubAgentSummary = {
-        threadId: card.monitorThreadId,
-        title: card.task,
-        createdAt: card.createdAt,
-        updatedAt: card.updatedAt,
-        threadStatus: codexNativeSubAgentIsTerminal(card.status) ? "idle" : "active",
-        agentNickname: card.agentName,
-      };
+      const agent = nativeSubAgentRowFromCard(card, card.monitorThreadId);
       if (isCodexNativeSubAgentVisibleInNavigation(agent, Date.now())) {
         agents.set(agent.threadId, agent);
       }
@@ -34822,6 +35431,52 @@ export class DesktopBackendRegistry {
       });
       return {};
     }
+  }
+
+  private retainedOwnerThreadsMissingFrom(
+    threads: AppServerThreadSummary[],
+    params: { archived?: boolean; filter?: string },
+  ): AppServerThreadSummary[] {
+    const present = new Set(threads.filter(thread => thread.source === "codex").map(thread => thread.id));
+    return this.retainedOwnerThreadStorage?.list().filter(thread => !present.has(thread.id)
+      && (thread.archivedAt !== undefined) === (params.archived === true)
+      && pendingStartedThreadMatchesFilter(thread, params.filter)) ?? [];
+  }
+
+  private mergeRetainedOwnerThreads(
+    threads: AppServerThreadSummary[],
+    params: { archived?: boolean; filter?: string },
+    oppositeNativeIds: ReadonlySet<string>,
+  ): AppServerThreadSummary[] {
+    const retained = this.retainedOwnerThreadsMissingFrom(threads, params).filter(thread => !oppositeNativeIds.has(thread.id));
+    if (!retained.length) return threads;
+    return this.inheritIncompleteThreadList([...threads, ...retained]
+      .sort((left, right) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0)), threads);
+  }
+
+  private async withRetainedOwnerThreads(
+    threads: AppServerThreadSummary[],
+    params: { archived?: boolean; filter?: string; deadlineAt?: number },
+  ): Promise<AppServerThreadSummary[]> {
+    this.confirmRetainedNativeOwners(threads);
+    if (!this.retainedOwnerThreadsMissingFrom(threads, params).length) return threads;
+    // A missing active row may be a native archived member (and vice versa).
+    // Retained identity must not manufacture membership in the other collection.
+    const opposite = await this.codexClient.listThreads({ archived: params.archived !== true,
+      enrichDirectories: false, skipArchivedMetadataRefresh: true, requireComplete: true, deadlineAt: params.deadlineAt },
+    { callerReason: "retained-owner-membership", ownerId: this.threadListCacheOwnerId }).catch(() => {
+      this.incompleteThreadLists.add(threads);
+      return [];
+    });
+    this.confirmRetainedNativeOwners(opposite);
+    // Read retention again after awaiting discovery: a publication or retirement
+    // committed while this walk was pending remains authoritative.
+    return this.mergeRetainedOwnerThreads(threads, params, new Set(opposite.map(thread => thread.id)));
+  }
+
+  private confirmRetainedNativeOwners(threads: readonly AppServerThreadSummary[]): void {
+    if (this.closed || !threads.length) return;
+    this.retainedOwnerThreadStorage?.confirmNativeThreads(threads.filter(thread => thread.source === "codex").map(thread => thread.id));
   }
 
   private withPendingStartedThreads(
@@ -37092,6 +37747,88 @@ export class DesktopBackendRegistry {
     }
   }
 
+  /**
+   * Saves the cards for sub-agents Claude Code runs with its Agent tool, the
+   * way native Codex workers are saved. They have no thread of their own: the
+   * card names the task, and Claude stops it by the task id. A card that
+   * already ended keeps its end.
+   */
+  private async recordClaudeSubAgents(params: {
+    threadId: string;
+    subAgents: readonly ClaudeSubAgentCard[];
+  }): Promise<void> {
+    const existing = new Map((await this.overlayStore.getThreadSubAgents({
+      backend: "claude",
+      threadId: params.threadId,
+      monitorIds: params.subAgents.map((card) => card.monitorId),
+    })).map((card) => [card.monitorId, card]));
+    const now = Date.now();
+    const subAgents = params.subAgents.flatMap((card): ThreadSubAgentSummary[] => {
+      const previous = existing.get(card.monitorId);
+      if (previous && codexNativeSubAgentIsTerminal(previous.status)) return [];
+      const outcome = codexNativeSubAgentOutcome(card.status);
+      const createdAt = previous?.createdAt ?? card.startedAt ?? now;
+      return [{
+        ...previous,
+        monitorId: card.monitorId,
+        task: card.task,
+        status: card.status,
+        createdAt,
+        updatedAt: Math.max(now, createdAt),
+        ownerRuntimeInstanceId: previous?.ownerRuntimeInstanceId ?? this.runtimeInstanceId,
+        ownerRegistrySessionId: previous?.ownerRegistrySessionId ?? this.registrySessionId,
+        backend: "claude",
+        ...(card.agentName ? { agentName: card.agentName } : {}),
+        ...(card.lastMessage ? { lastMessage: truncateSubAgentText(card.lastMessage, 360) } : {}),
+        ...(outcome ? { outcome, completedAt: previous?.completedAt ?? Math.max(now, createdAt) } : {}),
+      }];
+    });
+    if (subAgents.length === 0) return;
+    // One transaction for the batch where the store offers it.
+    if (this.overlayStore.upsertThreadSubAgents) {
+      await this.overlayStore.upsertThreadSubAgents({ backend: "claude", threadId: params.threadId, subAgents });
+    } else {
+      for (const subAgent of subAgents) {
+        await this.overlayStore.upsertThreadSubAgent({ backend: "claude", threadId: params.threadId, subAgent });
+      }
+    }
+    this.invalidateThreadListCache("claude");
+    await this.emit({
+      backend: "claude",
+      notification: { method: "thread/subAgents/updated", params: { threadId: params.threadId } },
+    });
+  }
+
+  /**
+   * The thread list's sub-agent tray for Claude threads, from their saved
+   * sub-agent cards: running ones, and ones that ended within the hour.
+   */
+  private async withClaudeNativeSubAgents(
+    threads: AppServerThreadSummary[],
+  ): Promise<AppServerThreadSummary[]> {
+    if (threads.length === 0) return threads;
+    const cardsByThreadId = await this.overlayStore.listThreadSubAgentsByMonitorIdPrefix({
+      backend: "claude",
+      threadIds: threads.map((thread) => thread.id),
+      monitorIdPrefix: CLAUDE_NATIVE_SUBAGENT_MONITOR_ID_PREFIX,
+    });
+    const now = Date.now();
+    return threads.map((thread) => {
+      // A Claude sub-agent has no thread; its row is keyed by its card.
+      const agents = (cardsByThreadId[thread.id] ?? [])
+        .map((card) => nativeSubAgentRowFromCard(card, card.monitorId))
+        .filter((agent) => isCodexNativeSubAgentVisibleInNavigation(agent, now))
+        .sort((left, right) => (left.createdAt ?? 0) - (right.createdAt ?? 0)
+          || left.threadId.localeCompare(right.threadId));
+      if (agents.length === 0) {
+        if (!thread.codexNativeSubAgents) return thread;
+        const { codexNativeSubAgents: _stale, ...rest } = thread;
+        return rest;
+      }
+      return { ...thread, codexNativeSubAgents: agents };
+    });
+  }
+
   private async persistCodexNativeSubAgent(params: {
     authoritativeReplayOutcome?: boolean;
     call: CodexNativeSubAgentCall;
@@ -39054,6 +39791,11 @@ export class DesktopBackendRegistry {
   }
 
   private async findThreadForArchiveCleanup(params: ArchiveCleanupDiscoveryRequest): Promise<ArchiveCleanupMetadata> {
+    const read = async () => await this.readThreadForArchiveCleanup(params);
+    return params.context?.withInventory ? await params.context.withInventory(read) : await read();
+  }
+
+  private async readThreadForArchiveCleanup(params: ArchiveCleanupDiscoveryRequest): Promise<ArchiveCleanupMetadata> {
     if (this.codexClient.listArchiveCleanupThreadsPage) {
       return await this.readPacedArchiveCleanupMetadata(params);
     }
@@ -39131,22 +39873,205 @@ export class DesktopBackendRegistry {
    * admission and the ordinary snapshot/restore persistence boundary. */
   repairArchivedThreadWorktrees(options: {
     dryRun?: boolean;
+    /** With dryRun: also list PwrAgent worktrees no thread refers to. */
+    includeCheckoutInventory?: boolean;
+    /** Limit removal to these reviewed checkouts. Empty folders only when asked. */
+    select?: { worktreePaths: ReadonlySet<string>; emptyFolders: boolean };
     onProgress?: (completed: number, total: number, report?: ArchivedWorktreeRepairReport) => void;
   } = {}): Promise<ArchivedWorktreeRepairReport> {
     // A manual sweep joins startup repair rather than queuing duplicate removals.
-    // Read-only audits never join a mutating pass.
+    // Read-only audits never join a mutating pass. A reviewed selection waits
+    // for a running pass, then runs on its own: joining would report on
+    // checkouts nobody selected.
     if (options.dryRun) return this.runArchivedThreadWorktreeRepair(options);
-    if (this.archivedWorktreeRepair) return this.archivedWorktreeRepair;
-    const running = this.runArchivedThreadWorktreeRepair(options).finally(() => {
-      this.archivedWorktreeRepair = undefined;
+    if (this.archivedWorktreeRepair && !options.select) return this.archivedWorktreeRepair;
+    const previous = this.archivedWorktreeRepair?.catch(() => undefined);
+    const running = (async () => {
+      await previous;
+      return await this.runArchivedThreadWorktreeRepair(options);
+    })().finally(() => {
+      if (this.archivedWorktreeRepair === running) this.archivedWorktreeRepair = undefined;
     });
     this.archivedWorktreeRepair = running;
     return running;
   }
 
+  /** Read-only list of archived threads' checkouts still on disk, for review. */
+  async auditArchivedCheckouts(onProgress?: (progress: MaintenanceDiscoveryProgress) => void): Promise<{
+    candidates: Array<{ backend: AppServerBackendKind; threadId: string; worktreePath: string }>;
+    kept: Record<string, number>;
+    emptyFolders: number;
+    unreferenced: string[];
+    unreferencedUnavailable?: string;
+    unreferencedTruncated?: boolean;
+    inventory?: ArchivedWorktreeRepairReport["inventory"];
+  }> {
+    const report = await this.runArchivedThreadWorktreeRepair({ dryRun: true, includeCheckoutInventory: true, onDiscoveryProgress: onProgress });
+    return {
+      candidates: report.candidates,
+      kept: archivedWorktreeKeptReasons(report),
+      emptyFolders: report.emptyContainerCandidates.length,
+      unreferenced: report.unreferencedWorktrees ?? [],
+      ...(report.unreferencedUnavailable ? { unreferencedUnavailable: report.unreferencedUnavailable } : {}),
+      ...(report.unreferencedTruncated ? { unreferencedTruncated: true } : {}),
+      ...(report.inventory ? { inventory: report.inventory } : {}),
+    };
+  }
+
+  /** Report only checkouts positively associated with this profile's provider
+   * inventory. Other folders are neither measured nor offered for removal. */
+  private async describeMaintenanceCheckoutInventory(
+    inventory: Pick<ArchiveCleanupMetadata, "activeThreads" | "archivedThreads" | "overlaysByThreadKey">,
+    report: ArchivedWorktreeRepairReport,
+    onProgress?: (progress: MaintenanceDiscoveryProgress) => void,
+  ): Promise<void> {
+    const threads = [...inventory.activeThreads, ...inventory.archivedThreads];
+    const candidates = threads.map((thread) => ({ thread,
+      overlay: inventory.overlaysByThreadKey?.get(buildThreadIdentityKey(thread.source, thread.id)) }));
+    const checkouts = await resolveOwnedMaintenanceCheckouts(candidates, onProgress);
+    const providers = new Map<string, number>();
+    for (const thread of threads) providers.set(thread.source, (providers.get(thread.source) ?? 0) + 1);
+    const activeKeys = new Set(inventory.activeThreads.map((thread) => buildThreadIdentityKey(thread.source, thread.id)));
+    report.inventory = { roots: [], paths: checkouts.map((item) => item.path),
+      keptPaths: checkouts.flatMap((item) => {
+        const protectedOwner = report.protectedWorktreeDetails.find((row) =>
+          normalizeWorktreePathForComparison(row.worktreePath) === normalizeWorktreePathForComparison(item.path));
+        const reason = protectedOwner?.externallyManaged ? "Externally managed"
+          : item.candidates.some((owner) => activeKeys.has(buildThreadIdentityKey(owner.thread.source, owner.thread.id)))
+            ? "Used by an active thread" : undefined;
+        return reason ? [{ path: item.path, reason }] : [];
+      }),
+      providers: [...providers].map(([backend, count]) => ({ backend, threads: count })),
+      owners: checkouts.map((item) => ({ ...item, threads: item.candidates.map((candidate) =>
+        maintenanceKeptThread(candidate, checkoutHibernationLastActivity(candidate))) })),
+    };
+    report.unreferencedWorktrees = [];
+  }
+
+  /** Legacy callers cannot turn an unidentified folder into a removal. */
+  async removeUnreferencedCheckouts(worktreePaths: string[]): Promise<{
+    removed: { worktreePath: string }[];
+    kept: { worktreePath: string; reason: string }[];
+    failed: { worktreePath: string; message: string }[];
+  }> {
+    return { removed: [], failed: [], kept: [...new Set(worktreePaths)].map((worktreePath) => ({
+      worktreePath, reason: "No identified thread owns this checkout",
+    })) };
+  }
+
+  /** Remove only reviewed archived checkouts. Each removal still takes fresh
+   * ownership admission and snapshots changes, exactly like the repair pass. */
+  async removeArchivedCheckouts(selection: { worktreePaths: string[]; emptyFolders: boolean }): Promise<{
+    removed: { worktreePath: string }[];
+    kept: { worktreePath: string; reason: string }[];
+    failed: { worktreePath: string; message: string }[];
+    emptyFoldersRemoved: number;
+    emptyFoldersFailed: { worktreePath: string; message: string }[];
+  }> {
+    const selected = new Set(selection.worktreePaths.map(normalizeWorktreePathForComparison));
+    const report = await this.repairArchivedThreadWorktrees({
+      select: { worktreePaths: selected, emptyFolders: selection.emptyFolders },
+    });
+    const result = {
+      removed: [] as { worktreePath: string }[],
+      kept: [] as { worktreePath: string; reason: string }[],
+      failed: [] as { worktreePath: string; message: string }[],
+      emptyFoldersRemoved: 0,
+      emptyFoldersFailed: [] as { worktreePath: string; message: string }[],
+    };
+    const seen = new Set<string>();
+    for (const item of report.cleanup) {
+      if (!item.worktreePath) continue;
+      const key = normalizeWorktreePathForComparison(item.worktreePath);
+      if (!selected.has(key)) continue;
+      seen.add(key);
+      if (item.removedWorktree) result.removed.push({ worktreePath: item.worktreePath });
+      else if (item.error) result.failed.push({ worktreePath: item.worktreePath, message: item.error });
+      else result.kept.push({ worktreePath: item.worktreePath, reason: item.skippedReason ?? "Kept" });
+    }
+    for (const detail of report.protectedWorktreeDetails) {
+      const key = normalizeWorktreePathForComparison(detail.worktreePath);
+      if (!selected.has(key) || seen.has(key)) continue;
+      seen.add(key);
+      result.kept.push({ worktreePath: detail.worktreePath,
+        reason: detail.externallyManaged ? "Externally managed" : "Used by an active thread" });
+    }
+    for (const key of selected) {
+      if (!seen.has(key)) result.kept.push({ worktreePath: key, reason: "No longer an archived checkout" });
+    }
+    if (selection.emptyFolders) {
+      for (const item of report.containerCleanup) {
+        if (item.removed) result.emptyFoldersRemoved += 1;
+        else if (item.error) result.emptyFoldersFailed.push({ worktreePath: item.worktreePath, message: item.error });
+      }
+    }
+    return result;
+  }
+
+  /** Approve one thread's next archive to snapshot up to `bytes`. Expires on
+   * its own so a stale approval never applies to a later archive. */
+  approveReviewedSnapshotLimit(backend: AppServerBackendKind, threadId: string, bytes: number): void {
+    this.reviewedSnapshotLimits.set(buildThreadIdentityKey(backend, threadId), {
+      bytes, expiresAt: Date.now() + REVIEWED_SNAPSHOT_LIMIT_TTL_MS,
+    });
+  }
+
+  clearReviewedSnapshotLimit(backend: AppServerBackendKind, threadId: string): void {
+    this.reviewedSnapshotLimits.delete(buildThreadIdentityKey(backend, threadId));
+  }
+
+  private reviewedSnapshotLimitFor(backend: AppServerBackendKind, threadId: string): number | undefined {
+    const key = buildThreadIdentityKey(backend, threadId);
+    const approval = this.reviewedSnapshotLimits.get(key);
+    if (!approval) return undefined;
+    if (approval.expiresAt < Date.now()) {
+      this.reviewedSnapshotLimits.delete(key);
+      return undefined;
+    }
+    return approval.bytes;
+  }
+
+  /** Housekeeping hooks shared with the reviewed Thread maintenance run. */
+  getThreadArchivePolicy(): DesktopThreadArchivePolicy {
+    return this.readThreadArchivePolicy();
+  }
+
+  refreshArchiveCandidate(candidate: ThreadArchiveCandidate): Promise<ThreadArchiveCandidate> {
+    return this.refreshAutoArchiveCandidate(candidate);
+  }
+
+  isArchiveCandidateBusy(candidate: ThreadArchiveCandidate): boolean {
+    return this.autoArchiveCandidateIsBusy(candidate);
+  }
+
+  getCheckoutHibernationPolicy(): DesktopCheckoutHibernationPolicy {
+    return this.readCheckoutHibernationPolicy();
+  }
+
+  /** The sweep's thread-level rules for one candidate, as the review shows them. */
+  checkoutHibernationKeepReason(
+    candidate: ThreadArchiveCandidate,
+    candidates: readonly ThreadArchiveCandidate[],
+    policy: DesktopCheckoutHibernationPolicy,
+    now: number,
+  ): { target?: string; keep?: string } {
+    const target = hibernationTarget(candidate);
+    if ("keep" in target) return { target: primaryThreadWorktree(candidate.thread)?.worktreePath, keep: target.keep };
+    return { target: target.worktreePath,
+      keep: hibernationKeepReason(candidate, now, policy, this.checkoutHibernationContext(candidate, candidates)) };
+  }
+
+  /** Hibernate one reviewed checkout, with every check run again first. */
+  async hibernateReviewedCheckout(candidate: ThreadArchiveCandidate, policy: DesktopCheckoutHibernationPolicy): Promise<boolean | string> {
+    return await this.hibernateIdleCheckout(candidate, policy, { reviewed: true });
+  }
+
   private async runArchivedThreadWorktreeRepair(options: {
     dryRun?: boolean;
+    includeCheckoutInventory?: boolean;
+    select?: { worktreePaths: ReadonlySet<string>; emptyFolders: boolean };
     onProgress?: (completed: number, total: number, report?: ArchivedWorktreeRepairReport) => void;
+    onDiscoveryProgress?: (progress: MaintenanceDiscoveryProgress) => void;
   } = {}): Promise<ArchivedWorktreeRepairReport> {
     await this.subAgentStartupReconciliation;
     if (this.isBootstrapModeFn() || this.isCodexBootstrapDeferredFn() || !this.codexClient.listArchiveCleanupThreadsPage) {
@@ -39159,6 +40084,7 @@ export class DesktopBackendRegistry {
     let report!: ArchivedWorktreeRepairReport;
     const ownersByPath = new Map<string, { thread: AppServerThreadSummary; worktreePath: string }>();
     const canonicalKeys = new Map<string, string>();
+    options.onDiscoveryProgress?.({ detail: "Waiting for checkout ownership audit" });
     await this.archiveCleanupQueue.enqueue(`archive-repair-read:${++this.archiveWorkspaceWriteSequence}`, async (context) => {
       const checkpoint = async () => { await context.checkpoint(); };
       const canonical = canonicalWorktreePaths();
@@ -39176,7 +40102,26 @@ export class DesktopBackendRegistry {
       };
       inventory = await this.readPacedArchiveCleanupInventory({
         backend: "codex", threadId: "", context,
+        ...(options.dryRun ? { identityOnly: true } : {}),
+        onDiscoveryProgress: options.onDiscoveryProgress,
       });
+      if (options.dryRun) {
+        // Identity pages are read at the provider's maximum page size with
+        // no per-row Git subprocess. Resolve cwd metadata once per checkout
+        // in bounded slices instead of serially enriching thousands of rows.
+        const observations = new Map<string, Promise<LinkedDirectorySummary | undefined>>();
+        let found = 0;
+        for (const rows of [inventory.activeThreads, inventory.archivedThreads]) {
+          for (let offset = 0; offset < rows.length; offset += ARCHIVE_CLEANUP_SLICE_SIZE) {
+            await checkpoint();
+            options.onDiscoveryProgress?.({ detail: "Resolving checkout ownership from Git metadata", found });
+            const resolved = await Promise.all(rows.slice(offset, offset + ARCHIVE_CLEANUP_SLICE_SIZE).map(async (thread) =>
+              await this.maintenanceThreadWorkspace(thread, inventory.overlaysByThreadKey?.get(buildThreadIdentityKey(thread.source, thread.id)), observations)));
+            rows.splice(offset, resolved.length, ...resolved);
+            found += resolved.length;
+          }
+        }
+      }
       report = {
         archivedThreads: inventory.archivedThreads.length, discoveredWorktrees: 0,
         missingWorktrees: 0, protectedWorktrees: 0, protectedWorktreeDetails: [], candidates: [], cleanup: [],
@@ -39186,8 +40131,13 @@ export class DesktopBackendRegistry {
         // A removed checkout may no longer enrich to a linked directory. Its
         // archived provider cwd still proves association with a managed id.
         if (thread.source !== "codex" && thread.source !== "claude" && !isAcpBackendId(thread.source)) continue;
-        if (thread.projectKey && await this.worktreeContainerService.containerPath(thread.projectKey)) {
-          await rememberOwner(thread.projectKey, thread);
+        try {
+          if (thread.projectKey && await this.worktreeContainerService.containerPath(thread.projectKey)) {
+            await rememberOwner(thread.projectKey, thread);
+          }
+        } catch (error) {
+          report.cleanup.push({ worktreePath: thread.projectKey!, removedWorktree: false, deletedBranch: false,
+            error: error instanceof Error ? error.message : String(error) });
         }
         for (const directory of thread.linkedDirectories) {
           const worktreePath = linkedDirectoryWorktreePath(directory);
@@ -39195,53 +40145,108 @@ export class DesktopBackendRegistry {
         }
       }
       report.discoveredWorktrees = ownersByPath.size;
-      const seenContainers = new Set<string>();
-      for (const [canonicalKey, { worktreePath, thread }] of ownersByPath) {
-        await checkpoint();
+      const owners = [...ownersByPath];
+      const summary = report;
+      const containerInspections = new Map<string, Promise<WorktreeContainerCleanup | undefined>>();
+      let activeChecks = 0, checked = 0, foundCandidates = 0;
+      const progress = (root: string) => options.onDiscoveryProgress?.({
+        detail: `Checking archived checkout owners · ${checked}/${owners.length} checked · ${activeChecks} in flight`,
+        root, found: foundCandidates,
+      });
+      const inspectOwner = async ([canonicalKey, { worktreePath, thread }]: typeof owners[number]) => {
+        if (!options.dryRun) await checkpoint();
+        assertCurrent();
+        const report: ArchivedWorktreeRepairReport = { ...summary, missingWorktrees: 0, protectedWorktrees: 0,
+          protectedWorktreeDetails: [], candidates: [], cleanup: [], emptyContainerCandidates: [], containerCleanup: [] };
+        let checkedContainerPath: string | undefined;
+        activeChecks += 1;
+        progress(worktreePath);
+        // One unreadable checkout records its own error; the rest are still read.
         try {
-          if (!(await stat(worktreePath)).isDirectory()) throw new Error(`Worktree path is not a directory: ${worktreePath}`);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          try {
+            if (!(await stat(worktreePath)).isDirectory()) throw new Error(`Worktree path is not a directory: ${worktreePath}`);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+              report.cleanup.push({ worktreePath, removedWorktree: false, deletedBranch: false,
+                error: error instanceof Error ? error.message : String(error) });
+              return { report, containerPath: checkedContainerPath };
+            }
+            report.missingWorktrees += 1;
+            const containerPath = thread.source === "codex" ? await this.worktreeContainerService.containerPath(worktreePath) : undefined;
+            if (containerPath) {
+              checkedContainerPath = containerPath;
+              let inspectionPending = containerInspections.get(containerPath);
+              if (!inspectionPending) {
+                inspectionPending = this.worktreeContainerService.inspect(worktreePath);
+                containerInspections.set(containerPath, inspectionPending);
+              }
+              const inspection = await inspectionPending;
+              if (inspection?.identity && !inspection.skippedReason && !inspection.error
+                && !this.isWorktreeContainerProtected(containerPath, inventory)) {
+                report.emptyContainerCandidates.push({ backend: thread.source, threadId: thread.id, worktreePath, containerIdentity: inspection.identity });
+              } else if (inspection?.error) report.containerCleanup.push(inspection);
+            }
+            return { report, containerPath: checkedContainerPath };
+          }
+          const acpBlocker = this.archivedAcpWorktreeBlocker(worktreePath, inventory);
+          if (acpBlocker) {
+            report.protectedWorktrees += 1;
             report.cleanup.push({ worktreePath, removedWorktree: false, deletedBranch: false,
-              error: error instanceof Error ? error.message : String(error) });
-            continue;
+              skippedReason: acpBlocker });
+            return { report, containerPath: checkedContainerPath };
           }
-          report.missingWorktrees += 1;
-          const containerPath = thread.source === "codex" ? await this.worktreeContainerService.containerPath(worktreePath) : undefined;
-          if (containerPath && !seenContainers.has(containerPath)) {
-            seenContainers.add(containerPath);
-            const inspection = await this.worktreeContainerService.inspect(worktreePath);
-            if (inspection?.identity && !inspection.skippedReason && !inspection.error
-              && !this.isWorktreeContainerProtected(containerPath, inventory)) {
-              report.emptyContainerCandidates.push({ backend: thread.source, threadId: thread.id, worktreePath, containerIdentity: inspection.identity });
-            } else if (inspection?.error) report.containerCleanup.push(inspection);
-          }
-          continue;
-        }
-        const acpBlocker = this.archivedAcpWorktreeBlocker(worktreePath, inventory);
-        if (acpBlocker) {
-          report.protectedWorktrees += 1;
-          report.cleanup.push({ worktreePath, removedWorktree: false, deletedBranch: false,
-            skippedReason: acpBlocker });
-          continue;
-        }
-        const ownership = await this.readCanonicalArchiveOwnership(inventory, worktreePath);
-        if (ownership.external || ownership.users.length) {
-          report.protectedWorktrees += 1;
-          report.protectedWorktreeDetails.push({ worktreePath, externallyManaged: ownership.external,
-            activeThreads: ownership.users.map((owner) => ({ backend: owner.source, threadId: owner.id, projectKey: owner.projectKey })),
-          });
-          if (!options.dryRun && !ownership.external) {
-            const directory = thread.linkedDirectories.find((row) => {
-              const value = linkedDirectoryWorktreePath(row);
-              return value !== undefined && canonicalKeys.get(normalizeWorktreePathForComparison(value)) === canonicalKey;
+          const ownership = await this.readCanonicalArchiveOwnership(inventory, worktreePath);
+          if (ownership.external || ownership.users.length) {
+            report.protectedWorktrees += 1;
+            report.protectedWorktreeDetails.push({ worktreePath, externallyManaged: ownership.external,
+              activeThreads: ownership.users.map((owner) => ({ backend: owner.source, threadId: owner.id, projectKey: owner.projectKey })),
             });
-            await this.retainDeferredArchiveWorktree({ backend: thread.source, thread, activeThreads: inventory.activeThreads },
-              { worktreePath, repositoryPath: directory?.path }, ownership.users.map((owner) => buildThreadIdentityKey(owner.source, owner.id)));
+            if (!options.dryRun && !ownership.external) {
+              const directory = thread.linkedDirectories.find((row) => {
+                const value = linkedDirectoryWorktreePath(row);
+                return value !== undefined && canonicalKeys.get(normalizeWorktreePathForComparison(value)) === canonicalKey;
+              });
+              await this.retainDeferredArchiveWorktree({ backend: thread.source, thread, activeThreads: inventory.activeThreads },
+                { worktreePath, repositoryPath: directory?.path }, ownership.users.map((owner) => buildThreadIdentityKey(owner.source, owner.id)));
+            }
+            return { report, containerPath: checkedContainerPath };
           }
-          continue;
+          report.candidates.push({ backend: thread.source, threadId: thread.id, worktreePath });
+        } catch (error) {
+          if (error instanceof ArchiveCleanupCancelledError || this.closed || this.stoppingRunningTurnsForShutdown) throw error;
+          report.cleanup.push({ worktreePath, removedWorktree: false, deletedBranch: false,
+            error: error instanceof Error ? error.message : String(error) });
+        } finally {
+          activeChecks -= 1;
+          checked += 1;
+          foundCandidates += report.candidates.length;
+          progress(worktreePath);
         }
-        report.candidates.push({ backend: thread.source, threadId: thread.id, worktreePath });
+        return { report, containerPath: checkedContainerPath };
+      };
+      const results = options.dryRun
+        ? await mapMaintenanceAudit(owners, context, inspectOwner)
+        : await (async () => {
+            const rows: Awaited<ReturnType<typeof inspectOwner>>[] = [];
+            for (const owner of owners) rows.push(await inspectOwner(owner));
+            return rows;
+          })();
+      const seenContainers = new Set<string>();
+      for (const { report: row, containerPath } of results) {
+        report.missingWorktrees += row.missingWorktrees;
+        report.protectedWorktrees += row.protectedWorktrees;
+        report.protectedWorktreeDetails.push(...row.protectedWorktreeDetails);
+        report.candidates.push(...row.candidates);
+        report.cleanup.push(...row.cleanup);
+        if (!containerPath || !seenContainers.has(containerPath)) {
+          if (containerPath) seenContainers.add(containerPath);
+          report.emptyContainerCandidates.push(...row.emptyContainerCandidates);
+          report.containerCleanup.push(...row.containerCleanup);
+        }
+      }
+      if (options.dryRun && options.includeCheckoutInventory) {
+        await checkpoint();
+        await this.describeMaintenanceCheckoutInventory(inventory, report, options.onDiscoveryProgress);
       }
       backendRegistryLog.info("archived worktree repair discovered", {
         archivedThreads: report.archivedThreads, discoveredWorktrees: report.discoveredWorktrees,
@@ -39251,6 +40256,12 @@ export class DesktopBackendRegistry {
       return { backend: "codex", threadId: "", archivedAt: Date.now(), cleanup: [] };
     });
     if (options.dryRun) return report;
+    if (options.select) {
+      const { worktreePaths, emptyFolders } = options.select;
+      report.candidates = report.candidates.filter((candidate) =>
+        worktreePaths.has(normalizeWorktreePathForComparison(candidate.worktreePath)));
+      if (!emptyFolders) report.emptyContainerCandidates = [];
+    }
     const total = report.candidates.length + report.emptyContainerCandidates.length;
     options.onProgress?.(0, total, report);
     let completed = 0;
@@ -39292,35 +40303,39 @@ export class DesktopBackendRegistry {
       const completion = this.enqueueArchiveRepair(key, candidate.worktreePath, async (context) => {
         const containerPath = await this.worktreeContainerService.containerPath(candidate.worktreePath);
         if (!containerPath) throw new Error("Selected worktree root is unavailable; the container was kept.");
-        const admission = { ...candidate, containerPath };
-        const scope = new ArchiveWorkspaceAdmission(key, containerPath);
-        const scopedAdmission = { ...admission, scope };
-        this.archiveWorktreeRemovalAdmissions.add(scopedAdmission);
-        this.archiveWorkspaceOwnership.beginAdmission(scope);
-        try {
-          const current = await this.findThreadForArchiveCleanup({ ...candidate, context, ownershipScope: containerPath, removalAdmission: scope });
-          await scope.prepare(this.archiveWorkspaceMutations());
-          scope.reserve(this.archiveWorkspaceMutations());
-          const ownedPaths = [current.thread.projectKey, ...current.thread.linkedDirectories.map(linkedDirectoryWorktreePath)];
-          const canonical = canonicalWorktreePaths();
-          const candidateKey = await canonical(candidate.worktreePath);
-          const ownedKeys = await Promise.all(ownedPaths.filter((value): value is string => Boolean(value)).map(canonical));
-          if (!ownedKeys.includes(candidateKey)) {
-            throw new Error("Archived thread no longer owns the container; it was kept.");
+        context.setWorktreePath?.(candidate.worktreePath);
+        const prune = async () => {
+          const admission = { ...candidate, containerPath };
+          const scope = new ArchiveWorkspaceAdmission(key, containerPath);
+          const scopedAdmission = { ...admission, scope };
+          this.archiveWorktreeRemovalAdmissions.add(scopedAdmission);
+          this.archiveWorkspaceOwnership.beginAdmission(scope);
+          try {
+            const current = await this.findThreadForArchiveCleanup({ ...candidate, context, ownershipScope: containerPath, removalAdmission: scope });
+            await scope.prepare(this.archiveWorkspaceMutationsFor(scope));
+            scope.reserve(this.archiveWorkspaceMutations());
+            const ownedPaths = [current.thread.projectKey, ...current.thread.linkedDirectories.map(linkedDirectoryWorktreePath)];
+            const canonical = canonicalWorktreePaths();
+            const candidateKey = await canonical(candidate.worktreePath);
+            const ownedKeys = await Promise.all(ownedPaths.filter((value): value is string => Boolean(value)).map(canonical));
+            if (!ownedKeys.includes(candidateKey)) {
+              throw new Error("Archived thread no longer owns the container; it was kept.");
+            }
+            if (this.isWorktreeContainerProtected(containerPath, current)) {
+              report.containerCleanup.push({ ...candidate, containerPath, removed: false, skippedReason: "Container has an active or external owner." });
+            } else {
+              const result = await this.worktreeContainerService.prune(candidate.worktreePath, () => {
+                context.assertCurrent();
+                scope.assertCurrent(this.archiveWorkspaceMutations());
+              }, candidate.containerIdentity);
+              if (result) report.containerCleanup.push(result);
+            }
+            return { backend: candidate.backend, threadId: candidate.threadId, archivedAt: Date.now(), cleanup: [] };
+          } finally {
+            this.archiveWorktreeRemovalAdmissions.delete(scopedAdmission);
           }
-          if (this.isWorktreeContainerProtected(containerPath, current)) {
-            report.containerCleanup.push({ ...candidate, containerPath, removed: false, skippedReason: "Container has an active or external owner." });
-          } else {
-            const result = await this.worktreeContainerService.prune(candidate.worktreePath, () => {
-              context.assertCurrent();
-              scope.assertCurrent(this.archiveWorkspaceMutations());
-            }, candidate.containerIdentity);
-            if (result) report.containerCleanup.push(result);
-          }
-          return { backend: candidate.backend, threadId: candidate.threadId, archivedAt: Date.now(), cleanup: [] };
-        } finally {
-          this.archiveWorktreeRemovalAdmissions.delete(scopedAdmission);
-        }
+        };
+        return context.withWorktree ? await context.withWorktree(containerPath, prune) : await prune();
       });
       try {
         await this.observeArchiveCleanupCompletion(completion, { ...candidate, archivedAt: Date.now() });
@@ -39385,33 +40400,16 @@ export class DesktopBackendRegistry {
     return { ...inventory, thread: archivedTarget };
   }
 
+  /** Queue jobs use the fleet index. Broad repair and the identity-only read
+   * that builds the index each perform one complete, uncached read. */
   private async readPacedArchiveCleanupInventory(params: ArchiveCleanupDiscoveryRequest): Promise<
-    Omit<ArchiveCleanupMetadata, "thread"> & { thread?: AppServerThreadSummary; activeTarget?: AppServerThreadSummary; targetIsActive: boolean }
+    Omit<ArchiveCleanupMetadata, "thread"> & { thread?: AppServerThreadSummary; activeTarget?: AppServerThreadSummary; targetIsActive: boolean; codexWatermark?: number }
   > {
     if (this.isBootstrapModeFn()) throw new Error("Archive discovery is unavailable in bootstrap mode.");
-    if (params.reuseInventory && !params.identityOnly && this.codexClient.enrichArchiveCleanupThreads) {
-      return await this.readCandidateScopedArchiveCleanupInventory(params);
-    }
+    const fleet = this.archiveFleetIndexFor(params);
+    if (fleet) return await this.readFleetArchiveCleanupInventory(fleet, params);
     const context = params.context;
     const revision = this.archiveWorkspaceRevision;
-    const inventories = this.archiveCleanupInventories;
-    const batch = params.reuseInventory ? context?.batch : undefined;
-    const cached = batch ? inventories.get(batch) : undefined;
-    // Reuse only preliminary discovery within one uninterrupted queue batch.
-    // Removal admission and repair always request a new authoritative scan.
-    // Workspace or membership changes fence reuse even while a scan awaits I/O.
-    if (batch && cached && cached.revision === revision
-      && Boolean(cached.identityOnly) === Boolean(params.identityOnly)
-      && (params.targetThread || cached.includesArchived)) {
-      await context?.checkpoint();
-      if (this.archiveWorkspaceRevision === revision && this.archiveCleanupInventories.get(batch) === cached) {
-        backendRegistryLog.info("archive cleanup inventory reused", {
-          backend: params.backend, threadId: params.threadId, runtimeInstanceId: this.runtimeInstanceId,
-          activeThreads: cached.inventory.activeThreads.length, archivedThreads: cached.inventory.archivedThreads.length,
-        });
-        return this.selectArchiveCleanupInventory(cached.inventory, params);
-      }
-    }
     const activeThreads: AppServerThreadSummary[] = [];
     const archivedThreads: AppServerThreadSummary[] = [];
     const activeChildren: AppServerThreadSummary[] = [];
@@ -39424,7 +40422,7 @@ export class DesktopBackendRegistry {
     let activeTarget: AppServerThreadSummary | undefined;
     let targetIsActive = false;
     const overlaysByThreadKey = new Map<string, ThreadOverlayState | undefined>();
-    const agents = await this.acpBackend.listAvailableAgents();
+    const agents = (await this.acpBackend.archiveCleanupBackendIds()).map((backendId) => ({ backendId }));
     const directoryObservations = new Map<string, Promise<ThreadDirectoryEnrichment>>();
     const workspaceObservations = new Map<string, Promise<LinkedDirectorySummary | undefined>>();
     // Admission never uses the preliminary inventory. Larger metadata pages
@@ -39437,10 +40435,14 @@ export class DesktopBackendRegistry {
     const providerPageSize = directoryFilter ? 100 : ARCHIVE_CLEANUP_SLICE_SIZE;
     const scanStartedAt = Date.now();
     let providerPages = 0;
-    const appendPage = async (backend: AppServerBackendKind, rows: AppServerThreadSummary[], archived: boolean, resolveCwd = isAcpBackendId(backend)) => {
+    // Newest active Codex row this complete read covered. Admission later
+    // reads only rows the provider changed at or after it.
+    let codexWatermark: number | undefined = 0;
+    const appendPage = async (backend: AppServerBackendKind, rows: AppServerThreadSummary[], archived: boolean, resolveCwd = isAcpBackendId(backend), providerRows = backend === "codex") => {
       for (let offset = 0; offset < rows.length; offset += ARCHIVE_CLEANUP_SLICE_SIZE) {
         await context?.checkpoint();
         const slice = rows.slice(offset, offset + ARCHIVE_CLEANUP_SLICE_SIZE);
+        params.onDiscoveryProgress?.({ detail: `Reading ${archived ? "archived" : "active"} ${backend} threads`, found: activeThreads.length + archivedThreads.length });
         const readOverlays = this.overlayStore.getArchiveCleanupOverlayStates ?? this.overlayStore.getThreadOverlayStates;
         const overlays = await readOverlays.call(this.overlayStore, { backend, threadIds: slice.map((thread) => thread.id) });
         for (const row of slice) {
@@ -39464,12 +40466,16 @@ export class DesktopBackendRegistry {
               if (directory) directories = [directory];
             }
           }
+          if (providerRows && !archived && codexWatermark !== undefined) {
+            codexWatermark = typeof row.updatedAt === "number" ? Math.max(codexWatermark, row.updatedAt) : undefined;
+          }
+          params.fleetRows?.push({ backend, archived, overlay, base: { ...row, source: backend, linkedDirectories: directories } });
           directories = withRetainedWorktrees(
             mergeThreadLinkedDirectories([...directories, ...(overlay?.extraLinkedDirectories ?? [])]),
             overlay,
           );
           const thread: AppServerThreadSummary = {
-            id: row.id, source: backend, title: "", titleSource: "explicit", linkedDirectories: directories,
+            id: row.id, source: backend, title: row.title, titleSource: row.titleSource, updatedAt: row.updatedAt, linkedDirectories: directories,
             projectKey: row.projectKey, gitBranch: row.gitBranch, observedGitBranch: row.observedGitBranch,
           };
           params.removalAdmission?.observeThread(buildThreadIdentityKey(backend, row.id), [
@@ -39512,6 +40518,7 @@ export class DesktopBackendRegistry {
         let cursor: string | undefined;
         do {
           await context?.checkpoint();
+          params.onDiscoveryProgress?.({ detail: `Reading ${archived ? "archived" : "active"} Codex page ${providerPages + 1}`, found: activeThreads.length + archivedThreads.length });
           const page = await this.codexClient.listArchiveCleanupThreadsPage!({
             archived, cursor, limit: providerPageSize,
             checkpoint: async () => { await context?.checkpoint(); },
@@ -39528,7 +40535,7 @@ export class DesktopBackendRegistry {
           // A newly started thread may not appear in the provider list yet.
           // It is nevertheless an active checkout user.
           const pending = this.withPendingStartedThreads("codex", [], { archived: false });
-          await appendPage("codex", pending, false, true);
+          await appendPage("codex", pending, false, true, false);
         }
       }
       for (const agent of agents) {
@@ -39556,118 +40563,490 @@ export class DesktopBackendRegistry {
       directoryObservations: directoryObservations.size, workspaceObservations: workspaceObservations.size,
       ownershipScope: params.ownershipScope, providerPageSize,
     });
-    if (batch && revision === this.archiveWorkspaceRevision && inventories === this.archiveCleanupInventories) {
-      inventories.set(batch, { revision, includesArchived: !params.targetThread, identityOnly: params.identityOnly,
-        inventory: { activeThreads, archivedThreads, overlaysByThreadKey, worktreeEvidence, workspaceRevision: revision } });
-    }
     // A confirmed missing rollout can leave retained metadata in the active
     // provider listing. Use that exact identity for recovery while still
     // scanning every checkout user. Actual restore intent cancels this job.
     return { workspaceRevision: revision, activeThreads, archivedThreads: params.targetThread ? [...archivedThreads, params.targetThread] : archivedThreads,
-      thread: archivedTarget, activeTarget, targetIsActive, overlaysByThreadKey, activeChildren, legacyParentBackends, worktreeEvidence };
+      thread: archivedTarget, activeTarget, targetIsActive, overlaysByThreadKey, activeChildren, legacyParentBackends, worktreeEvidence,
+      codexWatermark: this.isCodexBootstrapDeferredFn() ? undefined : codexWatermark };
   }
 
-  /** Share only complete identity/overlay evidence across a preliminary batch.
-   * Candidate discovery and scoped Git observations belong to this job. A later
-   * job with different roots must enrich those roots, even at the same revision.
-   * Admission deliberately bypasses this cache and reads providers afresh. */
-  private async readCandidateScopedArchiveCleanupInventory(params: ArchiveCleanupDiscoveryRequest) {
-    const raw = await this.readPacedArchiveCleanupInventory({ ...params, identityOnly: true, targetThread: undefined });
-    const target = raw.thread ?? (params.codexRolloutMissing ? raw.activeTarget : undefined);
-    if (!target) return raw;
+  /** The current queue batch's fleet index, when this read can use one.
+   * Repair keeps its complete audit; alternate adapters use aggregate discovery. */
+  private archiveFleetIndexFor(params: ArchiveCleanupDiscoveryRequest): ArchiveFleetIndex | undefined {
+    const batch = params.context?.batch;
+    if (!batch || params.identityOnly || params.fleetRows || !params.threadId || !this.codexClient.listArchiveCleanupThreadsPage) return undefined;
+    if (this.archiveFleet?.batch !== batch) this.archiveFleet = { batch, index: new ArchiveFleetIndex() };
+    return this.archiveFleet.index;
+  }
+
+  /** Record a change the current batch's index has not read yet. A change
+   * with no identity can affect any checkout, so it requests a complete read. */
+  private noteArchiveFleetChange(identity: { backend: AppServerBackendKind; threadId: string } | undefined, change: FleetChange, reason: string): void {
+    const index = this.archiveFleet?.index;
+    if (!index) return;
+    if (identity) index.markDirty(buildThreadIdentityKey(identity.backend, identity.threadId), change);
+    else index.requestRebuild(reason);
+  }
+
+  private archiveFleetRow(backend: AppServerBackendKind, base: AppServerThreadSummary, overlay: ThreadOverlayState | undefined, archived: boolean): FleetRow {
+    const linkedDirectories = withRetainedWorktrees(
+      mergeThreadLinkedDirectories([...base.linkedDirectories, ...(overlay?.extraLinkedDirectories ?? [])]),
+      overlay,
+    );
+    const thread: AppServerThreadSummary = {
+      id: base.id, source: backend, title: "", titleSource: "explicit", linkedDirectories,
+      projectKey: base.projectKey, gitBranch: base.gitBranch, observedGitBranch: base.observedGitBranch,
+    };
+    return {
+      key: buildThreadIdentityKey(backend, base.id), backend, threadId: base.id, archived, base, thread, overlay,
+      paths: archiveWorkspacePaths(thread),
+      // A provider row with no workspace of its own cannot prove where it runs.
+      unknownWorkspace: !base.projectKey && base.linkedDirectories.length === 0,
+      externalPaths: linkedDirectories.filter((directory) => directory.worktreeOwnership === "external")
+        .map((directory) => linkedDirectoryWorktreePath(directory) ?? directory.path),
+    };
+  }
+
+  private async readClaudeArchiveCleanupChangeToken(): Promise<string | undefined> {
+    try { return await this.claudeBackend.archiveCleanupChangeToken?.(); } catch { return undefined; }
+  }
+
+  /** A foreign Claude write changes only Claude's ownership evidence. Read
+   * its complete membership and overlays without walking the Codex fleet. */
+  private async refreshArchiveFleetClaudeRows(index: ArchiveFleetIndex, token: string, context?: ArchiveCleanupContext): Promise<void> {
+    const epoch = index.beginRead();
+    const observed = new Map<string, { key: string; backend: "claude"; threadId: string; archived: boolean; base: AppServerThreadSummary }>();
+    for (const archived of [false, true]) {
+      await context?.checkpoint();
+      for (const base of await this.claudeBackend.listThreads({ archived })) {
+        const key = buildThreadIdentityKey("claude", base.id);
+        // An active listing wins if a concurrent restore puts the identity
+        // in both pages, just as it does in a complete fleet read.
+        if (!observed.has(key)) observed.set(key, { key, backend: "claude", threadId: base.id, archived, base });
+      }
+    }
+    const rows = [...observed.values()];
+    const overlays = await this.readArchiveFleetOverlays(rows, context);
+    context?.assertCurrent();
+    for (const row of index.rowsForBackend("claude")) {
+      if (!observed.has(row.key)) {
+        index.delete(row.key);
+        index.settle(row.key, epoch);
+      }
+    }
+    for (const row of rows) {
+      const overlay = overlays.get(row.key);
+      if (overlay?.archiveTombstonedAt !== undefined) index.delete(row.key);
+      else {
+        const next = this.archiveFleetRow("claude", row.base, overlay, row.archived);
+        const prior = index.get(row.key);
+        // Transcript, title and usage writes move the token too. Preserve
+        // preliminary checkout observations when ownership did not change.
+        if (!prior || prior.archived !== next.archived
+          || JSON.stringify(prior.thread) !== JSON.stringify(next.thread)
+          || JSON.stringify(prior.overlay) !== JSON.stringify(next.overlay)) await index.upsert(next);
+      }
+      index.settle(row.key, epoch);
+    }
+    // Capture the token from before the read. A write during it remains
+    // visible to the next admission, and newer dirty marks remain unsettled.
+    index.claudeToken = token;
+  }
+
+  /** One complete identity and overlay read: every provider, every page. */
+  private async rebuildArchiveFleet(index: ArchiveFleetIndex, context?: ArchiveCleanupContext): Promise<void> {
+    const reason = index.rebuildReason ?? "new batch";
+    const epoch = index.beginRead();
     const startedAt = Date.now();
-    const directoryObservations = new Map<string, Promise<ThreadDirectoryEnrichment>>();
-    const workspaceObservations = new Map<string, Promise<LinkedDirectorySummary | undefined>>();
-    const checkpoint = async () => { await params.context?.checkpoint(); };
-    const enrich = async (rows: AppServerThreadSummary[], directoryFilter?: (cwd: string | undefined) => Promise<boolean>) => {
-      const result: AppServerThreadSummary[] = [];
-      for (let offset = 0; offset < rows.length; offset += ARCHIVE_CLEANUP_SLICE_SIZE) {
-        await checkpoint();
-        const slice = rows.slice(offset, offset + ARCHIVE_CLEANUP_SLICE_SIZE);
-        const codex = slice.filter((row) => row.source === "codex");
-        const enrichedCodex = codex.length ? await this.codexClient.enrichArchiveCleanupThreads!(codex, {
-          checkpoint, directoryObservations, directoryFilter,
-        }) : [];
-        let codexIndex = 0;
-        for (const row of slice) {
-          params.context?.assertCurrent();
-          const overlay = raw.overlaysByThreadKey?.get(buildThreadIdentityKey(row.source, row.id));
-          const enrichedRow = row.source === "codex" ? enrichedCodex[codexIndex++]! : row;
-          let directories = enrichedRow.linkedDirectories;
-          if (row.source !== "codex") {
-            const cwd = resolveThreadWorkspaceCwd(row, overlay?.extraLinkedDirectories ?? []);
-            if (cwd && (!directoryFilter || await directoryFilter(cwd))) {
-              let observation = workspaceObservations.get(cwd);
-              if (!observation) {
-                await checkpoint();
-                observation = this.acpWorktreeRepositoryResolver(cwd);
-                workspaceObservations.set(cwd, observation);
-              }
-              const directory = await observation;
-              if (directory) directories = [directory];
+    // Observe change tokens before the read, so a write during it forces the
+    // next admission to read again rather than trust this result.
+    const overlayToken = this.overlayStore.readArchiveCleanupChangeToken?.();
+    const claudeToken = await this.readClaudeArchiveCleanupChangeToken();
+    const fleetRows: NonNullable<ArchiveCleanupDiscoveryRequest["fleetRows"]> = [];
+    const inventory = await this.readPacedArchiveCleanupInventory({ backend: "codex", threadId: "", context, identityOnly: true, fleetRows });
+    // A provider can list one identity as both active and archived. Archived
+    // membership must be unambiguous: an active listing anywhere wins.
+    const rows = new Map<string, FleetRow>();
+    for (const row of fleetRows) {
+      const next = this.archiveFleetRow(row.backend, row.base, row.overlay, row.archived);
+      const previous = rows.get(next.key);
+      if (!previous || (previous.archived && !next.archived)) rows.set(next.key, next);
+    }
+    await index.replaceAll([...rows.values()], epoch, {
+      codexWatermark: inventory.codexWatermark, overlayToken, claudeToken,
+    });
+    backendRegistryLog.info("archive cleanup fleet index built", {
+      runtimeInstanceId: this.runtimeInstanceId, reason, rows: index.size, durationMs: Date.now() - startedAt,
+    });
+  }
+
+  private async refreshArchiveFleet(index: ArchiveFleetIndex, context?: ArchiveCleanupContext): Promise<"rebuilt" | "current"> {
+    // Past a quarter of the fleet, one complete read costs less than reading
+    // each changed identity on its own.
+    if (index.dirtyCount > Math.max(ARCHIVE_CLEANUP_SLICE_SIZE, index.size / 4)) index.requestRebuild("many identities changed");
+    if (!index.needsRebuild) await this.refreshDirtyArchiveFleetRows(index, context);
+    if (!index.needsRebuild) return "current";
+    await this.rebuildArchiveFleet(index, context);
+    return "rebuilt";
+  }
+
+  /** Read again only the identities a writer or notification changed. */
+  private async refreshDirtyArchiveFleetRows(index: ArchiveFleetIndex, context?: ArchiveCleanupContext): Promise<void> {
+    const dirty = index.dirtyEntries();
+    if (!dirty.length) return;
+    const epoch = index.beginRead();
+    const checkpoint = async () => { await context?.checkpoint(); };
+    const reads: Array<{ key: string; backend: AppServerBackendKind; threadId: string; archived: boolean; base: AppServerThreadSummary }> = [];
+    let claude: Map<string, { thread: AppServerThreadSummary; archived: boolean }> | undefined;
+    for (const { key, changes, membership } of dirty) {
+      const identity = parseThreadIdentityKey(key);
+      if (!identity) {
+        index.requestRebuild("unrecognized identity");
+        return;
+      }
+      const backend = identity.backend;
+      const threadId = identity.threadId;
+      const prior = index.get(key);
+      if (membership === "deleted") {
+        index.delete(key);
+        index.settle(key, epoch);
+        continue;
+      }
+      let archived = membership ? membership === "archived" : prior?.archived ?? false;
+      // Archive membership and overlay links do not move the provider's cwd.
+      let base = changes.has("provider") || !prior ? undefined : prior.base;
+      if (!base) {
+        if (isAcpBackendId(backend)) {
+          const session = this.acpBackend.getSession(backend, threadId);
+          // Deletion is announced; an unreadable session is not proof that it
+          // is gone, so it protects every checkout until it can be read.
+          base = session ? this.acpBackend.sessionToThreadSummary(session)
+            : { id: threadId, source: backend, title: "", titleSource: "explicit", linkedDirectories: [] };
+          if (session) archived = Boolean(session.archivedAt);
+        } else if (backend === "claude") {
+          if (!claude) {
+            claude = new Map();
+            for (const isArchived of [false, true]) {
+              await checkpoint();
+              for (const thread of await this.claudeBackend.listThreads({ archived: isArchived })) claude.set(thread.id, { thread, archived: isArchived });
             }
           }
-          result.push({ ...enrichedRow, linkedDirectories: withRetainedWorktrees(
-            mergeThreadLinkedDirectories([...directories, ...(overlay?.extraLinkedDirectories ?? [])]), overlay,
-          ) });
+          const found = claude.get(threadId);
+          if (!found) {
+            index.delete(key);
+            index.settle(key, epoch);
+            continue;
+          }
+          base = found.thread;
+          archived = found.archived;
+        } else if (backend === "codex") {
+          const pending = this.pendingStartedThreads.get(key);
+          if (pending && !archived) base = pending;
+          else if (this.codexClient.readArchiveCleanupThreadSummary) {
+            // An unreadable owner protects every checkout until it is read.
+            base = await this.codexClient.readArchiveCleanupThreadSummary(threadId, checkpoint).catch(() => undefined)
+              ?? { id: threadId, source: "codex", title: "", titleSource: "explicit", linkedDirectories: [] };
+          } else {
+            index.requestRebuild("provider row reads unavailable");
+            return;
+          }
+        } else {
+          index.requestRebuild("unsupported backend");
+          return;
         }
       }
-      return result;
-    };
-    // Only the authoritative target's cwd and overlay can introduce candidates.
-    // Do not use the primary repository path of a linked worktree as a scope:
-    // that would unnecessarily include every other checkout of the repository.
-    const [candidate] = await enrich([target]);
-    const roots = [...new Set(candidate!.linkedDirectories.map(linkedDirectoryWorktreePath)
-      .filter((value): value is string => Boolean(value)))];
-    const filters = roots.map(archiveCleanupWorkspaceFilter);
-    const directoryFilter = async (cwd: string | undefined) => {
-      for (const filter of filters) if (await filter(cwd)) return true;
-      return false;
-    };
-    const activeThreads = await enrich(raw.activeThreads, directoryFilter);
-    const archivedThreads = await enrich(raw.archivedThreads, directoryFilter);
+      reads.push({ key, backend, threadId, archived, base });
+    }
+    const overlays = await this.readArchiveFleetOverlays(reads, context);
+    for (const read of reads) {
+      const overlay = overlays.get(read.key);
+      if (overlay?.archiveTombstonedAt !== undefined) index.delete(read.key);
+      else await index.upsert(this.archiveFleetRow(read.backend, read.base, overlay, read.archived));
+      index.settle(read.key, epoch);
+    }
+  }
+
+  private async readArchiveFleetOverlays(
+    identities: ReadonlyArray<{ key: string; backend: AppServerBackendKind; threadId: string }>,
+    context?: ArchiveCleanupContext,
+  ): Promise<Map<string, ThreadOverlayState | undefined>> {
+    const result = new Map<string, ThreadOverlayState | undefined>();
+    const byBackend = new Map<AppServerBackendKind, string[]>();
+    for (const { backend, threadId } of identities) byBackend.set(backend, [...byBackend.get(backend) ?? [], threadId]);
+    const read = this.overlayStore.getArchiveCleanupOverlayStates ?? this.overlayStore.getThreadOverlayStates;
+    for (const [backend, threadIds] of byBackend) {
+      for (let offset = 0; offset < threadIds.length; offset += ARCHIVE_CLEANUP_SLICE_SIZE) {
+        await context?.checkpoint();
+        const slice = threadIds.slice(offset, offset + ARCHIVE_CLEANUP_SLICE_SIZE);
+        const overlays = await read.call(this.overlayStore, { backend, threadIds: slice });
+        for (const threadId of slice) result.set(buildThreadIdentityKey(backend, threadId), overlays[threadId]);
+      }
+    }
+    return result;
+  }
+
+  /** Reread the overlays of related identities and apply any that changed. */
+  private async refreshArchiveFleetOverlays(index: ArchiveFleetIndex, keys: ReadonlySet<string>, context?: ArchiveCleanupContext): Promise<void> {
+    const rows = index.rows(keys);
+    const overlays = await this.readArchiveFleetOverlays(rows, context);
+    for (const row of rows) {
+      const overlay = overlays.get(row.key);
+      if (overlay?.archiveTombstonedAt !== undefined) index.delete(row.key);
+      else if (JSON.stringify(overlay) !== JSON.stringify(row.overlay)) {
+        await index.upsert(this.archiveFleetRow(row.backend, row.base, overlay, row.archived));
+      }
+    }
+  }
+
+  /**
+   * The provider's rows changed since the index's watermark, newest first.
+   * A new thread, a cwd change and an unarchived thread advance `updated_at`.
+   * Protocol-only captures (2026-11-05, Codex 0.160.0 and 0.163.0) confirmed
+   * `thread/unarchive` advances it in another app-server's `thread/list`
+   * with `sortKey: "updated_at"` and `useStateDbOnly: true`, including after
+   * restarting the restoring client. Archived `thread/resume` (ID or path)
+   * and `thread/fork` reject rather than reactivate the thread. Thus a short
+   * read sees an external restore without rereading the fleet.
+   */
+  private async readArchiveFleetCodexDelta(
+    index: ArchiveFleetIndex,
+    context: ArchiveCleanupContext | undefined,
+    directoryFilter?: (cwd: string | undefined) => Promise<boolean>,
+  ): Promise<void> {
+    const watermark = index.codexWatermark!;
+    let newest = watermark;
+    const changed: AppServerThreadSummary[] = [];
+    const cursors = new Set<string>();
+    const directoryObservations = new Map<string, Promise<ThreadDirectoryEnrichment>>();
+    let cursor: string | undefined;
+    for (let pages = 0; ; pages += 1) {
+      if (pages >= ARCHIVE_FLEET_DELTA_PAGES) {
+        index.requestRebuild("provider changes exceeded the incremental read");
+        return;
+      }
+      await context?.checkpoint();
+      const page = await this.codexClient.listArchiveCleanupThreadsPage!({
+        archived: false, cursor, limit: ARCHIVE_FLEET_DELTA_PAGE_SIZE, sortKey: "updated_at",
+        checkpoint: async () => { await context?.checkpoint(); }, directoryObservations, directoryFilter,
+      });
+      let reachedOlder = false;
+      for (const row of page.threads) {
+        if (typeof row.updatedAt !== "number") {
+          index.requestRebuild("provider row without updatedAt");
+          return;
+        }
+        // Rows at the watermark itself are read again: a timestamp tie cannot
+        // prove the row predates the complete read.
+        if (row.updatedAt < watermark) {
+          reachedOlder = true;
+          continue;
+        }
+        newest = Math.max(newest, row.updatedAt);
+        changed.push(row);
+      }
+      cursor = page.nextCursor?.trim();
+      if (reachedOlder || !cursor) break;
+      if (cursors.has(cursor)) {
+        index.requestRebuild("provider recency cursor repeated");
+        return;
+      }
+      cursors.add(cursor);
+    }
+    const unseen = changed.filter((row) => !index.get(buildThreadIdentityKey("codex", row.id)))
+      .map((row) => ({ key: buildThreadIdentityKey("codex", row.id), backend: "codex" as const, threadId: row.id }));
+    const overlays = await this.readArchiveFleetOverlays(unseen, context);
+    for (const row of changed) {
+      const key = buildThreadIdentityKey("codex", row.id);
+      const overlay = overlays.has(key) ? overlays.get(key) : index.get(key)?.overlay;
+      if (overlay?.archiveTombstonedAt !== undefined) continue;
+      await index.upsert(this.archiveFleetRow("codex", row, overlay, false));
+    }
+    index.codexWatermark = newest;
+  }
+
+  /**
+   * Fresh evidence for one removal, bounded by what changed: identities that
+   * PwrAgent's writers and notifications marked, provider rows changed since
+   * the watermark, and the overlays of every related identity. Without a
+   * provider recency read or after another process wrote the overlay store,
+   * admission reads the complete fleet again. Foreign Claude writes refresh
+   * that provider's membership without discarding the other providers.
+   */
+  private async verifyArchiveFleetForAdmission(index: ArchiveFleetIndex, scopePath: string, params: ArchiveCleanupDiscoveryRequest): Promise<void> {
+    const overlayToken = this.overlayStore.readArchiveCleanupChangeToken?.();
+    if (overlayToken === undefined || overlayToken !== index.overlayToken) index.requestRebuild("overlay store changed or has no change token");
+    const claudeToken = await this.readClaudeArchiveCleanupChangeToken();
+    if (claudeToken === undefined) index.requestRebuild("Claude sessions have no change token");
+    if (await index.pathWriteRelates(scopePath)) index.requestRebuild("workspace write near this checkout");
+    if (this.codexClient.archiveCleanupRecencyReads !== true || index.codexWatermark === undefined || this.isCodexBootstrapDeferredFn()) {
+      index.requestRebuild("provider recency reads unavailable");
+    }
+    if (!index.needsRebuild && claudeToken !== undefined && claudeToken !== index.claudeToken) {
+      await this.refreshArchiveFleetClaudeRows(index, claudeToken, params.context);
+    }
+    if (await this.refreshArchiveFleet(index, params.context) === "rebuilt") return;
+    await this.readArchiveFleetCodexDelta(index, params.context, params.removalAdmission?.directoryFilter);
+    await this.refreshArchiveFleet(index, params.context);
+  }
+
+  /** Git and cwd enrichment for related rows only, as the complete read did. */
+  private async enrichArchiveFleetRows(
+    rows: readonly FleetRow[],
+    directoryFilter: ((cwd: string | undefined) => Promise<boolean>) | undefined,
+    context: ArchiveCleanupContext | undefined,
+    directoryObservations: Map<string, Promise<ThreadDirectoryEnrichment>>,
+    workspaceObservations: Map<string, Promise<LinkedDirectorySummary | undefined>>,
+  ): Promise<AppServerThreadSummary[]> {
+    const checkpoint = async () => { await context?.checkpoint(); };
+    const result: AppServerThreadSummary[] = [];
+    for (let offset = 0; offset < rows.length; offset += ARCHIVE_CLEANUP_SLICE_SIZE) {
+      await checkpoint();
+      const slice = rows.slice(offset, offset + ARCHIVE_CLEANUP_SLICE_SIZE);
+      const codex = slice.filter((row) => row.backend === "codex").map((row) => row.base);
+      const enrichedCodex = codex.length && this.codexClient.enrichArchiveCleanupThreads
+        ? await this.codexClient.enrichArchiveCleanupThreads(codex, { checkpoint, directoryObservations, directoryFilter })
+        : codex;
+      let codexIndex = 0;
+      for (const row of slice) {
+        context?.assertCurrent();
+        let directories = row.backend === "codex" ? enrichedCodex[codexIndex++]!.linkedDirectories : row.base.linkedDirectories;
+        if (row.backend !== "codex") {
+          const cwd = resolveThreadWorkspaceCwd(row.base, row.overlay?.extraLinkedDirectories ?? []);
+          if (cwd && (!directoryFilter || await directoryFilter(cwd))) {
+            let observation = workspaceObservations.get(cwd);
+            if (!observation) {
+              await checkpoint();
+              observation = this.acpWorktreeRepositoryResolver(cwd);
+              workspaceObservations.set(cwd, observation);
+            }
+            const directory = await observation;
+            if (directory) directories = [directory];
+          }
+        }
+        result.push({ ...row.thread, linkedDirectories: withRetainedWorktrees(
+          mergeThreadLinkedDirectories([...directories, ...(row.overlay?.extraLinkedDirectories ?? [])]), row.overlay,
+        ) });
+      }
+    }
+    return result;
+  }
+
+  /** Ownership lists for related identities, as consumers expect them. */
+  private async buildArchiveFleetLists(
+    index: ArchiveFleetIndex,
+    keys: ReadonlySet<string>,
+    scopes: readonly string[],
+    directoryFilter: ((cwd: string | undefined) => Promise<boolean>) | undefined,
+    context: ArchiveCleanupContext | undefined,
+    removalAdmission?: ArchiveWorkspaceAdmission,
+    directoryObservations = new Map<string, Promise<ThreadDirectoryEnrichment>>(),
+    workspaceObservations = new Map<string, Promise<LinkedDirectorySummary | undefined>>(),
+  ) {
+    const rows = index.rows(keys);
+    const ownershipPaths = new WeakMap<AppServerThreadSummary, readonly string[]>();
+    const pathsByKey = new Map<string, readonly string[]>();
+    if (removalAdmission) this.archiveFleetAdmissionPaths.set(removalAdmission, pathsByKey);
+    const enriched = await this.enrichArchiveFleetRows(rows, directoryFilter, context, directoryObservations, workspaceObservations);
+    context?.assertCurrent();
+    const activeThreads: AppServerThreadSummary[] = [];
+    const archivedThreads: AppServerThreadSummary[] = [];
+    const byKey = new Map<string, { row: FleetRow; summary: AppServerThreadSummary }>();
     const worktreeEvidence: NonNullable<ArchiveCleanupMetadata["worktreeEvidence"]> = {
       externalPaths: new Set(), activeByPath: new Map(), archivedByPath: new Map(),
     };
-    for (const [threads, index] of [[activeThreads, worktreeEvidence.activeByPath], [archivedThreads, worktreeEvidence.archivedByPath]] as const) {
-      for (const thread of threads) {
-        const paths = new Set(thread.projectKey ? [normalizeWorktreePathForComparison(thread.projectKey)] : []);
-        for (const directory of thread.linkedDirectories) {
-          const worktreePath = linkedDirectoryWorktreePath(directory);
-          if (!worktreePath) continue;
-          const key = normalizeWorktreePathForComparison(worktreePath);
-          paths.add(key);
-          if (directory.worktreeOwnership === "external") worktreeEvidence.externalPaths.add(key);
-        }
-        for (const key of paths) {
-          const users = index.get(key) ?? [];
-          users.push(thread);
-          index.set(key, users);
-        }
+    for (const [offset, row] of rows.entries()) {
+      const summary = enriched[offset]!;
+      // Enrichment can only add a checkout above a related cwd; keep any path
+      // the index has not seen, and every path of an unknown owner.
+      const related = await index.relatedPaths(row.key, scopes);
+      const known = new Set(row.paths);
+      const paths = related ? [...new Set([...related, ...archiveWorkspacePaths(summary).filter((value) => !known.has(value))])] : undefined;
+      if (paths) {
+        ownershipPaths.set(summary, paths);
+        pathsByKey.set(row.key, paths);
       }
+      byKey.set(row.key, { row, summary });
+      (row.archived ? archivedThreads : activeThreads).push(summary);
+      removalAdmission?.observeThread(row.key, [...paths ?? archiveWorkspacePaths(summary), ...(row.unknownWorkspace ? [""] : [])]);
+      const evidencePaths = new Set(summary.projectKey ? [normalizeWorktreePathForComparison(summary.projectKey)] : []);
+      for (const directory of summary.linkedDirectories) {
+        const worktreePath = linkedDirectoryWorktreePath(directory);
+        if (!worktreePath) continue;
+        const normalized = normalizeWorktreePathForComparison(worktreePath);
+        evidencePaths.add(normalized);
+        if (directory.worktreeOwnership === "external") worktreeEvidence.externalPaths.add(normalized);
+      }
+      const byPath = row.archived ? worktreeEvidence.archivedByPath : worktreeEvidence.activeByPath;
+      for (const value of evidencePaths) byPath.set(value, [...byPath.get(value) ?? [], summary]);
     }
-    params.context?.assertCurrent();
-    backendRegistryLog.info("archive cleanup candidates enriched", {
-      backend: params.backend, threadId: params.threadId, runtimeInstanceId: this.runtimeInstanceId,
-      durationMs: Date.now() - startedAt, candidateRoots: roots.length,
-      directoryObservations: directoryObservations.size, workspaceObservations: workspaceObservations.size,
-    });
-    return this.selectArchiveCleanupInventory({ ...raw, activeThreads, archivedThreads, worktreeEvidence }, { ...params, targetThread: undefined });
+    return { activeThreads, archivedThreads, byKey, worktreeEvidence, ownershipPaths };
   }
 
-  private selectArchiveCleanupInventory(inventory: ArchiveCleanupInventory, params: ArchiveCleanupDiscoveryRequest) {
-    const { activeThreads, overlaysByThreadKey } = inventory;
-    const matchesTarget = (thread: AppServerThreadSummary) => thread.source === params.backend && thread.id === params.threadId;
-    const activeTarget = activeThreads.find(matchesTarget);
+  /**
+   * Discovery and admission from the batch's fleet index. The returned lists
+   * hold only identities related to the candidate scopes, plus every identity
+   * whose workspace is unknown; every consumer of these lists asks only about
+   * those scopes, so unrelated threads cost nothing per removal.
+   */
+  private async readFleetArchiveCleanupInventory(index: ArchiveFleetIndex, params: ArchiveCleanupDiscoveryRequest): Promise<
+    Omit<ArchiveCleanupMetadata, "thread"> & { thread?: AppServerThreadSummary; activeTarget?: AppServerThreadSummary; targetIsActive: boolean }
+  > {
+    const revision = this.archiveWorkspaceRevision;
+    const key = buildThreadIdentityKey(params.backend, params.threadId);
+    const scope = params.ownershipScope ?? params.removalAdmission?.scopePath;
+    if (scope) await this.verifyArchiveFleetForAdmission(index, scope, params);
+    else await this.refreshArchiveFleet(index, params.context);
+    params.context?.assertCurrent();
+    let lists: Awaited<ReturnType<DesktopBackendRegistry["buildArchiveFleetLists"]>>;
+    if (scope) {
+      // Admission: fresh overlays for every related identity, then fresh lists.
+      await this.refreshArchiveFleetOverlays(index, await index.related(scope), params.context);
+      const keys = await index.related(scope);
+      if (index.get(key)) keys.add(key);
+      if (params.removalAdmission) this.archiveFleetAdmissionKeys.set(params.removalAdmission, keys);
+      lists = await this.buildArchiveFleetLists(index, keys, [scope], params.removalAdmission?.directoryFilter ?? archiveCleanupWorkspaceFilter(scope),
+        params.context, params.removalAdmission);
+    } else {
+      // Only the target's own checkouts can become candidates.
+      const targetRow = index.get(key);
+      // One job's observations: the target's checkout is enriched once.
+      const directoryObservations = new Map<string, Promise<ThreadDirectoryEnrichment>>();
+      const workspaceObservations = new Map<string, Promise<LinkedDirectorySummary | undefined>>();
+      const [target] = targetRow ? await this.enrichArchiveFleetRows([targetRow], undefined, params.context, directoryObservations, workspaceObservations) : [];
+      const roots = [...new Set((target?.linkedDirectories ?? []).map(linkedDirectoryWorktreePath)
+        .filter((value): value is string => Boolean(value)))];
+      const memoized = roots.length === 1
+        ? await index.memo(roots[0]!, async (keys) => await this.buildArchiveFleetLists(index, keys, roots, archiveCleanupWorkspaceFilter(roots[0]!), params.context,
+          undefined, directoryObservations, workspaceObservations))
+        : undefined;
+      if (memoized && (!targetRow || memoized.byKey.has(key))) lists = memoized;
+      else {
+        const keys = new Set(targetRow ? [key] : []);
+        for (const root of roots) for (const related of await index.related(root)) keys.add(related);
+        const filters = roots.map(archiveCleanupWorkspaceFilter);
+        lists = await this.buildArchiveFleetLists(index, keys, roots, async (cwd) => {
+          for (const filter of filters) if (await filter(cwd)) return true;
+          return false;
+        }, params.context, undefined, directoryObservations, workspaceObservations);
+      }
+    }
+    const target = lists.byKey.get(key);
+    const thread = params.targetThread ?? (target?.row.archived ? target.summary : undefined);
+    const activeTarget = target && !target.row.archived ? target.summary : undefined;
+    const overlaysByThreadKey = new Map<string, ThreadOverlayState | undefined>();
+    const activeChildren = index.childrenOf(params.threadId).map((row) => {
+      overlaysByThreadKey.set(row.key, row.overlay);
+      return row.thread;
+    });
+    // Shared lists may be memoized; copy before adding a supplied target.
+    const archivedThreads = params.targetThread && !lists.archivedThreads.includes(params.targetThread)
+      ? [...lists.archivedThreads.filter((row) => row.id !== params.targetThread!.id || row.source !== params.targetThread!.source), params.targetThread]
+      : lists.archivedThreads;
     return {
-      ...inventory,
-      archivedThreads: params.targetThread ? [...inventory.archivedThreads.filter((thread) => !matchesTarget(thread)), params.targetThread] : inventory.archivedThreads,
-      thread: params.targetThread ?? inventory.archivedThreads.find(matchesTarget),
-      activeTarget, targetIsActive: Boolean(activeTarget),
-      activeChildren: activeThreads.filter((thread) => overlaysByThreadKey?.get(buildThreadIdentityKey(thread.source, thread.id))?.parentThreadId === params.threadId),
-      legacyParentBackends: new Set([params.backend, ...[...activeThreads, ...inventory.archivedThreads]
-        .filter((thread) => thread.id === params.threadId).map((thread) => thread.source)]),
+      workspaceRevision: revision, activeThreads: lists.activeThreads, archivedThreads, thread, activeTarget, targetIsActive: Boolean(activeTarget),
+      overlaysByThreadKey, activeChildren, worktreeEvidence: lists.worktreeEvidence, ownershipPaths: lists.ownershipPaths,
+      legacyParentBackends: new Set([params.backend, ...index.withThreadId(params.threadId).map((row) => row.backend)]),
     };
   }
 
@@ -39889,6 +41268,7 @@ export class DesktopBackendRegistry {
     worktreeEvidence?: ArchiveCleanupMetadata["worktreeEvidence"];
     deferredWorktrees?: ArchiveCleanupIntent["deferredWorktrees"];
     workspaceRevision?: number;
+    ownershipPaths?: ArchiveCleanupMetadata["ownershipPaths"];
   }): Promise<ArchiveThreadCleanupResult[]> {
     // Ownership may live on another (even archived) thread using the same
     // checkout. A provider alias without the marker must not authorize removal.
@@ -39947,7 +41327,7 @@ export class DesktopBackendRegistry {
       const prior = params.deferredWorktrees?.find((row) => row.worktreePath === candidate.worktreePath)?.snapshot;
       if (prior && !(await pathExists(candidate.worktreePath))) {
         await this.retainSharedWorktreeSnapshotForArchivedThreads({ archivedThreadId: params.thread.id,
-          archivedThreads: params.archivedThreads, backend: params.backend, snapshot: prior,
+          archivedThreads: params.archivedThreads, ownershipPaths: params.ownershipPaths, backend: params.backend, snapshot: prior,
           worktreePath: candidate.worktreePath, context: params.context });
         await this.archiveWorktreeReferences.fulfilled(candidate.worktreePath);
         return { worktreePath: candidate.worktreePath, removedWorktree: true, deletedBranch: false };
@@ -39959,7 +41339,8 @@ export class DesktopBackendRegistry {
           return { worktreePath: candidate.worktreePath, removedWorktree: false, deletedBranch: false,
             skippedReason: acpBlocker };
         }
-        if (externalWorktreePaths.has(normalizeWorktreePathForComparison(candidate.worktreePath))) {
+        if (externalWorktreePaths.has(normalizeWorktreePathForComparison(candidate.worktreePath))
+          && !await this.isManagedArchiveCheckout(params, candidate.worktreePath)) {
           return {
             worktreePath: candidate.worktreePath,
             removedWorktree: false,
@@ -39998,6 +41379,7 @@ export class DesktopBackendRegistry {
           if (isAcpBackendId(owner.source)) await this.acpBackend.prepareWorktreeArchive(owner.source, owner.id);
         }
         let removalMetadata: ArchiveCleanupMetadata | undefined;
+        let removalSiblings: AppServerThreadSummary[] | undefined;
         const managedContainerPath = params.backend === "codex" ? await this.worktreeContainerService.containerPath(candidate.worktreePath) : undefined;
         const scope = new ArchiveWorkspaceAdmission(buildThreadIdentityKey(params.backend, params.thread.id), managedContainerPath ?? candidate.worktreePath);
         const admission = {
@@ -40014,6 +41396,7 @@ export class DesktopBackendRegistry {
           threadId: params.thread.id,
           worktreePath: candidate.worktreePath,
           repositoryPath: candidate.repositoryPath,
+          maxSnapshotBytes: this.reviewedSnapshotLimitFor(params.backend, params.thread.id),
           beforeRemove: params.context && this.codexClient.listArchiveCleanupThreadsPage ? async () => {
             this.archiveWorktreeRemovalAdmissions.add(admission);
             this.archiveWorkspaceOwnership.beginAdmission(scope);
@@ -40024,17 +41407,25 @@ export class DesktopBackendRegistry {
               removalAdmission: scope,
             });
             removalMetadata = current;
+            removalSiblings = await this.archivedWorktreeSiblings({ archivedThreadId: params.thread.id, archivedThreads: current.archivedThreads,
+              ownershipPaths: current.ownershipPaths, backend: params.backend, worktreePath: candidate.worktreePath });
             const ownership = await this.readCanonicalArchiveOwnership(current, candidate.worktreePath);
+            const key = normalizeWorktreePathForComparison(candidate.worktreePath);
+            const hasExternalMarker = () => current.worktreeEvidence?.externalPaths.has(key)
+              || (!current.worktreeEvidence && [current.thread, ...current.activeThreads, ...current.archivedThreads].some((thread) =>
+                thread.linkedDirectories.some((directory) => directory.worktreeOwnership === "external"
+                  && normalizeWorktreePathForComparison(linkedDirectoryWorktreePath(directory) ?? "") === key),
+              ));
+            const managedCheckout = hasExternalMarker() && await this.isManagedArchiveCheckout(current, candidate.worktreePath);
             if (ownership.users.some((owner) => owner.id !== params.thread.id || owner.source !== params.backend)) {
               await this.retainDeferredArchiveWorktree({ ...params, activeThreads: current.activeThreads }, candidate,
                 ownership.users.filter((owner) => owner.id !== params.thread.id || owner.source !== params.backend)
                   .map((owner) => buildThreadIdentityKey(owner.source, owner.id)));
             }
-            await scope.prepare(this.archiveWorkspaceMutations());
+            await scope.prepare(this.archiveWorkspaceMutationsFor(scope));
           const check = () => {
             params.context!.assertCurrent();
             scope.assertCurrent(this.archiveWorkspaceMutations());
-              const key = normalizeWorktreePathForComparison(candidate.worktreePath);
               for (const owner of this.archivedAcpWorktreeOwners(key, current)) {
                 if (isAcpBackendId(owner.source)) this.acpBackend.assertWorktreeArchiveReleased(owner.source, owner.id);
               }
@@ -40042,10 +41433,7 @@ export class DesktopBackendRegistry {
                 const worktreePath = linkedDirectoryWorktreePath(directory);
                 return worktreePath && normalizeWorktreePathForComparison(worktreePath) === key;
               })) throw new Error("The archived thread no longer owns this worktree; the checkout was kept.");
-              if (current.worktreeEvidence?.externalPaths.has(key) || (!current.worktreeEvidence && [current.thread, ...current.activeThreads, ...current.archivedThreads].some((thread) =>
-                thread.linkedDirectories.some((directory) => directory.worktreeOwnership === "external"
-                  && normalizeWorktreePathForComparison(linkedDirectoryWorktreePath(directory) ?? "") === key),
-              ))) throw new Error("Externally managed worktree; thread archive leaves this checkout in place.");
+              if (!managedCheckout && hasExternalMarker()) throw new Error("Externally managed worktree; thread archive leaves this checkout in place.");
               if (ownership.external) throw new Error("Externally managed worktree; the checkout was kept.");
               const users = ownership.users.filter((thread) => thread.id !== params.thread.id || thread.source !== params.backend);
               if (users.length) throw new Error("Worktree is still used by another active thread; the checkout was kept.");
@@ -40056,7 +41444,6 @@ export class DesktopBackendRegistry {
           } : undefined,
         });
         removedSnapshot = snapshot;
-        this.invalidateArchiveCleanupInventory();
         backendRegistryLog.info("archive thread worktree cleanup removed worktree", {
           backend: params.backend,
           threadId: params.thread.id,
@@ -40071,6 +41458,8 @@ export class DesktopBackendRegistry {
         await this.retainSharedWorktreeSnapshotForArchivedThreads({
           archivedThreadId: params.thread.id,
           archivedThreads: removalMetadata?.archivedThreads ?? params.archivedThreads,
+          ownershipPaths: removalMetadata ? removalMetadata.ownershipPaths : params.ownershipPaths,
+          siblings: removalSiblings,
           backend: params.backend,
           snapshot,
           worktreePath: candidate.worktreePath,
@@ -40150,12 +41539,29 @@ export class DesktopBackendRegistry {
             branch: params.thread.observedGitBranch ?? params.thread.gitBranch,
             removedWorktree: false,
             deletedBranch: false,
-            skippedReason: "Worktree directory no longer exists.",
+            skippedReason: MISSING_WORKTREE_SKIP_REASON,
+          };
+        }
+        if (error instanceof MissingArchiveRepositoryError) {
+          // Without its repository the checkout cannot be snapshotted, so it
+          // stays on disk. Only the operator may delete it.
+          backendRegistryLog.debug("archive thread worktree cleanup skipped: repository missing", {
+            backend: params.backend,
+            threadId: params.thread.id,
+            repositoryPath: error.repositoryPath,
+            worktreePath: candidate.worktreePath,
+          });
+          return {
+            worktreePath: candidate.worktreePath,
+            branch: params.thread.observedGitBranch ?? params.thread.gitBranch,
+            removedWorktree: false,
+            deletedBranch: false,
+            skippedReason: MISSING_REPOSITORY_SKIP_REASON,
           };
         }
         const changed = removalAdmission?.scope.changedThreadKeys() ?? [];
-        if (removedSnapshot || changed.length || !this.archiveWorktreeReferences.intents().some((intent) => intent.backend === params.backend && intent.threadId === params.thread.id
-          && intent.deferredWorktrees?.some((row) => row.worktreePath === candidate.worktreePath))) {
+        if (removedSnapshot || changed.length
+          || !this.archiveWorktreeReferences.hasPending(buildThreadIdentityKey(params.backend, params.thread.id), candidate.worktreePath)) {
           await this.retainDeferredArchiveWorktree(params, candidate, changed, removedSnapshot);
         }
         backendRegistryLog.warn("archive thread worktree cleanup failed", {
@@ -40177,7 +41583,14 @@ export class DesktopBackendRegistry {
       }
     };
     const results: ArchiveThreadCleanupResult[] = [];
-    for (const candidate of uniqueCandidates) results.push(await cleanupCandidate(candidate));
+    for (const candidate of uniqueCandidates) {
+      params.context?.setWorktreePath?.(candidate.worktreePath);
+      const container = params.backend === "codex" ? await this.worktreeContainerService.containerPath(candidate.worktreePath) : undefined;
+      const clean = async () => await cleanupCandidate(candidate);
+      results.push(params.context?.withWorktree
+        ? await params.context.withWorktree(container ?? candidate.worktreePath, clean)
+        : await clean());
+    }
     return results;
   }
 
@@ -40229,10 +41642,11 @@ export class DesktopBackendRegistry {
       // Ready rows are the durable backlog. Leave them ready until a physical
       // queue slot is available; slot release resumes dispatch without polling.
       if (this.archiveCleanupQueue.availableSlots === 0) break;
-      if (this.archiveCleanupQueue.pending(buildThreadIdentityKey(intent.backend, intent.threadId))) continue;
+      const key = buildThreadIdentityKey(intent.backend, intent.threadId);
+      if (this.archiveCleanupQueue.pending(key) || this.archiveCleanupOverflow.has(key)) continue;
       this.archiveWorktreeReferences.scheduled(intent);
       const completion = this.enqueueArchiveCleanup(intent, true);
-      void this.observeArchiveCleanupCompletion(completion, { ...intent, backgroundCleanup: true });
+      void this.observeArchiveCleanupCompletion(completion, { ...intent, backgroundCleanup: true, reporting: "background" });
     }
   }
 
@@ -40262,21 +41676,39 @@ export class DesktopBackendRegistry {
     }
   }
 
-  private async readCanonicalArchiveOwnership(
-    params: { activeThreads: AppServerThreadSummary[]; archivedThreads: AppServerThreadSummary[] },
+  /** Outside roots, each explicitly external owner must authorize the exact
+   * Git checkout. One thread's registration cannot claim another's checkout. */
+  private async isManagedArchiveCheckout(
+    params: Pick<ArchiveCleanupMetadata, "activeThreads" | "archivedThreads" | "ownershipPaths">,
     worktreePath: string,
-  ): Promise<{ users: AppServerThreadSummary[]; external: boolean }> {
+  ): Promise<boolean> {
+    if (await this.isManagedMaintenanceCheckout(worktreePath)) return true;
+    const { external } = await this.canonicalArchiveOwnershipIndex(params);
+    if (external.has("*")) return false;
+    const checkout = await canonicalWorktreePaths()(worktreePath);
+    const owners = external.get(checkout);
+    if (!owners?.size) return false;
+    for (const thread of owners) {
+      const overlay = await this.overlayStore.getThreadOverlayState({ backend: thread.source, threadId: thread.id });
+      if (!await hasWorktreeRegistration(worktreePath, overlay?.worktreeRegistrations)) return false;
+    }
+    return true;
+  }
+
+  private canonicalArchiveOwnershipIndex(
+    params: Pick<ArchiveCleanupMetadata, "activeThreads" | "archivedThreads" | "ownershipPaths">,
+  ) {
     let pending = this.canonicalArchiveOwnership.get(params.activeThreads);
     if (!pending) {
       pending = (async () => {
         const canonical = canonicalWorktreePaths();
         const active = new Map<string, AppServerThreadSummary[]>();
         const unknown: AppServerThreadSummary[] = [];
-        const external = new Set<string>();
+        const external = new Map<string, Set<AppServerThreadSummary>>();
         for (const thread of params.activeThreads) {
           const paths = archiveWorkspacePaths(thread);
           if (!paths.length) unknown.push(thread);
-          for (const value of paths) {
+          for (const value of params.ownershipPaths?.get(thread) ?? paths) {
             try {
               const key = await canonical(value);
               const users = active.get(key) ?? [];
@@ -40288,39 +41720,69 @@ export class DesktopBackendRegistry {
         for (const thread of [...params.activeThreads, ...params.archivedThreads]) for (const directory of thread.linkedDirectories) {
           if (directory.worktreeOwnership !== "external") continue;
           const value = linkedDirectoryWorktreePath(directory) ?? directory.path;
-          try { external.add(await canonical(value)); } catch { external.add("*"); }
+          if (params.ownershipPaths?.get(thread) && !params.ownershipPaths.get(thread)!.includes(value)) continue;
+          let key: string;
+          try { key = await canonical(value); } catch { key = "*"; }
+          const owners = external.get(key) ?? new Set<AppServerThreadSummary>();
+          owners.add(thread);
+          external.set(key, owners);
         }
         return { active, unknown, external };
       })();
       this.canonicalArchiveOwnership.set(params.activeThreads, pending);
     }
-    const { active, unknown, external } = await pending;
+    return pending;
+  }
+
+  private async readCanonicalArchiveOwnership(
+    params: Pick<ArchiveCleanupMetadata, "activeThreads" | "archivedThreads" | "ownershipPaths">,
+    worktreePath: string,
+  ): Promise<{ users: AppServerThreadSummary[]; external: boolean }> {
+    const { active, unknown, external } = await this.canonicalArchiveOwnershipIndex(params);
     const key = await canonicalWorktreePaths()(worktreePath);
     const users = new Set([...active.get(key) ?? [], ...unknown]);
     for (const [value, owners] of active) if (value.startsWith(key + path.sep)) for (const owner of owners) users.add(owner);
-    return { users: [...users], external: external.has(key) || external.has("*") };
+    return { users: [...users], external: (external.has(key) || external.has("*"))
+      && !await this.isManagedArchiveCheckout(params, worktreePath) };
   }
 
-  private async retainSharedWorktreeSnapshotForArchivedThreads(params: {
+  /** Archived threads other than the owner that use this checkout. Resolve
+   * them before removal: afterwards a sibling's symlink to it dangles and no
+   * longer resolves to the checkout. */
+  private async archivedWorktreeSiblings(params: {
     archivedThreadId: string;
     archivedThreads: AppServerThreadSummary[];
+    ownershipPaths?: ArchiveCleanupMetadata["ownershipPaths"];
     backend: AppServerBackendKind;
-    snapshot: WorktreeSnapshotSummary;
     worktreePath: string;
-    context?: ArchiveCleanupContext;
-  }): Promise<void> {
+  }): Promise<AppServerThreadSummary[]> {
     const canonical = canonicalWorktreePaths();
     const checkout = await canonical(params.worktreePath);
     const siblingThreads: AppServerThreadSummary[] = [];
     for (const thread of params.archivedThreads) {
       if (thread.source === params.backend && thread.id === params.archivedThreadId) continue;
-      for (const value of archiveWorkspacePaths(thread)) {
+      for (const value of params.ownershipPaths?.get(thread) ?? archiveWorkspacePaths(thread)) {
         if (await canonical(value).then((candidate) => candidate === checkout).catch(() => false)) {
           siblingThreads.push(thread);
           break;
         }
       }
     }
+    return siblingThreads;
+  }
+
+  private async retainSharedWorktreeSnapshotForArchivedThreads(params: {
+    archivedThreadId: string;
+    archivedThreads: AppServerThreadSummary[];
+    ownershipPaths?: ArchiveCleanupMetadata["ownershipPaths"];
+    /** Resolved while the checkout still existed. */
+    siblings?: AppServerThreadSummary[];
+    backend: AppServerBackendKind;
+    snapshot: WorktreeSnapshotSummary;
+    worktreePath: string;
+    context?: ArchiveCleanupContext;
+  }): Promise<void> {
+    const siblingThreads = params.siblings ?? await this.archivedWorktreeSiblings(params);
 
     if (siblingThreads.length === 0) {
       return;
@@ -40402,7 +41864,9 @@ export class DesktopBackendRegistry {
         async (candidate): Promise<RestoreThreadWorktreeResult> => {
           try {
             if (await pathExists(candidate.worktreePath)) {
-              if (candidate.snapshot?.state === "archived") {
+              // A hibernated checkout is the archived case without a thread
+              // archive: another thread may have restored the same path.
+              if (candidate.snapshot?.state === "archived" || candidate.snapshot?.state === "hibernated") {
                 const sharedRestore = await this.findSharedWorktreeRestore(candidate.snapshot);
                 if (sharedRestore) {
                   await this.overlayStore.upsertWorktreeSnapshot({ backend: params.backend, threadId: params.threadId,
@@ -40450,7 +41914,9 @@ export class DesktopBackendRegistry {
                   snapshotCommit: snapshot.snapshotCommit,
                   snapshot,
                   allowDetachedFallback: params.backend !== "claude" && !isAcpBackendId(params.backend),
-                  ...(params.backend === "claude" || isAcpBackendId(params.backend) ? { restoreSourceCheckout: true } : {}),
+                  // A hibernated checkout goes back on its own branch.
+                  ...(params.backend === "claude" || isAcpBackendId(params.backend) || snapshot.state === "hibernated"
+                    ? { restoreSourceCheckout: true } : {}),
                 }))
               : await this.withArchiveWorkspaceWrite([candidate.worktreePath], async () => await this.worktreeArchiveService.restoreDetached({
                   backend: params.backend,
@@ -40819,15 +42285,10 @@ export class DesktopBackendRegistry {
    * applied. It reads the thread listing, which probes each workspace's
    * `.codex/environments` on the host filesystem, so a test that counted
    * event-loop turns instead raced that I/O. Loop because a finished
-   * generation can be followed by another; the bound is a runaway guard.
+   * generation can be followed by another admitted from its title event.
    */
   async whenThreadTitleGenerationSettledForTests(): Promise<void> {
-    for (let pass = 0; pass < 10; pass += 1) {
-      if (this.titleGenerationWork.size === 0) {
-        return;
-      }
-      await Promise.all([...this.titleGenerationWork]);
-    }
+    await this.threadTitles.whenSettled();
   }
 
   /**
@@ -41044,251 +42505,43 @@ export class DesktopBackendRegistry {
     threadId: string;
     input: AppServerTurnInputItem[];
   }): void {
-    const key = buildTitleGenerationKey(params.backend, params.threadId);
-    if (!this.threadTitleGenerationService) {
-      return;
-    }
-    if (
-      this.threadTitleGenerationService.canGenerateTitle &&
-      !this.threadTitleGenerationService.canGenerateTitle(params.backend)
-    ) {
-      return;
-    }
-
-    const prompt = extractFirstMeaningfulTextInput(params.input);
-    if (!prompt) {
-      return;
-    }
-
-    if (this.attemptedTitleGenerations.has(key)) {
-      return;
-    }
-
-    const promptHash = buildPromptHash(prompt);
-    const current = this.pendingTitleGenerations.get(key);
-    if (current) {
-      return;
-    }
-
-    this.attemptedTitleGenerations.add(key);
-    const token = ++this.titleGenerationSequence;
-    this.pendingTitleGenerations.set(key, {
-      promptHash,
-      token,
-    });
-
-    const work = this.generateAndApplyThreadTitle({
-      backend: params.backend,
-      threadId: params.threadId,
-      prompt,
-      key,
-      token,
-    });
-    this.titleGenerationWork.add(work);
-    void work.finally(() => {
-      this.titleGenerationWork.delete(work);
-    });
+    this.threadTitles.schedule(params);
   }
 
   private schedulePendingThreadTitleGenerationFromLifecycle(params: {
     backend: AppServerBackendKind;
     threadId: string;
   }): void {
-    const key = buildTitleGenerationKey(params.backend, params.threadId);
-    const input = this.pendingTitleGenerationInputs.get(key);
-    if (!input) {
-      return;
-    }
-    this.pendingTitleGenerationInputs.delete(key);
-    this.scheduleThreadTitleGeneration({
-      backend: params.backend,
-      threadId: params.threadId,
-      input,
-    });
+    this.threadTitles.schedulePending(params);
   }
 
-  private async generateAndApplyThreadTitle(params: {
-    backend: AppServerBackendKind;
-    threadId: string;
-    prompt: string;
-    key: string;
-    token: number;
-  }): Promise<void> {
-    let generatedResult: Extract<ThreadTitleGenerationResult, { status: "generated" }> | undefined;
-    try {
-      const currentThread = await this.findThreadForTitleGeneration({
-        backend: params.backend,
-        callerReason: "title-generation",
-        threadId: params.threadId,
-      });
-      if (
-        !isEligibleForGeneratedTitle(currentThread, params.prompt, {
-          systemPlaceholder: this.systemPlaceholderTitleThreadKeys.has(params.key),
-        })
-      ) {
-        this.logThreadTitleGeneration(
-          "skipped",
-          params,
-          "current_title_not_eligible",
-          buildTitleEligibilityLogDetails(currentThread, params.prompt)
-        );
-        await this.safePersistExistingTitleHelperSubAgent({
-          backend: params.backend,
-          threadId: params.threadId,
-          status: "cancelled",
-          reason: "Current title is no longer eligible.",
-        });
-        return;
-      }
-
-      // Claude's adapter requests its own native title. Keep a local prompt
-      // fallback eligible for session_info_update, without another model call.
-      if (params.backend === "acp:claude") {
-        if (currentThread?.titleSource !== "explicit") await this.applyPromptDerivedAcpThreadTitle({
-          backend: params.backend, threadId: params.threadId, prompt: params.prompt,
-        });
-        return;
-      }
-
-      if (params.backend === "codex" || isAcpBackendId(params.backend)) {
-        const titleHelperRuntime = await this.resolveTitleHelperRuntime(params);
-        await this.safePersistTitleHelperSubAgent({
-          backend: params.backend,
-          threadId: params.threadId,
-          status: "running",
-          ...(titleHelperRuntime.model ? { model: titleHelperRuntime.model } : {}),
-          ...(titleHelperRuntime.reasoningEffort
-            ? { reasoningEffort: titleHelperRuntime.reasoningEffort }
-            : {}),
-          reason: "Generating a title.",
-        });
-      }
-      this.logThreadTitleGeneration("requesting", params, undefined, {
-        promptTitle: truncateLogValue(shortenDerivedThreadTitle(params.prompt) ?? params.prompt),
-      });
-      const result = await this.threadTitleGenerationService?.generateTitle({
-        backend: params.backend,
-        threadId: params.threadId,
-        userPrompt: params.prompt,
-      });
-      if (!result || result.status !== "generated") {
-        this.logThreadTitleGeneration(
-          result?.status ?? "unavailable",
-          params,
-          result?.reason ?? "title_generation_unavailable"
-        );
-        await this.safePersistExistingTitleHelperSubAgent({
-          backend: params.backend,
-          threadId: params.threadId,
-          ...(result?.status === "invalid" ? { result } : {}),
-          status: "failed",
-          reason: result?.reason ?? "title_generation_unavailable",
-        });
-        if (isAcpBackendId(params.backend)) {
-          await this.applyPromptDerivedAcpThreadTitle({
-            backend: params.backend,
-            threadId: params.threadId,
-            prompt: params.prompt,
-          });
-        }
-        return;
-      }
-      generatedResult = result;
-      this.logThreadTitleGeneration("generated", params, undefined, {
-        generatedTitle: truncateLogValue(result.title),
-        cachedTokens: result.cachedTokens ?? null,
-      });
-
-      const pending = this.pendingTitleGenerations.get(params.key);
-      if (!pending || pending.token !== params.token) {
-        this.logThreadTitleGeneration("skipped", params, "stale_generation", {
-          generatedTitle: truncateLogValue(result.title),
-        });
-        await this.safePersistExistingTitleHelperSubAgent({
-          backend: params.backend,
-          threadId: params.threadId,
-          result,
-          status: "success",
-          reason: "Title generation became stale.",
-        });
-        return;
-      }
-
-      const latestThread = await this.findThreadForTitleGeneration({
-        backend: params.backend,
-        callerReason: "title-generation",
-        threadId: params.threadId,
-      });
-      if (
-        latestThread
-        && !isEligibleForGeneratedTitle(latestThread, params.prompt, {
-          systemPlaceholder: this.systemPlaceholderTitleThreadKeys.has(params.key),
-        })
-      ) {
-        this.logThreadTitleGeneration(
-          "skipped",
-          params,
-          "latest_title_not_eligible",
-          buildTitleEligibilityLogDetails(latestThread, params.prompt)
-        );
-        await this.safePersistExistingTitleHelperSubAgent({
-          backend: params.backend,
-          threadId: params.threadId,
-          result,
-          status: "success",
-          reason: buildLateTitleCancellationReason(
-            params.backend,
-            latestThread,
-          ),
-        });
-        return;
-      }
-
-      await this.applyGeneratedThreadTitle({
-        backend: params.backend,
-        threadId: params.threadId,
-        title: result.title,
-      });
+  private readonly threadTitles = new ThreadTitleLifecycle(this.threadNaming, {
+    canGenerateTitle: (backend) => Boolean(this.threadTitleGenerationService
+      && (!this.threadTitleGenerationService.canGenerateTitle || this.threadTitleGenerationService.canGenerateTitle(backend))),
+    generateTitle: async (params) => {
+      this.assertThreadOwnership();
+      return await this.threadTitleGenerationService?.generateTitle(params);
+    },
+    readTitle: async (identity) => await this.findThreadForTitleGeneration(identity),
+    prepareHelper: async ({ backend, threadId }) => {
+      const runtime = await this.resolveTitleHelperRuntime({ backend, threadId });
       await this.safePersistTitleHelperSubAgent({
-        backend: params.backend,
-        threadId: params.threadId,
-        result,
-        status: "success",
+        backend, threadId, status: "running", reason: "Generating a title.",
+        ...(runtime.model ? { model: runtime.model } : {}),
+        ...(runtime.reasoningEffort ? { reasoningEffort: runtime.reasoningEffort } : {}),
       });
-      this.logThreadTitleGeneration("applied", params, undefined, {
-        generatedTitle: truncateLogValue(result.title),
-      });
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      if (generatedResult) {
-        await this.safePersistTitleHelperSubAgent({
-          backend: params.backend,
-          threadId: params.threadId,
-          result: generatedResult,
-          status: "failed",
-          reason,
-        });
-      } else {
-        await this.safePersistExistingTitleHelperSubAgent({
-          backend: params.backend,
-          threadId: params.threadId,
-          status: "failed",
-          reason,
-        });
-      }
-      this.logThreadTitleGeneration(
-        "failed",
-        params,
-        reason
-      );
-    } finally {
-      const pending = this.pendingTitleGenerations.get(params.key);
-      if (pending?.token === params.token) {
-        this.pendingTitleGenerations.delete(params.key);
-      }
-      this.systemPlaceholderTitleThreadKeys.delete(params.key);
-    }
-  }
+    },
+    persistHelper: async ({ existingOnly, ...params }) => {
+      if (existingOnly) await this.safePersistExistingTitleHelperSubAgent(params);
+      else await this.safePersistTitleHelperSubAgent(params);
+    },
+    log: (status, params, reason, details) => this.logThreadTitleGeneration(status, params, reason, {
+      ...(details?.eligibility ? buildTitleEligibilityLogDetails(details.thread, params.prompt) : {}),
+      ...(details?.promptTitle ? { promptTitle: truncateLogValue(shortenDerivedThreadTitle(params.prompt) ?? params.prompt) } : {}),
+      ...(details?.generatedTitle !== undefined ? { generatedTitle: truncateLogValue(details.generatedTitle) } : {}),
+      ...(details?.cachedTokens !== undefined ? { cachedTokens: details.cachedTokens } : {}),
+    }),
+  });
 
   private async safePersistTitleHelperSubAgent(params: {
     backend: AppServerBackendKind;
@@ -41341,38 +42594,6 @@ export class DesktopBackendRegistry {
       return;
     }
     await this.safePersistTitleHelperSubAgent(params);
-  }
-
-  private async applyPromptDerivedAcpThreadTitle(params: {
-    backend: AcpBackendId;
-    threadId: string;
-    prompt: string;
-  }): Promise<void> {
-    const title = shortenDerivedThreadTitle(params.prompt);
-    if (!title) {
-      return;
-    }
-    const latestThread = await this.findThreadForTitleGeneration({
-      backend: params.backend,
-      callerReason: "title-generation",
-      threadId: params.threadId,
-    });
-    if (
-      latestThread
-      && !isEligibleForGeneratedTitle(latestThread, params.prompt, {
-        systemPlaceholder: this.systemPlaceholderTitleThreadKeys.has(
-          buildTitleGenerationKey(params.backend, params.threadId),
-        ),
-      })
-    ) {
-      return;
-    }
-    await this.renameAcpSession(params.backend, params.threadId, title, {
-      titleSource: "fallback",
-    });
-    this.logThreadTitleGeneration("applied", params, "prompt_derived_fallback", {
-      generatedTitle: truncateLogValue(title),
-    });
   }
 
   private async persistTitleHelperSubAgent(params: {
@@ -42759,32 +43980,6 @@ export class DesktopBackendRegistry {
     };
   }
 
-  private async applyGeneratedThreadTitle(params: {
-    backend: AppServerBackendKind;
-    threadId: string;
-    title: string;
-  }): Promise<void> {
-    // Both backends announce the same provenance. PwrAgent generated this
-    // title and knows that; the branch is only about which rename path stores
-    // it. Letting the Codex side stay silent would make it read as an operator
-    // rename, which is what this provenance exists to stop — and would make
-    // the behavior depend on the backend.
-    if (isAcpBackendId(params.backend)) {
-      await this.renameAcpSession(params.backend, params.threadId, params.title, {
-        titleSource: "derived",
-      });
-    } else {
-      await this.renameThread(
-        {
-          backend: params.backend,
-          threadId: params.threadId,
-          name: params.title,
-        },
-        { titleSource: "derived" },
-      );
-    }
-  }
-
   private async findThreadForTitleGeneration(params: {
     backend: AppServerBackendKind;
     callerReason?: ThreadListCallerReason;
@@ -42795,7 +43990,8 @@ export class DesktopBackendRegistry {
       // each time so a late operator rename still cancels generated naming.
       return await this.withCodexThreadClient(params.threadId, async (client) => {
         const thread = await client.readThreadSummary!(params.threadId);
-        return thread.archivedAt === undefined ? this.withObservedThreadName(thread) : undefined;
+        const metadata = await this.overlayStore.getThreadMetadata?.({ backend: "codex", threadId: params.threadId });
+        return thread.archivedAt === undefined ? this.withObservedThreadName({ ...thread, ...projectOwnerThreadTitle(thread, metadata) }) : undefined;
       }).catch(() => undefined);
     }
     const activeThreads = await this.listThreads({
@@ -43200,9 +44396,24 @@ export class DesktopBackendRegistry {
       return buildHeadlessAutomationRequestCancelResponse(request);
     }
 
+    // Only main offers a project grant. A copy on the way in is not ours.
+    if (request.method === "mcpServer/elicitation/request") {
+      request = withoutMcpProjectToolApprovalOffer(request);
+    }
+    let projectOffer: McpProjectToolApprovalCardOffer | undefined;
     if (backend === "codex" && isMcpToolApproval(request)) {
-      const consent = await this.selectedConnectionMcpConsent(request, signal);
-      if (consent) return consent;
+      const decision = await this.selectedConnectionMcpConsent(request, signal);
+      if (decision?.consent) return decision.consent;
+      projectOffer = decision?.projectOffer;
+      if (projectOffer) {
+        request = {
+          ...request,
+          params: {
+            ...request.params,
+            _meta: { ...readRecord(request.params._meta), [MCP_PROJECT_TOOL_APPROVAL_OFFER_META_KEY]: projectOffer.offer },
+          },
+        } as AppServerPendingRequestNotification;
+      }
     }
 
     const managedReview = this.findManagedReviewForChildRequest({
@@ -43240,7 +44451,7 @@ export class DesktopBackendRegistry {
     });
 
     if (signal?.aborted) return { decision: "cancel" };
-    return await new Promise<SubmitServerRequestRequest["response"]>((resolve, reject) => {
+    const response = await new Promise<SubmitServerRequestRequest["response"]>((resolve, reject) => {
       this.pendingServerRequests.set(key, {
         backend: routedBackend,
         notification: routedRequest,
@@ -43264,6 +44475,116 @@ export class DesktopBackendRegistry {
         );
       });
     });
+    if (request.method !== "mcpServer/elicitation/request") return response;
+    return await this.settleMcpProjectToolApprovalChoice(response, projectOffer);
+  }
+
+  /**
+   * Save the project grant an accepted card chose, then answer Codex without
+   * PwrAgent's key: the choice is PwrAgent's, and Codex's grant scopes are
+   * still whatever `persist` says.
+   */
+  private async settleMcpProjectToolApprovalChoice(
+    response: SubmitServerRequestRequest["response"],
+    offer: McpProjectToolApprovalCardOffer | undefined,
+  ): Promise<SubmitServerRequestRequest["response"]> {
+    if (!response || !("action" in response)) return response;
+    const meta = readRecord(response._meta);
+    if (!meta || !(MCP_PROJECT_TOOL_APPROVAL_CHOICE_META_KEY in meta)) return response;
+    const { [MCP_PROJECT_TOOL_APPROVAL_CHOICE_META_KEY]: _choice, ...rest } = meta;
+    if (response.action === "accept" && readMcpProjectToolApprovalChoice(meta)) {
+      if (offer) await this.saveMcpProjectToolApproval(offer);
+      else backendRegistryLog.warn("ignoring a project grant this card did not offer");
+    }
+    return { ...response, _meta: Object.keys(rest).length > 0 ? rest : null };
+  }
+
+  /**
+   * The operator approved the call either way, so a failed save is logged
+   * and the call still runs once.
+   */
+  private async saveMcpProjectToolApproval(offer: McpProjectToolApprovalCardOffer): Promise<void> {
+    try {
+      await this.mcpConnectionService?.setConnectionProjectToolApproval?.(
+        offer.connectionId,
+        offer.repository,
+        "approve",
+      );
+      backendRegistryLog.info("saved an MCP project tool approval from a card", {
+        connectionId: offer.connectionId,
+        repository: offer.repository,
+      });
+    } catch (error) {
+      backendRegistryLog.warn("could not save an MCP project tool approval", {
+        connectionId: offer.connectionId,
+        repository: offer.repository,
+        error: String(error),
+      });
+    }
+  }
+
+  /**
+   * The thread's project, as a forge rule names it: its primary repository.
+   * The resolver reads a thread no navigation refresh has listed yet.
+   */
+  private async threadProjectRepository(backend: AppServerBackendKind, threadId: string): Promise<string | undefined> {
+    try {
+      const primary = this.threadPrimaryGitRepositoryReader?.(backend, threadId)
+        ?? await this.threadProjectRepositoryResolver?.(backend, threadId);
+      return primary ? normalizeForgeRuleRepository(primary) : undefined;
+    } catch (error) {
+      backendRegistryLog.warn("could not read a thread's project for MCP tool approval", { threadId, error: String(error) });
+      return undefined;
+    }
+  }
+
+  /**
+   * The grant a tool approval card may offer for this thread's project, or
+   * none. Never for a thread without a repository, and never when the
+   * project itself is set to ask before every tool: the operator already
+   * chose to be asked there.
+   */
+  private async mcpProjectToolApprovalOffer(input: {
+    connection: Pick<McpConnectionStatus, "id" | "displayName">;
+    resolution: McpConnectionToolApprovalResolution;
+    repository: string | undefined;
+  }): Promise<McpProjectToolApprovalCardOffer | undefined> {
+    const { connection, resolution, repository } = input;
+    if (!repository || !this.mcpConnectionService?.setConnectionProjectToolApproval) return undefined;
+    if (resolution.repository && resolution.toolApproval === "prompt") return undefined;
+    const projectLabel = await this.ruleRepositoryProjectLabel(repository);
+    return {
+      connectionId: connection.id,
+      repository,
+      offer: buildMcpProjectToolApprovalOffer({ serverLabel: connection.displayName, projectLabel }),
+    };
+  }
+
+  /**
+   * The project's name in the Directories lens, so a card names it as the
+   * sidebar and Settings do. `fallback` when no row matches or the lookup is
+   * slow: a card must not wait on the directory inventory.
+   */
+  private async ruleRepositoryProjectLabel(
+    repository: string,
+    fallback = forgeRuleRepositoryLabel(repository),
+  ): Promise<string> {
+    if (!this.forgeProjectLabelResolver) return fallback;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const label = await Promise.race([
+        this.forgeProjectLabelResolver(repository),
+        new Promise<undefined>((resolve) => {
+          timer = setTimeout(() => resolve(undefined), FORGE_PROJECT_LABEL_TIMEOUT_MS);
+        }),
+      ]);
+      return label?.trim() || fallback;
+    } catch (error) {
+      backendRegistryLog.warn("could not read the project name for an approval card", { error: String(error) });
+      return fallback;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   private isTaskMonitorThread(context: { backend: AppServerBackendKind; threadId: string }): boolean {
@@ -43344,7 +44665,14 @@ export class DesktopBackendRegistry {
     const sourceRevision = consentRevision ?? invocation.schemaRevision;
     const sourceKey = JSON.stringify([invocation.connectionId, invocation.serverName, invocation.toolName]);
     const monitor = this.taskMonitorForThread(context);
-    if (monitor && (annotations?.readOnlyHint !== true || annotations.destructiveHint === true)) return false;
+    const readOnlyCall = annotations?.readOnlyHint === true && annotations.destructiveHint !== true;
+    if (monitor && !readOnlyCall) return false;
+    // Claude passes plan-turn gateway calls here without its generic card.
+    // The upstream hints decide whether the call can run in a read-only turn.
+    if (!readOnlyCall && context.backend === "claude"
+      && this.claudeBackend.livePermissionMode(context.threadId) === "plan") {
+      throw new Error(claudePlanTurnRefusal(`"${invocation.toolName}" on ${invocation.serverName}`));
+    }
     const selectionOwner = monitor?.mcpAccess?.selectionOwner ?? context;
     const approvalContext = monitor
       ? { backend: monitor.parentBackend, threadId: monitor.parentThreadId, turnId: monitor.parentTurnId }
@@ -43439,7 +44767,11 @@ export class DesktopBackendRegistry {
     // The connection's Tool approval setting, read now so the next call
     // follows a change. By default Codex's rule applies: listing and
     // inspecting run, and a restart still asks.
-    const toolApproval = await this.readMcpConnectionToolApproval(invocation.connectionId);
+    // A project's own mode wins for a thread in that project.
+    const repository = await this.threadProjectRepository(approvalContext.backend, approvalContext.threadId);
+    const { resolution, connection: approvalConnection } =
+      await this.readMcpConnectionToolApproval(invocation.connectionId, repository);
+    const toolApproval = resolution.toolApproval;
     signal.throwIfAborted();
     if (!gatewayToolRequiresApproval(annotations, toolApproval)) {
       backendRegistryLog.info("running MCP gateway tool without approval", {
@@ -43450,12 +44782,23 @@ export class DesktopBackendRegistry {
         serverName: invocation.serverName,
         toolName: invocation.toolName,
         toolApproval,
+        ...(resolution.repository ? { repository: resolution.repository } : {}),
       });
       return true;
     }
-    const readOnlyCall = annotations?.readOnlyHint === true && annotations.destructiveHint !== true;
     if ((consent.approved && (!consent.readOnlyOnly || readOnlyCall))
       || (connectionConsent?.approved && (!connectionConsent.readOnlyOnly || readOnlyCall))) return true;
+    // A Job Monitor's card approves reads only, so it offers no grant.
+    const projectOffer = !monitor && approvalConnection
+      ? await this.mcpProjectToolApprovalOffer({ connection: approvalConnection, resolution, repository })
+      : undefined;
+    signal.throwIfAborted();
+    if (projectOffer) {
+      notification.params._meta = {
+        ...readRecord(notification.params._meta),
+        [MCP_PROJECT_TOOL_APPROVAL_OFFER_META_KEY]: projectOffer.offer,
+      };
+    }
     const key = buildPendingRequestKey({ ...approvalContext, requestId });
     return await new Promise<McpGatewayApproval>((resolve, reject) => {
       if (monitor) monitor.pendingMcpApprovalCount = (monitor.pendingMcpApprovalCount ?? 0) + 1;
@@ -43485,7 +44828,17 @@ export class DesktopBackendRegistry {
           if (signal.aborted) { aborted(); return; }
           const approved = Boolean(response && "action" in response && response.action === "accept");
           if (response && "action" in response && response.action === "decline" && monitor) (monitor.deniedMcpTools ??= new Set()).add(denialKey);
-          const persist = response && "_meta" in response ? readRecord(response._meta)?.persist : undefined;
+          const responseMeta = response && "_meta" in response ? readRecord(response._meta) : undefined;
+          if (approved && readMcpProjectToolApprovalChoice(responseMeta)) {
+            if (!projectOffer) {
+              backendRegistryLog.warn("ignoring a project grant this card did not offer", { threadId: context.threadId, requestId });
+              finish(true);
+              return;
+            }
+            void this.saveMcpProjectToolApproval(projectOffer).finally(() => finish(true));
+            return;
+          }
+          const persist = responseMeta?.persist;
           const rememberedConsent = persist === "session" ? consent
             : persist === "server-session" ? connectionConsent : undefined;
           const rememberedKey = persist === "server-session" ? serverKey : sourceKey;
@@ -43622,10 +44975,18 @@ export class DesktopBackendRegistry {
     });
   }
 
+  /**
+   * Codex's own approval card for a tool on a selected connection. Answers
+   * it when the connection, or the thread's project, is set to Allow all
+   * tools; otherwise names the project grant the card may offer.
+   */
   private async selectedConnectionMcpConsent(
     request: AppServerPendingRequestNotification,
     signal?: AbortSignal,
-  ): Promise<AppServerMcpElicitationResponse | undefined> {
+  ): Promise<{
+    consent?: AppServerMcpElicitationResponse;
+    projectOffer?: McpProjectToolApprovalCardOffer;
+  } | undefined> {
     const consent = buildMcpToolApprovalConsent(request);
     const threadId = request.params.threadId;
     const turnId = request.params.turnId ?? undefined;
@@ -43642,8 +45003,16 @@ export class DesktopBackendRegistry {
       if (!connectionId) return undefined;
       const connection = (await service.listConnections({ cachedLocalStatus: true }))
         .find((entry) => entry.id === connectionId);
-      if (!connection?.enabled || !connection.configured || connection.toolApproval !== "approve"
+      if (!connection?.enabled || !connection.configured
         || connection.state === "disconnected" || connection.state === "reauthorization_required") return undefined;
+      const repository = await this.threadProjectRepository("codex", threadId);
+      const resolution = resolveMcpConnectionToolApproval(connection, repository);
+      if (resolution.toolApproval !== "approve") {
+        if (this.isTaskMonitorThread({ backend: "codex", threadId })) return undefined;
+        const projectOffer = await this.mcpProjectToolApprovalOffer({ connection, resolution, repository });
+        signal?.throwIfAborted();
+        return projectOffer ? { projectOffer } : undefined;
+      }
       // A server prefix is not proof of ownership. Recheck selection, the
       // exact live bridge and turn after asynchronous policy reads.
       const current = await this.readThreadMcpConnections({ backend: "codex", threadId });
@@ -43652,9 +45021,14 @@ export class DesktopBackendRegistry {
       if (!current.connectionIds.includes(connectionId)
         || !this.isLiveDynamicToolCall("codex", { threadId, turnId })
         || !currentBridge || buildCodexConnectionMcpServerName(currentBridge) !== request.params.serverName) return undefined;
+      if (resolution.repository) {
+        backendRegistryLog.info("approving MCP tool call allowed for its project", {
+          threadId, turnId, connectionId, repository: resolution.repository,
+        });
+      }
       // One invocation only: future requests must reread the connection's
       // policy rather than inherit a Codex conversation or permanent grant.
-      return consent;
+      return { consent };
     } catch {
       signal?.throwIfAborted();
       // An unavailable policy or registration keeps the normal prompt.
@@ -43664,16 +45038,36 @@ export class DesktopBackendRegistry {
 
   // A lookup that fails reads as the default, which still asks for anything
   // the server does not mark safe; it never reads as Allow all tools.
-  private async readMcpConnectionToolApproval(connectionId: string): Promise<McpConnectionToolApproval> {
+  private async readMcpConnectionToolApproval(
+    connectionId: string,
+    repository?: string,
+  ): Promise<{ resolution: McpConnectionToolApprovalResolution; connection?: McpConnectionStatus }> {
     try {
       // The approval mode is stored config. Reading it must not wait on a
       // local CLI's status probe before every tool call.
       const connections = await this.mcpConnectionService?.listConnections?.({ cachedLocalStatus: true });
-      return connections?.find((connection) => connection.id === connectionId)?.toolApproval ?? "auto";
+      const connection = connections?.find((entry) => entry.id === connectionId);
+      return {
+        resolution: connection ? resolveMcpConnectionToolApproval(connection, repository) : { toolApproval: "auto" },
+        ...(connection ? { connection } : {}),
+      };
     } catch (error) {
       backendRegistryLog.warn("could not read MCP connection tool approval", { connectionId, error: String(error) });
-      return "auto";
+      return { resolution: { toolApproval: "auto" } };
     }
+  }
+
+  /** The live turn's plan mode is independent of its saved approval mode. */
+  private isForgePlanTurn(context: AgentToolCallContext): boolean {
+    if (context.backend === "claude") return this.claudeBackend.livePermissionMode(context.threadId) === "plan";
+    if (context.backend !== "codex") return false;
+    const pendingKey = buildActiveTurnKey("codex", context.threadId, `pending:${context.threadId}`);
+    const turnId = context.turnId ?? this.getActiveTurnForThread(context)?.turnId;
+    const mode = turnId
+      ? this.activeCodexTurnCollaborationModes.get(buildActiveTurnKey("codex", context.threadId, turnId))
+      : undefined;
+    // A dynamic call can arrive before turn/start returns its real turn id.
+    return (mode ?? this.activeCodexTurnCollaborationModes.get(pendingKey)) === "plan";
   }
 
   /**
@@ -44067,6 +45461,9 @@ export class DesktopBackendRegistry {
     if (request.operation === "move_thread_workspace") {
       return await this.moveThreadWorkspace(request);
     }
+    if (request.operation === "register_thread_worktree") {
+      return await this.registerThreadWorktree(request);
+    }
     if (request.operation === "send_message_to_thread") {
       return await this.sendMessageToThread(request);
     }
@@ -44360,6 +45757,130 @@ export class DesktopBackendRegistry {
       message: move.message ?? "Workspace move is pending.",
       ...(move.error ? { error: move.error } : {}),
     };
+  }
+
+  private async registerThreadWorktree(
+    request: PwrAgentThreadOrchestrationRequest<"register_thread_worktree">,
+  ): Promise<PwrAgentThreadOrchestrationResponse> {
+    const caller = request.context;
+    const live = () => Boolean(caller.turnId && this.isLiveDynamicToolCall(caller.backend, {
+      threadId: caller.threadId, turnId: caller.turnId,
+    }));
+    if (!live()) return threadOrchestrationFailure("forbidden", "Worktree registration requires a live invoking turn.");
+    const { backend, threadId, worktreePath } = request.args;
+    if (!isAppServerBackendKind(backend) || !threadId.trim() || !path.isAbsolute(worktreePath)) {
+      return threadOrchestrationFailure("invalid_arguments", "Pass a known backend, threadId and absolute worktreePath.");
+    }
+    if (!this.overlayStore.setThreadWorktreeRegistration) {
+      return threadOrchestrationFailure("unsupported_capability", "Worktree registration storage is unavailable.");
+    }
+    const unregister = request.args.action === "unregister";
+    const readOwner = async () => {
+      // Only the local provider inventory establishes current-profile membership.
+      // Do not accept a PR reference, a cached navigation row or an arbitrary cwd.
+      let thread: AppServerThreadSummary | undefined;
+      for (const archived of [false, true]) {
+        if (backend === "codex") {
+          if (!this.codexClient.listArchiveCleanupThreadsPage) throw new Error("Current-profile inventory is unavailable.");
+          const cursors = new Set<string>();
+          let cursor: string | undefined;
+          do {
+            const page = await this.codexClient.listArchiveCleanupThreadsPage({ archived, cursor, limit: 100,
+              checkpoint: async () => {}, directoryFilter: async () => false });
+            thread = page.threads.find((item) => item.id === threadId);
+            cursor = page.nextCursor?.trim();
+            if (cursor && cursors.has(cursor)) throw new Error("Provider inventory did not advance.");
+            if (cursor) cursors.add(cursor);
+          } while (cursor && !thread);
+        } else if (backend === "claude") {
+          thread = (await this.claudeBackend.listThreads({ archived })).find((item) => item.id === threadId);
+        } else if (isAcpBackendId(backend) && (await this.acpBackend.archiveCleanupBackendIds()).includes(backend)) {
+          let after: string | undefined;
+          do {
+            const page = this.acpBackend.listArchiveCleanupSessionsPage(backend, { archived, after, limit: 100 });
+            const session = page.sessions.find((item) => item.sessionId === threadId);
+            if (session) thread = this.acpBackend.sessionToThreadSummary(session);
+            if (page.nextCursor && after && page.nextCursor <= after) throw new Error("Provider inventory did not advance.");
+            after = page.nextCursor;
+          } while (after && !thread);
+        }
+        if (thread) break;
+      }
+      if (!thread) throw new Error("The target is not a known current-profile thread.");
+      const overlay = await this.overlayStore.getThreadOverlayState({ backend, threadId });
+      return { thread: request.args.action && request.args.action !== "register" ? thread
+        : await this.maintenanceThreadWorkspace(thread, overlay), overlay };
+    };
+    try {
+      const owner = await readOwner();
+      const registered = owner.overlay?.worktreeRegistrations?.find((entry) => entry.worktreePath === worktreePath);
+      if (request.args.action === "inspect") {
+        const attached = [...owner.thread.linkedDirectories, ...owner.overlay?.extraLinkedDirectories ?? []]
+          .some((directory) => directory.worktreePath === worktreePath)
+          || resolveThreadWorkspaceCwd(owner.thread, owner.overlay?.extraLinkedDirectories ?? []) === worktreePath;
+        return { ok: true, data: { backend, threadId, worktreePath, registered: Boolean(registered),
+          valid: attached && await hasWorktreeRegistration(worktreePath, registered ? [registered] : []),
+          ...(registered ? { registration: registered } : {}),
+          message: "Registration applies only while this thread remains attached to the same Git checkout. Removal protections still apply.",
+        } };
+      }
+      if (unregister && !registered) return { ok: true, data: {
+        backend, threadId, worktreePath, registered: false, message: "This thread has no registration for that checkout.",
+      } };
+      const inspected = unregister ? registered! : await inspectRegisterableWorktree(worktreePath);
+      const attached = (thread: AppServerThreadSummary, overlay?: ThreadOverlayState) =>
+        [...thread.linkedDirectories, ...overlay?.extraLinkedDirectories ?? []]
+          .some((directory) => directory.kind === "worktree" && directory.worktreePath
+            && path.resolve(directory.worktreePath) === inspected.worktreePath);
+      if (!unregister && !attached(owner.thread, owner.overlay)) {
+        return threadOrchestrationFailure("unsupported_workspace", "That linked checkout is not attached to the target thread.");
+      }
+      const approved = await this.requestThreadMaintenanceConfirmation({
+        backend: caller.backend, threadId: caller.threadId, turnId: caller.turnId, itemId: caller.callId,
+        requestId: `worktree-registration:${caller.callId || randomUUID()}`,
+        header: "Worktree ownership", approveLabel: unregister ? "Unregister worktree" : "Register worktree",
+        approveDescription: unregister ? "Revoke this thread's authorization for this checkout." : "Authorize future snapshot and cleanup of this exact checkout.",
+        question: `${unregister ? "Unregister" : "Register"} checkout ${inspected.worktreePath} for ${backend} thread ${threadId}`
+          + `${owner.thread.title ? ` (${owner.thread.title})` : ""}?\nGit repository: ${inspected.commonDirectory}`
+          + `\n${unregister ? "Revoke this thread's registration. Other owners and managed-root rules still apply."
+            : "Allow PwrAgent to snapshot and remove this linked checkout during thread archive or eligible idle maintenance. Tracked edits and non-ignored untracked files are saved first; ignored files are deleted without recovery. Idle, activity, shared-owner and snapshot limits still apply."}`
+          + "\nThis registration action changes no checkout files.",
+      });
+      if (!approved) return threadOrchestrationFailure("forbidden", "The operator declined worktree registration. Do not retry without a new request.");
+      if (!live()) return threadOrchestrationFailure("forbidden", "The invoking turn ended before registration was approved.");
+      // Cancel every hibernation of this checkout before yielding. Another
+      // archived owner can revoke a receipt the hibernating thread depends on.
+      const hibernations: string[] = [];
+      for (const [key, reservation] of this.automaticArchiveReservations) {
+        if (!reservation.worktreePath || normalizeWorktreePathForComparison(reservation.worktreePath) !== normalizeWorktreePathForComparison(worktreePath)) continue;
+        reservation.cancelled = true;
+        hibernations.push(key);
+      }
+      return await this.withThreadLifecycleMutation({ backend, threadId, worktreePath }, async () => {
+        await Promise.all(hibernations.map(async (key) => await this.threadLifecycleLocks.run(key, async () => {})));
+        return await this.withThreadWorkspaceMutation({ backend, threadId }, async () => {
+          const current = await readOwner();
+          if (!unregister && (!attached(current.thread, current.overlay)
+            || !sameRegisteredWorktree(inspected, await inspectRegisterableWorktree(worktreePath)))) {
+            return threadOrchestrationFailure("stale_target", "The thread or checkout changed during review. Nothing was registered.");
+          }
+          if (!live()) return threadOrchestrationFailure("forbidden", "The invoking turn ended before registration could be saved.");
+          const registration = !unregister ? { ...inspected, authorizedAt: Date.now(),
+            requestedBy: { backend: caller.backend, threadId: caller.threadId } } : undefined;
+          await this.withArchiveWorkspaceWrite([worktreePath], async () => {
+            await this.overlayStore.setThreadWorktreeRegistration!({ backend, threadId, worktreePath,
+              ...(registration ? { registration } : {}) });
+          });
+          return { ok: true, data: { backend, threadId, worktreePath, registered: !unregister,
+            ...(registration ? { valid: true, registration } : {}),
+            message: unregister ? "Revoked this thread's worktree registration."
+              : "Registered this exact checkout for snapshot and cleanup. Existing removal protections still apply.",
+          } };
+        });
+      });
+    } catch (error) {
+      return threadOrchestrationFailure("unsupported_workspace", error instanceof Error ? error.message : String(error));
+    }
   }
 
   private async attachThreadDirectory(
@@ -45294,11 +46815,16 @@ export class DesktopBackendRegistry {
     source: { backend: AppServerBackendKind; threadId: string },
     target: ThreadTodoMessageTarget,
   ): Promise<ThreadTodoMessageTarget> {
-    if (target.instanceId && target.instanceLabel && target.title) return target;
+    if (target.instanceId) {
+      await this.validateRemoteMessageTarget(target);
+      if (target.instanceLabel && target.title) return target;
+    }
     if (!target.instanceId) {
       const local = await this.resolveThread({ backend: target.backend, threadId: target.threadId })
         .catch(() => undefined);
       if (local) return target.title ? target : { ...target, title: local.title };
+      const archived = await this.readArchivedMessageTarget(target).catch(() => undefined);
+      if (archived) throw new ThreadTodoError("invalid_arguments", archivedThreadMessageRefusal(archived));
     }
     if (!this.federationHandler) return target;
     const response = await Promise.resolve(this.federationHandler({
@@ -45316,12 +46842,34 @@ export class DesktopBackendRegistry {
     const found = response.data.results.find((result) =>
       !result.isLocal && result.backend === target.backend && result.threadId === target.threadId);
     if (!found) return target;
-    return {
+    const resolved = {
       ...target,
       instanceId: found.instanceId,
       instanceLabel: found.instanceLabel,
       title: target.title ?? found.title,
     };
+    return target.instanceId ? resolved : await this.validateRemoteMessageTarget(resolved);
+  }
+
+  private async validateRemoteMessageTarget(target: ThreadTodoMessageTarget): Promise<ThreadTodoMessageTarget> {
+    if (!target.instanceId || !this.federatedThreadInspectionHandler) return target;
+    const remote = await this.federatedThreadInspectionHandler({
+      backend: target.backend, threadId: target.threadId, instanceId: target.instanceId, limit: 0, includeTurns: false,
+    }).catch(() => undefined);
+    if (remote?.archived === true || remote?.thread.archivedAt !== undefined) {
+      throw new ThreadTodoError("invalid_arguments", archivedThreadMessageRefusal(remote.thread));
+    }
+    return target;
+  }
+
+  private async readArchivedMessageTarget(target: {
+    backend: AppServerBackendKind;
+    threadId: string;
+  }): Promise<AppServerThreadSummary | undefined> {
+    return (await this.listThreads({
+      backend: target.backend, archived: true, enrichDirectories: false, forceRefresh: true,
+      callerReason: "thread-id-lookup",
+    })).find((thread) => thread.id === target.threadId);
   }
 
   private async sendMessageToThread(
@@ -45442,7 +46990,7 @@ export class DesktopBackendRegistry {
       }
       // A peer's paused project lets a to-do card's send through.
       if (options?.operatorApproved) messageOrigin.operatorApproved = true;
-      if (!request.args.replaceQueueEntryId) this.correspondenceStore.record({
+      this.correspondenceStore.record({
         id: correspondenceId,
         source,
         destination: { backend, threadId, ...(instanceId ? { instanceId } : {}) },
@@ -45486,6 +47034,19 @@ export class DesktopBackendRegistry {
       if (!instanceId) {
         try {
           localThread = await this.resolveThread({ backend, threadId });
+          if (!localThread) {
+            // Archive membership belongs to the provider's listing, even when
+            // its rows omit archivedAt. Never wake a reclaimed workspace merely
+            // because a prior status/search read warmed the archived cache.
+            const archivedThread = await this.readArchivedMessageTarget({ backend, threadId });
+            if (archivedThread) {
+              return threadOrchestrationFailure(
+                "forbidden",
+                archivedThreadMessageRefusal(archivedThread),
+                { backend, threadId, archived: true },
+              );
+            }
+          }
         } catch (error) {
           localResolutionError = error;
         }
@@ -45508,7 +47069,7 @@ export class DesktopBackendRegistry {
       } else {
         if (localThread) {
           // Publish lifecycle receipts with the resolved title from the outset.
-          if (!request.args.replaceQueueEntryId) this.correspondenceStore.update(source, correspondenceId, {
+          this.correspondenceStore.update(source, correspondenceId, {
             state: "sending", destination: { backend, threadId, title: localThread.title },
           });
           if (request.args.replaceQueueEntryId) {
@@ -45579,10 +47140,10 @@ export class DesktopBackendRegistry {
       };
       if (request.args.replaceQueueEntryId) {
         try {
-          const replaced = this.correspondenceStore.replaceQueuedInput(source, {
+          const replaced = this.correspondenceStore.cancelQueuedInput(source, {
             backend, threadId, ...(targetInstanceId ? { instanceId: targetInstanceId } : {}),
-          }, request.args.replaceQueueEntryId, input);
-          if (replaced) this.publishCorrespondenceMessage(source, replaced.id);
+          }, request.args.replaceQueueEntryId);
+          for (const record of replaced) this.publishCorrespondenceMessage(source, record.id);
         } catch (error) {
           // The recipient already accepted the edit. A sender-side log failure
           // must not encourage another send of the same findings.
@@ -45590,7 +47151,8 @@ export class DesktopBackendRegistry {
             error: error instanceof Error ? error.message : String(error),
           });
         }
-      } else this.updateCorrespondenceStatus(source, correspondenceId, {
+      }
+      this.updateCorrespondenceStatus(source, correspondenceId, {
         state: turn.queueStatus === "queued" ? "queued" : "started",
         destination: { ...threadLinkRef, title: targetTitle },
         queueEntryId: turn.queueEntryId,
@@ -45867,6 +47429,12 @@ export class DesktopBackendRegistry {
       const localThread = !instanceId
         ? await this.resolveThread({ backend, threadId }).catch(() => undefined)
         : undefined;
+      if (!localThread && !instanceId && request.operation === "steer_thread") {
+        const archived = await this.readArchivedMessageTarget({ backend, threadId }).catch(() => undefined);
+        if (archived) {
+          return threadOrchestrationFailure("forbidden", archivedThreadMessageRefusal(archived), { backend, threadId, archived: true });
+        }
+      }
       const rememberedRemote =
         !localThread && includeRemote && this.federatedThreadControlHandler
           ? await this.federatedThreadControlHandler({
@@ -48611,10 +50179,10 @@ export class DesktopBackendRegistry {
     }
   }
 
-  /** Background tasks a Claude monitor's session runs, such as its watcher. */
+  /** Background tasks a Claude monitor's session runs, such as its watcher or a sub-agent. */
   private claudeMonitorTaskCount(record: TaskMonitorDelegationRecord): number {
     if (record.backend !== "claude" || !record.monitorThreadId) return 0;
-    return this.claudeBackend.listBackgroundTasks(record.monitorThreadId).terminals.length;
+    return this.claudeBackend.activeTaskCount(record.monitorThreadId);
   }
 
   /**
@@ -49356,7 +50924,7 @@ export class DesktopBackendRegistry {
           : {}),
         backend: request.args.backend ?? request.context.backend,
         threadId: request.args.threadId ?? request.context.threadId,
-      }, await this.readCausalMessagingContext(request.context));
+      }, await this.readCausalMessagingContext(request.context), `agent:${request.context.backend}:${request.context.threadId}`);
     }
 
     if (request.operation === "mark_project_read") {
@@ -49378,6 +50946,12 @@ export class DesktopBackendRegistry {
       } catch (error) {
         return threadInspectionFailure("internal_error", error instanceof Error ? error.message : String(error));
       }
+    }
+
+    if (request.operation === "scan_thread_maintenance"
+      || request.operation === "apply_thread_maintenance"
+      || request.operation === "open_thread_maintenance") {
+      return await this.handleThreadMaintenanceToolRequest(request);
     }
 
     if (request.operation === "rename_current_thread") {
@@ -49408,6 +50982,163 @@ export class DesktopBackendRegistry {
         message: "Unsupported PwrAgent thread inspection operation.",
       },
     };
+  }
+
+  private async handleThreadMaintenanceToolRequest(
+    request: Extract<PwrAgentThreadInspectionRequest, {
+      operation: "scan_thread_maintenance" | "apply_thread_maintenance" | "open_thread_maintenance";
+    }>,
+  ): Promise<PwrAgentThreadInspectionResponse> {
+    // Every answer must reach the agent within one MCP request's limit.
+    const callStartedAt = Date.now();
+    const handler = this.threadMaintenanceToolHandler;
+    const scans = this.threadMaintenanceToolScans;
+    if (!handler || !scans) return threadInspectionFailure("unsupported_operation", "Thread maintenance is unavailable on this instance.");
+    const args = (request.args ?? {}) as Record<string, unknown>;
+    const allowed = (keys: string[]) => Object.keys(args).every((key) => keys.includes(key));
+    const projectKey = args.projectKey;
+    if (projectKey !== undefined && (typeof projectKey !== "string" || !projectKey.trim())) {
+      return threadInspectionFailure("invalid_arguments", "projectKey must be a nonempty project path.");
+    }
+    try {
+      if (request.operation === "open_thread_maintenance") {
+        if (!allowed(["projectKey"])) return threadInspectionFailure("invalid_arguments", "Pass only an optional projectKey.");
+        const opened = handler.open(typeof projectKey === "string" ? { projectKey: projectKey.trim() } : {});
+        return { ok: true, data: { maintenanceDialog: { opened } } };
+      }
+      if (request.operation === "scan_thread_maintenance") {
+        if (!allowed(["projectKey", "rules", "scanId"])) return threadInspectionFailure("invalid_arguments", "Pass only projectKey, rules and scanId.");
+        const rules = args.rules;
+        if (rules !== undefined && (!rules || typeof rules !== "object" || Array.isArray(rules))) {
+          return threadInspectionFailure("invalid_arguments", "rules must be an object.");
+        }
+        const scanId = args.scanId;
+        if (scanId !== undefined && (typeof scanId !== "string" || !scanId.trim())) {
+          return threadInspectionFailure("invalid_arguments", "scanId must be the nonempty scanId of an earlier scan.");
+        }
+        if (scanId !== undefined && (projectKey !== undefined || rules !== undefined)) {
+          return threadInspectionFailure("invalid_arguments", "Pass scanId alone to read a scan, or projectKey and rules to start one.");
+        }
+        const outcome = typeof scanId === "string"
+          ? await scans.read(scanId.trim(), THREAD_MAINTENANCE_TOOL_WAIT_MS)
+          : await scans.start({
+            ...(typeof projectKey === "string" ? { projectKey: projectKey.trim() } : {}),
+            ...(rules ? { rules: rules as Partial<ThreadMaintenanceRules> } : {}),
+          }, THREAD_MAINTENANCE_TOOL_WAIT_MS);
+        const run = handler.getRun();
+        switch (outcome.kind) {
+          case "finished":
+            return { ok: true, data: { maintenanceScan: summarizeThreadMaintenanceScan(outcome.scan, run) } };
+          case "running":
+            return { ok: true, data: { maintenanceScanPending: {
+              scanId: outcome.scanId, running: true, startedAt: outcome.startedAt,
+              ...(outcome.projectKey ? { projectKey: outcome.projectKey } : {}),
+              ...(run ? { run: summarizeThreadMaintenanceRun(run) } : {}),
+              guidance: "The scan is still running in PwrAgent and changes nothing. Call scan_thread_maintenance with only this scanId to read it. "
+                + `Each call waits up to ${THREAD_MAINTENANCE_TOOL_WAIT_MS / 1_000} seconds. Do not start another scan.`,
+            } } };
+          case "failed":
+            return threadInspectionFailure("internal_error", `The scan failed: ${outcome.message}`);
+          case "missing":
+            return threadInspectionFailure("not_found", "That scan is no longer available. Call scan_thread_maintenance again.");
+        }
+      }
+      if (!allowed(["scanId", "archive", "removeCheckouts", "trashCheckouts", "removeEmptyFolders", "hibernate", "dryRun"])) {
+        return threadInspectionFailure("invalid_arguments", "Pass only scanId, archive, removeCheckouts, trashCheckouts, removeEmptyFolders, hibernate and dryRun.");
+      }
+      const applyArgs = request.args as import("@pwragent/shared").ApplyThreadMaintenanceToolArgs;
+      if (typeof applyArgs.scanId !== "string" || !applyArgs.scanId.trim()) {
+        return threadInspectionFailure("invalid_arguments", "Pass the scanId from scan_thread_maintenance.");
+      }
+      for (const key of ["archive", "removeCheckouts", "trashCheckouts", "hibernate"] as const) {
+        if (applyArgs[key] !== undefined && !Array.isArray(applyArgs[key])) {
+          return threadInspectionFailure("invalid_arguments", `${key} must be an array.`);
+        }
+      }
+      const scan = handler.getScan(applyArgs.scanId.trim());
+      if (!scan) return threadInspectionFailure("not_found", "That scan is no longer available. Call scan_thread_maintenance again.");
+      const plan = planThreadMaintenanceApply(applyArgs, scan, {
+        backend: request.context.backend, threadId: request.context.threadId,
+      });
+      if ("error" in plan) return threadInspectionFailure("invalid_arguments", plan.error);
+      if (applyArgs.dryRun === true) return { ok: true, data: { maintenancePlan: plan.summary, dryRun: true } };
+      if (handler.getRun()?.running) {
+        return threadInspectionFailure("forbidden", "Thread maintenance is already running. Wait for it, then scan again.");
+      }
+      const approved = await this.requestThreadMaintenanceConfirmation({
+        backend: request.context.backend,
+        threadId: request.context.threadId,
+        turnId: request.context.turnId,
+        itemId: request.context.callId,
+        requestId: `thread-maintenance:${scan.scanId}:${request.context.callId?.trim() || randomUUID()}`,
+        question: threadMaintenanceConfirmationQuestion(plan.summary),
+      });
+      if (!approved) {
+        return threadInspectionFailure("forbidden", "The operator declined this thread maintenance run. Do not retry it. Ask the operator what to change.");
+      }
+      const { done } = handler.start(plan.request);
+      // The operator's answer to the card counts against the same limit.
+      const waitMs = Math.max(0, THREAD_MAINTENANCE_TOOL_WAIT_MS - (Date.now() - callStartedAt));
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const waited = await Promise.race([
+        done,
+        new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), waitMs); }),
+      ]).finally(() => clearTimeout(timer));
+      const run = waited ?? handler.getRun();
+      if (!run) return threadInspectionFailure("internal_error", "Thread maintenance did not report a run.");
+      return { ok: true, data: { maintenanceRun: summarizeThreadMaintenanceRun(run) } };
+    } catch (error) {
+      return threadInspectionFailure("internal_error", error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  /** One approve-or-cancel card on the calling thread. Resolves false on
+   * anything but an explicit approval. */
+  private async requestThreadMaintenanceConfirmation(params: {
+    backend: AppServerBackendKind;
+    threadId: string;
+    turnId?: string;
+    itemId?: string;
+    requestId: string;
+    question: string;
+    header?: string;
+    approveLabel?: string;
+    approveDescription?: string;
+  }): Promise<boolean> {
+    const key = buildPendingRequestKey({ backend: params.backend, threadId: params.threadId, requestId: params.requestId });
+    const notification: AppServerPendingRequestNotification = {
+      method: "item/tool/requestUserInput",
+      params: {
+        threadId: params.threadId,
+        ...(params.turnId ? { turnId: params.turnId } : {}),
+        ...(params.itemId ? { itemId: params.itemId } : {}),
+        requestId: params.requestId,
+        questions: [{
+          id: THREAD_MAINTENANCE_CONFIRM_QUESTION_ID,
+          header: params.header ?? "Thread maintenance",
+          question: params.question,
+          isOther: false,
+          isSecret: false,
+          options: [
+            { label: params.approveLabel ?? THREAD_MAINTENANCE_CONFIRM_APPROVE_LABEL,
+              description: params.approveDescription ?? "Run exactly these changes. Each item is checked again first." },
+            { label: "Cancel", description: "Change nothing." },
+          ],
+        }],
+      },
+    };
+    const response = await new Promise<SubmitServerRequestRequest["response"]>((resolve, reject) => {
+      this.pendingServerRequests.set(key, { backend: params.backend, notification, resolve, reject });
+      void this.emit({ backend: params.backend, notification }).catch((error) => {
+        backendRegistryLog.error("failed to publish thread maintenance confirmation; keeping request pending", {
+          backend: params.backend, threadId: params.threadId, requestId: params.requestId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    });
+    const answers = (response as AppServerToolRequestUserInputResponse)?.answers?.[THREAD_MAINTENANCE_CONFIRM_QUESTION_ID]?.answers;
+    return Array.isArray(answers) && answers.length === 1
+      && answers[0] === (params.approveLabel ?? THREAD_MAINTENANCE_CONFIRM_APPROVE_LABEL);
   }
 
   private async mergeFederatedThreadSearchResults(params: {
@@ -49541,7 +51272,10 @@ export class DesktopBackendRegistry {
       Boolean(condition) && typeof condition === "object"
       && typeof (condition as { backend?: unknown }).backend === "string"
       && typeof (condition as { threadId?: unknown }).threadId === "string"
-      && (condition as { title?: unknown }).title === undefined;
+      && (condition as { title?: unknown }).title === undefined
+      // A peer's thread or "something else" is not in this machine's list.
+      && (condition as { subject?: unknown }).subject === undefined
+      && (condition as { target?: unknown }).target === undefined;
     const missing = (conditions as unknown[]).filter(untitled);
     if (missing.length === 0) return conditions;
     const titles = new Map<string, string>();
@@ -49605,7 +51339,9 @@ export class DesktopBackendRegistry {
         let candidateThreads = activeThreads.filter(
           (thread) => thread.id === threadId,
         );
+        let archived = false;
         if (candidateThreads.length === 0) {
+          archived = true;
           candidateThreads = (
             await this.listThreads({
               backend: args.backend,
@@ -49657,6 +51393,7 @@ export class DesktopBackendRegistry {
             data: {
               thread: {
                 ...summary,
+                archived,
                 status,
                 queuedExecutionMode: queued?.mode,
                 queuedExecutionModeAt: queued?.queuedAt,
@@ -49697,6 +51434,7 @@ export class DesktopBackendRegistry {
                 ...summary,
                 instanceId: remote.instanceId,
                 instanceLabel: remote.instanceLabel,
+                ...(remote.archived !== undefined ? { archived: remote.archived } : {}),
                 threadLink: buildThreadMarkdownLink({
                   backend: args.backend,
                   threadId,
@@ -49882,7 +51620,9 @@ export class DesktopBackendRegistry {
     let candidateThreads = activeThreads.filter(
       (thread) => thread.id === params.threadId,
     );
+    let archived = false;
     if (candidateThreads.length === 0) {
+      archived = true;
       candidateThreads = (
         await this.listThreads({
           backend: params.backend,
@@ -49892,7 +51632,7 @@ export class DesktopBackendRegistry {
       ).filter((thread) => thread.id === params.threadId);
     }
     const [summary] = await this.enrichThreadInspectionSummaries(candidateThreads);
-    return summary;
+    return summary ? { ...summary, archived } : undefined;
   }
 
   /**
@@ -50543,14 +52283,14 @@ export class DesktopBackendRegistry {
     if (mutateLocally) {
       // Known only when the backend listed the thread; an overlay-only hit
       // leaves the question to the archive call itself.
-      const archivedAt = localSummary?.archivedAt;
-      if (archive === true && archivedAt !== undefined) {
+      const archived = localSummary?.archived;
+      if (archive === true && archived === true) {
         return threadInspectionFailure(
           "invalid_arguments",
           `${threadLabel} is already archived.`,
         );
       }
-      if (archive === false && localSummary && archivedAt === undefined) {
+      if (archive === false && archived === false) {
         return threadInspectionFailure(
           "invalid_arguments",
           `${threadLabel} is not archived.`,
@@ -50966,7 +52706,7 @@ export class DesktopBackendRegistry {
   readonly ownerContentSearch = new OwnerContentSearch(async (request, signal) => {
     if (!this.ownerThreadSearchService) {
       this.ownerThreadSearchService = new ThreadSearchService(
-        new ThreadSearchStore(getAppStateDb()),
+        createThreadSearchStorage(),
         async (params) => await this.listThreadSearchCandidates(params),
         new ProviderTranscriptThreadSearchAdapter(async (params) => await this.readThreadForContentSearch(params)),
       );
@@ -50997,7 +52737,7 @@ export class DesktopBackendRegistry {
       return this.threadInspectionSearchService;
     }
     this.threadInspectionSearchService = new ThreadSearchService(
-      new ThreadSearchStore(getAppStateDb()),
+      createThreadSearchStorage(),
       async ({ backend, archived }) =>
         await this.listThreads({
           backend,
@@ -52075,8 +53815,29 @@ export class DesktopBackendRegistry {
     );
   }
 
-  private invalidateArchiveCleanupInventory(): void {
-    this.archiveCleanupInventories = new WeakMap();
+  /**
+   * Fleet admission observes only related identities. Before an unobserved
+   * identity's change or in-flight mutation reaches the scope, give it the
+   * batch evidence admission used: proven disjoint when the index related it
+   * to nothing here, its indexed paths otherwise. New paths it reports later
+   * still have to be proven by `prepare`, as before.
+   */
+  private observeArchiveFleetIdentity(scope: ArchiveWorkspaceAdmission, key: string): void {
+    if (scope.hasObserved(key)) return;
+    const related = this.archiveFleetAdmissionKeys.get(scope);
+    const row = this.archiveFleet?.index.get(key);
+    if (!row) return;
+    // While admission is still reading, `prepare` proves the indexed paths.
+    if (related && !related.has(key) && !row.unknownWorkspace && row.paths.length) scope.observeDisjoint(key, row.paths);
+    else {
+      const paths = this.archiveFleetAdmissionPaths.get(scope)?.get(key) ?? row.paths;
+      scope.observeThread(key, [...paths, ...(row.unknownWorkspace || !paths.length ? [""] : [])]);
+    }
+  }
+
+  private archiveWorkspaceMutationsFor(scope: ArchiveWorkspaceAdmission, mutations = this.archiveWorkspaceMutations()): ArchiveWorkspaceMutation[] {
+    for (const { key } of mutations) this.observeArchiveFleetIdentity(scope, key);
+    return mutations;
   }
 
   private archiveWorkspaceMutations(): ArchiveWorkspaceMutation[] {
@@ -52086,8 +53847,12 @@ export class DesktopBackendRegistry {
   }
 
   private recordArchiveWorkspaceChange(key?: string, paths: readonly string[] = [], observation = false): void {
+    const identity = key ? parseThreadIdentityKey(key) : undefined;
+    this.noteArchiveFleetChange(identity ? { backend: identity.backend, threadId: identity.threadId } : undefined, "provider",
+      "workspace change without an identity");
     for (const scope of new Set([...this.archiveWorktreeRemovalAdmissions].map((admission) => admission.scope))) {
       if (observation && key === scope.ownerKey) continue;
+      if (key) this.observeArchiveFleetIdentity(scope, key);
       const observedPaths = observation && paths.length === 0 ? [""] : paths;
       if (observation && key) scope.observeThread(key, observedPaths);
       scope.changed(key, observedPaths);
@@ -52104,11 +53869,16 @@ export class DesktopBackendRegistry {
   ): Promise<T> {
     const finish = this.archiveWorkspaceOwnership.beginMutation(buildThreadIdentityKey(identity.backend, identity.threadId), paths !== undefined);
     this.archiveWorkspaceRevision += 1;
+    this.noteArchiveFleetChange(identity, "provider", "workspace mutation");
     try {
-      if (paths) await this.archiveWorkspaceOwnership.assertAvailable(paths);
+      if (paths) {
+        await this.archiveFleet?.index.notePathWrite(paths);
+        await this.archiveWorkspaceOwnership.assertAvailable(paths);
+      }
       return await work();
     } finally {
       this.archiveWorkspaceRevision += 1;
+      this.noteArchiveFleetChange(identity, "provider", "workspace mutation");
       await this.refreshArchiveWorkspaceOwnership(identity.backend, identity.threadId, finish());
     }
   }
@@ -52119,6 +53889,9 @@ export class DesktopBackendRegistry {
     const key = `workspace-write:${++this.archiveWorkspaceWriteSequence}`;
     const finish = this.archiveWorkspaceOwnership.beginMutation(key, true);
     try {
+      // The written identity is announced after the write. Until a complete
+      // read, a removal near these paths cannot rely on incremental evidence.
+      await this.archiveFleet?.index.notePathWrite(paths);
       await this.archiveWorkspaceOwnership.assertAvailable(paths);
       return await work();
     } finally {
@@ -52186,7 +53959,7 @@ export class DesktopBackendRegistry {
     }));
     const mutations = this.archiveWorkspaceMutations();
     await Promise.all([...new Set([...this.archiveWorktreeRemovalAdmissions].map((admission) => admission.scope))]
-      .map(async (scope) => { await scope.prepare(mutations); }));
+      .map(async (scope) => { await scope.prepare(this.archiveWorkspaceMutationsFor(scope, mutations)); }));
   }
 
   private invalidateArchiveCleanupReads(
@@ -52195,8 +53968,15 @@ export class DesktopBackendRegistry {
     workspaceChanged = true,
     threadId?: string,
     paths: readonly string[] = [],
+    change: FleetChange = notification?.method === "thread/archived" ? "archived"
+      : notification?.method === "thread/deleted" ? "deleted"
+        : notification?.method === "thread/unarchived" ? "active" : "provider",
   ): void {
-    this.invalidateArchiveCleanupInventory();
+    // Membership-only refreshes without an identity (navigation observing its
+    // own archive) change no checkout user; their added identities are marked
+    // through recordArchiveWorkspaceChange.
+    if (backend && threadId) this.noteArchiveFleetChange({ backend, threadId }, change, "identity change");
+    else if (workspaceChanged) this.noteArchiveFleetChange(undefined, change, "workspace change without an identity");
     if (workspaceChanged) {
       this.archiveWorkspaceRevision += 1;
       this.recordArchiveWorkspaceChange(backend && threadId ? buildThreadIdentityKey(backend, threadId) : undefined, paths);
@@ -52211,12 +53991,14 @@ export class DesktopBackendRegistry {
     source: "provider" | "local" = "local",
   ): Array<{ threadId: string; observation: ArchiveWorkspaceObservation }> | undefined {
     const observations: Array<{ threadId: string; observation: ArchiveWorkspaceObservation }> = [];
-    const invalidateOwnership = (threadId: string) => {
+    const invalidateOwnership = (threadId: string, change: FleetChange) => {
+      this.noteArchiveFleetChange({ backend, threadId }, change, "identity change");
       observations.push({ threadId, observation: this.archiveWorkspaceOwnership.invalidate(buildThreadIdentityKey(backend, threadId),
         source === "local" && this.archiveWorkspaceOwnership.isControlled(buildThreadIdentityKey(backend, threadId)) ? "controlled" : "observed") });
     };
     if (notification.method === "thread/parent/set" || notification.method === "thread/parent/cleared") {
-      this.invalidateArchiveCleanupInventory();
+      const threadId = readNonEmptyString(readRecord(notification.params)?.threadId);
+      this.noteArchiveFleetChange(threadId ? { backend, threadId } : undefined, "overlay", "grouping change without an identity");
     }
     const membershipChanged = notification.method === "thread/archived"
       || notification.method === "thread/deleted"
@@ -52253,13 +54035,15 @@ export class DesktopBackendRegistry {
         if (notification.method === "thread/started") {
           const thread = readRecord(notification.params.thread);
           const threadId = readNonEmptyString(notification.params.threadId) ?? readNonEmptyString(thread?.id);
-          if (threadId) invalidateOwnership(threadId);
+          if (threadId) invalidateOwnership(threadId, "provider");
           else this.recordArchiveWorkspaceChange();
         } else if (notification.method === "navigation/threadDirectories/updated") {
           const threadIds = notification.params.threadIds;
           const identities = Array.isArray(threadIds) ? threadIds.filter((id): id is string => typeof id === "string" && id.length > 0) : [];
           if (Array.isArray(threadIds) && identities.length && identities.length === threadIds.length) {
-            for (const threadId of new Set(identities)) invalidateOwnership(threadId);
+            // A directory refresh can report a provider cwd move as well as an
+            // overlay link, so the identity's provider row is read again too.
+            for (const threadId of new Set(identities)) invalidateOwnership(threadId, "provider");
           } else this.recordArchiveWorkspaceChange();
         } else {
           const threadId = readNonEmptyString(readRecord(notification.params)?.threadId);
@@ -52278,9 +54062,9 @@ export class DesktopBackendRegistry {
 
   private readonly transcriptImageWork = new Map<string, Promise<void>>();
 
-  private emitWithTranscriptImages(event: AgentEvent): Promise<void> {
+  private emitWithTranscriptImages(event: AgentEvent, codexStatusSequence?: number): Promise<void> {
     const notification = event.notification;
-    if (!("threadId" in notification.params) || typeof notification.params.threadId !== "string") return this.emitEvent(event);
+    if (!("threadId" in notification.params) || typeof notification.params.threadId !== "string") return this.emitEvent(event, codexStatusSequence);
     const threadId = notification.params.threadId;
     const key = `${event.backend}:${threadId}`;
     const previous = this.transcriptImageWork.get(key);
@@ -52293,7 +54077,7 @@ export class DesktopBackendRegistry {
       || notification.method === "thread/status/changed"
       || notification.method.startsWith("item/");
     if (!materializeImages && (!previous || !orderedNotification)) {
-      return this.emitEvent(event);
+      return this.emitEvent(event, codexStatusSequence);
     }
     const work = (async () => {
       await previous?.catch(() => undefined);
@@ -52308,7 +54092,7 @@ export class DesktopBackendRegistry {
         });
         return event;
       }) : event;
-      await this.emitEvent(materialized);
+      await this.emitEvent(materialized, codexStatusSequence);
     })();
     this.transcriptImageWork.set(key, work);
     void work.finally(() => {
@@ -52317,7 +54101,24 @@ export class DesktopBackendRegistry {
     return work;
   }
 
-  private async emit(event: AgentEvent): Promise<void> {
+  private async emit(event: AgentEvent, codexStatusSequence?: number): Promise<void> {
+    if (event.backend === "codex") {
+      const params = readRecord(event.notification.params);
+      const threadId = readOptionalString(params, ["threadId"]);
+      const turnId = readOptionalString(params, ["turnId"])
+        ?? readOptionalString(readRecord(params?.turn), ["id"]);
+      if (threadId && turnId && turnId !== `pending:${threadId}`) {
+        let turns = this.codexMessageContextTurnObservations.get(threadId);
+        if (!turns) {
+          turns = new Map();
+          this.codexMessageContextTurnObservations.set(threadId, turns);
+        }
+        // Keep the first observation at ingress: delayed repeats must not
+        // turn an earlier identity into one admitted by a later start.
+        if (!turns.has(turnId)) turns.set(turnId, ++this.codexMessageContextTurnSequence);
+      }
+    }
+    this.navigationDirectoryScope.invalidate(event);
     const archiveWorkspaceChanged = this.invalidateArchiveCleanupForNotification(event.backend, event.notification);
     if (event.notification.method === "thread/unarchived" || event.notification.method === "thread/deleted") {
       this.cancelArchiveCleanups(buildThreadIdentityKey(event.backend, event.notification.params.threadId));
@@ -52342,8 +54143,8 @@ export class DesktopBackendRegistry {
     const emitted = event.notification.method === "thread/deleted"
       ? deleteThreadAssets({ backend: event.backend, threadId: event.notification.params.threadId })
           .catch((error) => backendRegistryLog.warn("thread asset cleanup failed", { error: error instanceof Error ? error.message : String(error) }))
-          .then(() => this.emitWithTranscriptImages(event))
-      : this.emitWithTranscriptImages(event);
+          .then(() => this.emitWithTranscriptImages(event, codexStatusSequence))
+      : this.emitWithTranscriptImages(event, codexStatusSequence);
     const method = event.notification.method;
     if (
       this.stoppingRunningTurnsForShutdown
@@ -52519,7 +54320,7 @@ export class DesktopBackendRegistry {
     }
   }
 
-  private emitEvent(event: AgentEvent): Promise<void> {
+  private emitEvent(event: AgentEvent, codexStatusSequence?: number): Promise<void> {
     this.trackLiveCodexToolItem(event);
     if (event.backend === "codex" && event.notification.method === "turn/started") {
       const notification = event.notification as {
@@ -52586,6 +54387,7 @@ export class DesktopBackendRegistry {
       event,
       liveThreadUsageWork,
       precedingLiveThreadUsageBarrier,
+      codexStatusSequence,
     );
     return liveThreadUsageWork
       ? emitted.finally(() => {
@@ -52601,6 +54403,7 @@ export class DesktopBackendRegistry {
     event: AgentEvent,
     liveThreadUsageWork: LiveThreadUsageEmitWork | undefined,
     precedingLiveThreadUsageBarrier: Promise<void> | undefined,
+    codexStatusSequence?: number,
   ): Promise<void> {
     await this.forwardManagedReviewActivity(event);
     event = await this.withThreadMessageContext(event);
@@ -52628,6 +54431,37 @@ export class DesktopBackendRegistry {
       }
     }
 
+    if (event.backend === "codex" && event.notification.method === "thread/name/updated") {
+      const { threadId, threadName, titleSource } = event.notification.params;
+      if (typeof threadName === "string" && threadName.trim()) {
+        const source = normalizeRenamedTitleSource(titleSource);
+        const identity = { backend: "codex" as const, threadId };
+        const metadata = source === "explicit" ? await this.overlayStore.getThreadMetadata?.(identity) : undefined;
+        // The provider already persists ordinary explicit names. Retain owner
+        // provenance for derived titles and replace any earlier canonical title
+        // so a pending import cannot overwrite this acknowledged rename.
+        if (source !== "explicit" || metadata?.title !== undefined) {
+          await this.overlayStore.updateThreadMetadata?.(identity, {
+            title: { text: threadName.trim(), source, nativeName: threadName.trim() },
+          });
+        }
+      }
+    }
+    if (event.backend !== "codex" && event.notification.method === "thread/name/updated") {
+      const { threadId, threadName, titleSource } = event.notification.params;
+      const snapshot = this.providerThreadSnapshotStore?.list().find(value => value.backend === event.backend);
+      const thread = snapshot?.threads.find(value => value.id === threadId);
+      const source = titleSource === undefined ? thread?.titleSource ?? "fallback" : normalizeRenamedTitleSource(titleSource);
+      // A name event updates an already discovered provider row. It cannot
+      // manufacture a complete inventory for an undiscovered provider.
+      if (snapshot && thread && typeof threadName === "string" && threadName.trim()
+        && (thread.title !== threadName.trim() || thread.titleSource !== source)) {
+        this.providerThreadSnapshotStore?.replace({ ...snapshot,
+          threads: snapshot.threads.map(value => value.id === threadId
+            ? { ...value, title: threadName.trim(), titleSource: source } : value),
+        });
+      }
+    }
     this.rememberThreadTitleFromEvent(event);
     if (this.shouldInvalidateThreadListCacheForNotification(event.notification.method)) {
       this.invalidateThreadListCache(event.backend);
@@ -52676,6 +54510,7 @@ export class DesktopBackendRegistry {
         this.reconcileBackendCodexThreadStatus(
           notification.params.threadId,
           "active",
+          codexStatusSequence,
         );
       }
       if (!isAcpBackendId(event.backend)) {
@@ -52695,6 +54530,18 @@ export class DesktopBackendRegistry {
         });
       }
       if (event.backend === "codex") {
+        const pendingTurnId = `pending:${notification.params.threadId}`;
+        const pendingActiveKey = buildActiveTurnKey("codex", notification.params.threadId, pendingTurnId);
+        const pendingModeKey = buildActiveTurnModeKey(notification.params.threadId, pendingTurnId);
+        const collaborationMode = this.activeCodexTurnCollaborationModes.get(
+          pendingActiveKey,
+        );
+        const pendingMode = collaborationMode ? this.activeCodexTurnModes.get(pendingModeKey) : undefined;
+        if (collaborationMode) {
+          this.activeCodexTurnCollaborationModes.set(
+            buildActiveTurnKey("codex", notification.params.threadId, turnId), collaborationMode,
+          );
+        }
         const key = buildActiveTurnModeKey(
           notification.params.threadId,
           turnId,
@@ -52708,10 +54555,16 @@ export class DesktopBackendRegistry {
         if (!this.activeCodexTurnModes.has(key)) {
           this.activeCodexTurnModes.set(
             key,
-            await this.resolveCodexThreadExecutionModeForActiveTurn(
+            pendingMode ?? await this.resolveCodexThreadExecutionModeForActiveTurn(
               notification.params.threadId,
             ),
           );
+        }
+        if (collaborationMode && turnId !== pendingTurnId) {
+          // Transfer ownership before removing the placeholder and its guard.
+          this.activeCodexTurnModes.delete(pendingModeKey);
+          this.activeTurnKeys.delete(pendingActiveKey);
+          this.activeCodexTurnCollaborationModes.delete(pendingActiveKey);
         }
       }
     }
@@ -52872,6 +54725,9 @@ export class DesktopBackendRegistry {
         this.reconcileBackendCodexThreadStatus(
           notification.params.threadId,
           "idle",
+          // A synthetic failure belongs to its start's observation. A newer
+          // provider status must not become idle because submission failed.
+          codexStatusSequence,
         );
       }
       const managedReview = turnId
@@ -52932,16 +54788,11 @@ export class DesktopBackendRegistry {
           );
         }
         this.clearAcceptedToolCallsForEndedTurn(event.backend, notification.params.threadId, turnId);
-        const steerKeyPrefix = buildSteerTurnKeyPrefix({
+        this.threadSteering.retireTurn({
           backend: event.backend,
           threadId: notification.params.threadId,
           turnId,
         });
-        for (const key of this.acceptedSteerRequests.keys()) {
-          if (key.startsWith(steerKeyPrefix)) {
-            this.acceptedSteerRequests.delete(key);
-          }
-        }
       }
       if ((event.backend === "claude" && hadMatchingGenericActiveTurn)
         || (isAcpBackendId(event.backend) && hadGenericActiveTurn)) {
@@ -52966,6 +54817,10 @@ export class DesktopBackendRegistry {
           turnId,
         );
         this.activeCodexTurnModes.delete(activeTurnModeKey);
+        // The start response can register a turn whose started notification was absent.
+        this.activeCodexTurnCollaborationModes.delete(
+          buildActiveTurnKey("codex", notification.params.threadId, turnId),
+        );
         this.activeCodexReviewTurnKeys.delete(activeTurnModeKey);
         if (wasKnownActiveTurn) {
           await this.adoptThreadBranchChangeFromActiveTurn({
@@ -53052,9 +54907,7 @@ export class DesktopBackendRegistry {
           notification.params.threadId,
         );
         if (event.notification.method !== "turn/completed") {
-          this.pendingTitleGenerationInputs.delete(
-            buildTitleGenerationKey(event.backend, notification.params.threadId),
-          );
+          this.threadTitles.forgetPendingInput({ backend: event.backend, threadId: notification.params.threadId });
         }
       }
       void this.threadTurnQueue.releaseThread({
@@ -53200,6 +55053,9 @@ export class DesktopBackendRegistry {
             }
             this.activeCodexTurnModes.delete(key);
             if (parsed) {
+              this.activeCodexTurnCollaborationModes.delete(
+                buildActiveTurnKey("codex", parsed.threadId, parsed.turnId),
+              );
               this.clearAcceptedToolCallsForEndedTurn(event.backend, parsed.threadId, parsed.turnId);
             }
           }
@@ -53318,6 +55174,7 @@ export class DesktopBackendRegistry {
       this.finishLiveThreadUsageEmitWork(liveThreadUsageWork);
     }
     event = this.withReviewRuntimeMetadata(event);
+    event = { ...event, navigationDirectoryScope: this.navigationDirectoryScope.forEvent(event) };
     await this.emitToListeners(event);
   }
 
@@ -54156,6 +56013,7 @@ export function getDesktopBackendRegistry(): DesktopBackendRegistry {
     // fetch, the managed-Grok install, and the 5-16s binary probe out of the
     // suite even when a test forgets to inject its own discovery stub.
     registry = new DesktopBackendRegistry({
+      ownerAdmission: new ProfileThreadOwnerAdmission(() => getRuntimeLeaseManager()),
       configStore: getDesktopConfigStore(),
       useMachineAcpDiscovery: true,
       useMachineClaudeDiscovery: true,
@@ -54213,7 +56071,13 @@ function forgeToolApprovalMessage(operation: ForgePrToolOperation, args: ForgePr
       : `Allow the agent to rerun failed jobs and their dependents in GitHub Actions run ${args.runId}?`;
     case "create_pull_request": return `Allow the agent to open a ${request} on ${forge}?`;
     case "update_pull_request": return `Allow the agent to edit ${request}${pr} on ${forge}?`;
-    case "merge_pull_request": return `Allow the agent to merge ${request}${pr} on ${forge}?`;
+    case "merge_pull_request": switch (args.method) {
+      // Every surface that shows the request reads which merge it is.
+      case "squash": return `Allow the agent to squash and merge ${request}${pr} on ${forge}?`;
+      case "rebase": return `Allow the agent to rebase and merge ${request}${pr} on ${forge}?`;
+      case "merge": return `Allow the agent to merge ${request}${pr} on ${forge} with a merge commit?`;
+      default: return `Allow the agent to merge ${request}${pr} on ${forge}?`;
+    }
     case "submit_pull_request_review": {
       const verb = args.event === "APPROVE" ? "approve" : args.event === "REQUEST_CHANGES" ? "request changes on" : "review";
       return `Allow the agent to ${verb} ${request}${pr} on ${forge}?`;
@@ -54236,7 +56100,8 @@ function forgeToolApprovalMessage(operation: ForgePrToolOperation, args: ForgePr
 function forgeToolParamsDisplay(args: ForgePrToolArgs): Array<{ name: string; value: string; format?: "markdown"; location?: string }> {
   const rows: Array<{ name: string; value: string; format?: "markdown"; location?: string }> = [];
   for (const [name, value] of Object.entries(args)) {
-    if (value === undefined || name === "repository") continue;
+    // The question and the card's merge button both name the method.
+    if (value === undefined || name === "repository" || name === "method") continue;
     if (name === "body") {
       rows.push({ name, value: String(value), format: "markdown" });
     } else if (name === "commitMessage") {

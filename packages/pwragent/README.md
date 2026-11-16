@@ -34,10 +34,11 @@ npm install --global pwragent@1.3.7
 npm install --global pwragent@next
 ```
 
-Provide **Node >=22 and npm separately**, on Linux (macOS is also supported for
-development). The npm package includes the JavaScript federation bundle and its
-license notice; it does not need Electron, pnpm, a compiler or workspace packages
-on the destination machine. It supports **Codex only**. Install the Codex CLI
+Provide **Node 22.14+ (22.x) or Node >=23.6, and npm separately**, on Linux
+(macOS is also supported for development). The npm package includes the JavaScript
+federation bundle and its license notice; it does not need Electron, pnpm, a
+compiler or workspace packages on the destination machine. It supports **Codex
+only**. Install the Codex CLI
 separately and authenticate a dedicated Codex home as the eventual service user.
 The adapter follows the Codex **0.159.2** App Server contract; compatibility with
 other versions is not guaranteed. PwrAgent neither installs nor authenticates
@@ -76,7 +77,7 @@ unprivileged `pwragent` user/group and provision these non-overlapping directori
 | `/opt/pwragent` | root, npm installation prefix |
 
 Keep both state homes private (0700). Verify the service user can execute Node
->=22 at `/usr/bin/node` and its separately installed Codex at
+22.14+ (22.x) or >=23.6 at `/usr/bin/node` and its separately installed Codex at
 `/usr/local/bin/codex`; edit the template if either absolute path differs. A
 shell's Node version-manager initialization does not run under systemd.
 
@@ -111,10 +112,11 @@ with the installed one before deliberately updating it; npm does not overwrite
 
 ## Run from a checkout
 
-Use Node 22 or newer on Linux (macOS is also supported for development). Provide
-an installed Codex executable, an existing workspace, and an existing dedicated
-Codex home with authentication configured by the operator. Install this checkout's
-dependencies with `pnpm install`, then run `pnpm --filter pwragent build`. A packed
+Use the Node versions required above on Linux (macOS is also supported for
+development). Provide an installed Codex executable, an existing workspace, and an
+existing dedicated Codex home with authentication configured by the operator.
+Install this checkout's dependencies with `pnpm install`, then run
+`pnpm --filter pwragent build`. A packed
 tarball already includes the bundle. The protocol adapter follows the repository's
 Codex 0.159.2 contract; compatibility with other versions is not guaranteed.
 Validation uses a fake App Server, not real inference or live accounts.
@@ -167,7 +169,15 @@ select `workspace-write` explicitly when edits are wanted.
 - Each job ID is immutable. Retrying the same ID and input returns its existing
   record, even after reconnect/restart. Different input with that ID fails.
   A timeout or lost CLI response is a reason to inspect/retry the same ID, not
-  create another job. There is no queue: a new ID while busy is rejected.
+  create another job. Continued-thread jobs wait in the shared owner's FIFO
+  while busy. New-thread jobs still require an idle daemon. Waiting input stays
+  in memory; shutdown or crash recovery settles unfinished jobs as `unknown`
+  without replay. `interrupt` cancels a waiting job before provider dispatch.
+  `pause --id JOB` keeps a waiting entry in place while dispatch skips it;
+  `resume --id JOB` puts it back in line. `move --id JOB --before OTHER_JOB`
+  moves it inside the same thread's FIFO; omit `--before` to move to the end.
+  Holds still require `release --id JOB` or `cancel --id JOB`. These controls
+  preserve accepted input and never restore a queue after restart.
 - Both thread and turn setup specify `approvalPolicy: never`. Full access is
   not offered. Turn sandbox policy disables tool network access; workspace-write
   grants the thread's registered project directory and excludes ambient temporary directories.
@@ -215,13 +225,18 @@ Normal shutdown removes it. Abrupt daemon death or a cold boot can leave
 an old writer is gone. For manual recovery, stop the service, inspect the PID
 and Codex PID in `owner.lock`, and establish that the daemon and its process
 group/cgroup have exited. Only then remove those two files from this profile's
-headless directory and restart. Do not remove `identity.json` or `jobs/`, and do
-not remove `threads.json` or `federation.json`, or recover concurrently with another startup. PID reuse is a reason to inspect,
+headless directory and restart. Preserve `identity.json`, `federation.json`,
+the profile `state.db` and `legacy-owner-backup-v1/`. Do not recover concurrently with another startup. PID reuse is a reason to inspect,
 not to kill an unrelated process. Incomplete records become `unknown` at startup.
 
-State is atomically replaced and fsynced only at lifecycle boundaries (normally
-four small job writes per accepted turn), with no SQLite commits, heartbeat,
-per-event writes, or transcript log. Metadata polling does not write. Records
+Job acceptance and outcomes use FULL-durability SQLite commits at lifecycle
+boundaries (normally four job commits per accepted turn). New-thread discovery
+and first-prompt naming add two canonical metadata commits. There is no SQLite
+heartbeat, per-event write or transcript log. Metadata polling does not write.
+The first SQLite start backs up legacy threads/jobs under
+`headless/legacy-owner-backup-v1/`, imports them in one transaction and then
+retires their JSON files. Restart completes any partial retirement without
+reimporting the backups or replaying accepted work. Records
 are capped at 10,000; there is no automatic garbage collection. Prompt input is
 capped at 256 KiB and protocol responses at 32 MiB; oversized history reads fail
 explicitly. A corrupted registry fails startup rather than discarding history.
@@ -284,8 +299,10 @@ errors rather than falling back to the viewer's machine. Read-only peers cannot
 create or control turns. Event subscriptions select both class and thread; no
 transcript is broadcast without demand. Navigation uses the current bounded
 protocol-2 pages, and remote submissions carrying a stable `queueEntryId` reuse
-the same durable job after a lost response. There is still no turn queue: a
-second distinct submission while busy is rejected.
+the same durable job after a lost response. Continued-thread submissions use the
+shared turn queue, return `queueStatus: queued` when waiting, and publish typed
+queue events and paged queue projections. A failed dispatch holds its FIFO;
+held-entry retry/edit controls are not yet exposed by this host.
 
 Directory launchpads and `create_instance_thread` can create an independent
 thread and start its first text turn in a registered owner-side project. Supply
@@ -296,7 +313,7 @@ grouping, environments or provider extensions are rejected before creation.
 
 A new thread is named from its first user message, shortened the way desktop
 names a thread before any helper-model title. The outpost has no helper model.
-The name is stored in `threads.json`, and subscribed viewers receive
+The name is stored in the profile SQLite owner registry, and subscribed viewers receive
 `thread/name/updated` with `titleSource: derived`, followed by a navigation
 invalidation. A later turn never renames a thread. An explicit `renameThread`
 always wins and is never replaced. A thread that still has a placeholder name,
@@ -306,8 +323,9 @@ it is read. The outpost does not set the Codex thread name.
 ## Identity, compute lifetime and remaining scope
 
 The private `federation.json` stores the retained peer ID, signing/Noise keys,
-pinned gateway, enrollments and peer records. `threads.json` stores owned thread
-metadata. These are separate from desktop configuration and OS secret storage.
+pinned gateway, enrollments and peer records. Owned thread metadata and jobs use
+the profile state.db shared with desktop. The private host identity and transport
+keys remain separate from desktop configuration and OS secret storage.
 Provision each outpost with a dedicated root; do not clone a provisioned
 identity into another running machine or bake it into a template image.
 

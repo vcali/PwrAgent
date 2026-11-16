@@ -42,8 +42,14 @@ export const FEDERATION_BACKEND_METHODS = {
   acknowledgeThreadEnvironmentFailure: "backend.acknowledgeThreadEnvironmentFailure",
   setThreadReaction: "backend.setThreadReaction",
   setThreadLock: "backend.setThreadLock",
+  setThreadCheckoutHibernation: "backend.setThreadCheckoutHibernation",
+  /** Wait Until Done, before v1.3.15. Answered so older peers fail clearly; see `legacyManageThreadMergeHolds`. */
+  manageThreadMergeHolds: "backend.manageThreadMergeHolds",
+  manageThreadDependencies: "backend.manageThreadDependencies",
   setThreadPin: "backend.setThreadPin",
   reorderThreadPins: "backend.reorderThreadPins",
+  setDirectoryPin: "backend.setDirectoryPin",
+  reorderDirectoryPins: "backend.reorderDirectoryPins",
   mountRemoteChild: "backend.mountRemoteChild",
   setThreadParent: "backend.setThreadParent",
   mutateThreadParentV1: "backend.mutateThreadParentV1",
@@ -193,8 +199,14 @@ export const FEDERATION_BACKEND_METHOD_CAPABILITIES: Record<
   // A lock refuses every turn on the owner's thread, so it takes the same
   // capability as starting one.
   [FEDERATION_BACKEND_METHODS.setThreadLock]: "turn_control",
+  // Restoring writes the owner's checkout and can start setup, and Keep it
+  // awake changes what the owner's housekeeping may remove.
+  [FEDERATION_BACKEND_METHODS.setThreadCheckoutHibernation]: "turn_control",
+  [FEDERATION_BACKEND_METHODS.manageThreadMergeHolds]: "turn_control",
   [FEDERATION_BACKEND_METHODS.setThreadPin]: "thread_navigation",
   [FEDERATION_BACKEND_METHODS.reorderThreadPins]: "thread_navigation",
+  [FEDERATION_BACKEND_METHODS.setDirectoryPin]: "thread_navigation",
+  [FEDERATION_BACKEND_METHODS.reorderDirectoryPins]: "thread_navigation",
   [FEDERATION_BACKEND_METHODS.mountRemoteChild]: "thread_navigation",
   [FEDERATION_BACKEND_METHODS.setThreadParent]: "thread_grouping",
   [FEDERATION_BACKEND_METHODS.mutateThreadParentV1]: "thread_grouping",
@@ -210,6 +222,7 @@ export const FEDERATION_BACKEND_METHOD_CAPABILITIES: Record<
   // A watch wakes the thread with an agent turn, and stopping one cancels
   // that wake, so both sit with Auto-fix under turn control.
   [FEDERATION_BACKEND_METHODS.manageThreadPrWatchesV1]: "turn_control",
+  [FEDERATION_BACKEND_METHODS.manageThreadDependencies]: "turn_control",
   // A project's Forge Automation decides which turns the owner starts on its
   // own, and a held wake-up's Send starts one, so all three take the
   // turn-control grant. Listing rides with them: only the resume flow asks.

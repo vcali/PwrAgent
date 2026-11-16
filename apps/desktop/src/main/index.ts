@@ -14,9 +14,9 @@ import {
 } from "./app-server/backend-registry";
 import { interruptStartupStorageMaintenance, runStartupStorageMaintenance } from "./storage-maintenance";
 import { removeRetiredCiArtifactStore } from "./pr-status/forge-artifact-download";
-import { hadExistingAppStateDatabase, getAppStateDb } from "./state/app-state";
-import { observeStorageArchive } from "./state/storage-maintenance";
-import { getDesktopOverlayStore } from "./app-server/desktop-overlay-store";
+import { hadExistingAppStateDatabase } from "./storage/desktop-state-lifecycle";
+import { getDesktopStorageMaintenanceStorage } from "./storage/desktop-storage-maintenance";
+import { getDesktopOverlayStore } from "./storage/desktop-overlay-store";
 import { createPwrAgentAppManagementHandler } from "./agent-tools/pwragent-app-management-service";
 import type {
   CreateInstanceThreadResult,
@@ -210,11 +210,12 @@ import {
 } from "./settings/provider-discovery-permit";
 import {
   disposeAppState,
-  initializeAppState,
+  initializeDesktopState,
   isAppStateInitialized,
   recordBootDecision,
-} from "./state/app-state";
-import type { AutoVacuumConversion } from "./state/state-db";
+  stopProfileRuntimeHeartbeatRefresh,
+} from "./storage/desktop-state-lifecycle";
+import type { AutoVacuumConversion } from "./storage/desktop-state-lifecycle";
 import {
   createMainWindow,
   getRendererEntry,
@@ -226,6 +227,7 @@ import { registerManagedRuntimeProgressBroadcast } from "./managed-runtime-progr
 import { subscribersForChannel } from "./window-channels";
 import { requestOpenMainView } from "./window-open-main-view";
 import { requestOpenNewThread } from "./window-open-new-thread";
+import { requestOpenThreadMaintenance } from "./window-open-thread-maintenance";
 import { requestOpenSettings } from "./window-open-settings";
 import { PROFILES_SETTINGS_CREATE_SUBSECTION } from "../shared/settings-routes";
 import { requestReplayOnboarding } from "./window-replay-onboarding";
@@ -274,7 +276,7 @@ import {
 import {
   SQLITE_WRITE_METRICS_ENV,
   SQLITE_WRITE_METRICS_FILE_ENV,
-} from "./state/sqlite-write-metrics";
+} from "./storage/desktop-state-lifecycle";
 import {
   isUpdateInstallInProgress,
   isUpdateInstallUpdaterQuitReady,
@@ -532,9 +534,12 @@ function prewarmInitialThreadList(permit: ProviderDiscoveryPermit): void {
   const startupProviderRefresh = getDesktopSettingsService().resolveCodexCommand()
     // A missing executable must still publish the provider's degraded state.
     .catch(() => undefined)
-    .then(async () =>
-      await getDesktopBackendRegistry().refreshProvidersAtStartup(permit),
-    )
+    .then(async () => {
+      // A pending quit confirmation can be canceled. Resource shutdown owns
+      // permanent startup admission, just as it owns the boot guards below.
+      if (mainProcessShutdownPromise) return;
+      await getDesktopBackendRegistry().refreshProvidersAtStartup(permit);
+    })
     .catch((error) => {
       mainLog.warn("startup provider refresh failed", {
         error: error instanceof Error ? error.message : String(error),
@@ -553,6 +558,7 @@ function prewarmInitialThreadList(permit: ProviderDiscoveryPermit): void {
   // Its own chain, so an archive sweeper failure cannot leave idle Codex
   // threads (and their MCP servers) loaded for the whole session.
   void startupProviderRefresh.then(() => {
+    if (mainProcessShutdownPromise) return;
     getExistingDesktopBackendRegistry()?.startCodexIdleThreadUnsubscriber();
   }).catch((error) => {
     mainLog.warn("startup idle Codex thread unsubscriber initialization failed", {
@@ -562,6 +568,7 @@ function prewarmInitialThreadList(permit: ProviderDiscoveryPermit): void {
   // The idle app-server recycle is the leak backstop; it gets its own chain
   // for the same reason.
   void startupProviderRefresh.then(() => {
+    if (mainProcessShutdownPromise) return;
     getExistingDesktopBackendRegistry()?.startCodexAppServerRecycler();
   }).catch((error) => {
     mainLog.warn("startup Codex app server recycler initialization failed", {
@@ -570,6 +577,7 @@ function prewarmInitialThreadList(permit: ProviderDiscoveryPermit): void {
   });
   // And for idle ACP sessions.
   void startupProviderRefresh.then(() => {
+    if (mainProcessShutdownPromise) return;
     getExistingDesktopBackendRegistry()?.startAcpIdleSessionCloser();
   }).catch((error) => {
     mainLog.warn("startup idle ACP session closer initialization failed", {
@@ -579,6 +587,7 @@ function prewarmInitialThreadList(permit: ProviderDiscoveryPermit): void {
   // Continuations a quiet restart left start once providers can take a
   // turn, a few threads at a time.
   void startupProviderRefresh.then(() => {
+    if (mainProcessShutdownPromise) return;
     getExistingDesktopBackendRegistry()?.beginRestartContinuationDispatch();
   }).catch((error) => {
     mainLog.warn("restart continuation dispatch failed to start", {
@@ -586,6 +595,7 @@ function prewarmInitialThreadList(permit: ProviderDiscoveryPermit): void {
     });
   });
   void startupProviderRefresh.then(() => {
+    if (mainProcessShutdownPromise) return;
     getExistingDesktopBackendRegistry()?.startThreadArchiveSweeper();
   }).catch((error) => {
     mainLog.warn("startup thread archive sweeper initialization failed", {
@@ -593,6 +603,7 @@ function prewarmInitialThreadList(permit: ProviderDiscoveryPermit): void {
     });
   });
   void startupProviderRefresh.then(async () => {
+    if (mainProcessShutdownPromise) return;
     const registry = getExistingDesktopBackendRegistry();
     if (!registry) return;
     await registry.resumeArchiveCleanupsAtStartup();
@@ -600,9 +611,10 @@ function prewarmInitialThreadList(permit: ProviderDiscoveryPermit): void {
     mainLog.warn("archived worktree repair interrupted", { error: error instanceof Error ? error.message : String(error) });
   });
   void startupProviderRefresh
-    .then(async () =>
-      await getDesktopBackendRegistry().prepareTokenMiserRuntimeAtStartup(),
-    )
+    .then(async () => {
+      if (mainProcessShutdownPromise) return;
+      await getDesktopBackendRegistry().prepareTokenMiserRuntimeAtStartup();
+    })
     .catch((error) => {
       mainLog.warn("startup Token Miser preparation failed", {
         error: error instanceof Error ? error.message : String(error),
@@ -974,6 +986,10 @@ async function disposeMainProcessResources(source: string): Promise<void> {
       // released, leaving the next process free to dispatch the same action.
       disposeScheduledThreadActionService();
       getExistingRuntimeLeaseManager()?.markExited();
+      // The runtime no longer claims the profile, so stop advertising it.
+      // A refresh is a synchronous main-thread write, and Electron's native
+      // quit still has to run on this thread after the barrier.
+      stopProfileRuntimeHeartbeatRefresh();
       // The barrier bounds waiting; it does not cancel timed-out work. Keep
       // SQLite alive for late socket callbacks and the final lease release.
       // Only the process exit hook closes it, after synchronous cleanup.
@@ -1338,6 +1354,9 @@ function installApplicationMenu(): void {
       openSource: async () => {
         await shell.openExternal(PWRAGENT_SOURCE_URL);
       },
+      openThreadMaintenance: () => {
+        requestOpenThreadMaintenance();
+      },
       openThreadSearch: () => {
         requestOpenMainView("search");
       },
@@ -1632,7 +1651,7 @@ export function bootstrapApp(): void {
         bootMode,
       },
     });
-    reportAutoVacuumConversion(initializeAppState(bootMode).autoVacuum);
+    reportAutoVacuumConversion(initializeDesktopState(bootMode).autoVacuum);
     getDesktopConfigStore();
     if (bootMode === "active-profile") {
       const registry = getDesktopBackendRegistry();
@@ -1641,11 +1660,11 @@ export function bootstrapApp(): void {
         const method = event.notification.method;
         if (method === "thread/archived" || method === "thread/unarchived") {
           await interruptStartupStorageMaintenance();
-          observeStorageArchive(getAppStateDb().raw, event.backend, event.notification.params.threadId, method === "thread/archived");
+          getDesktopStorageMaintenanceStorage().observeArchive(event.backend, event.notification.params.threadId, method === "thread/archived");
         }
       });
       await runStartupStorageMaintenance({
-        state: getAppStateDb(),
+        storage: getDesktopStorageMaintenanceStorage(),
         existingDatabase: hadExistingAppStateDatabase(),
         onboardingCompleted: getDesktopConfigStore().read("onboarding").completed === true,
         discover: async () => {

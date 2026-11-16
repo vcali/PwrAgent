@@ -23,6 +23,7 @@ import {
   isToolManagedWorktreePath,
 } from "./worktree-paths.js";
 import { deriveInboxState, rankInboxThreadKeys } from "./inbox";
+import { isThreadCheckoutHibernated } from "./checkout-hibernation-policy";
 import { buildDirectorySummaries } from "./directory-navigation";
 
 type AppServerThreadSummaryWithEnvironmentOptions = AppServerThreadSummary & {
@@ -147,6 +148,9 @@ function resolveNavigationExecutionMode(params: {
   overlay?: ThreadOverlayState;
   thread: AppServerThreadSummary;
 }): NavigationThreadSummary["executionMode"] {
+  if (params.thread.source === "claude") {
+    return params.thread.executionMode ?? params.overlay?.executionMode ?? "default";
+  }
   if (isAcpBackendId(params.thread.source)) {
     const overlayIsAtLeastAsFresh =
       params.overlay?.executionModeUpdatedAt !== undefined
@@ -303,6 +307,9 @@ export function materializeNavigationThreads(params: {
       worktreeSnapshots: overlay?.worktreeSnapshots ?? thread.worktreeSnapshots ?? [],
       reactions: overlay?.reactions ?? [],
       lock: overlay?.lock,
+      ...(isThreadCheckoutHibernated({ linkedDirectories, worktreeSnapshots: overlay?.worktreeSnapshots ?? thread.worktreeSnapshots,
+        archivedAt: thread.archivedAt }) ? { checkoutHibernated: true } : {}),
+      ...(overlay?.keepCheckoutAwake ? { keepCheckoutAwake: true } : {}),
       scheduledStart: overlay?.scheduledStart,
       pinnedRank: overlay?.pinnedRank,
       ...parentThread,
@@ -652,6 +659,7 @@ export function serializeNavigationSnapshotForHash(params: {
       },
       reactions: thread.reactions ?? [],
       lock: thread.lock ?? null,
+      keepCheckoutAwake: thread.keepCheckoutAwake ?? false,
       pinnedRank: thread.pinnedRank ?? null,
       parentThreadId: thread.parentThreadId ?? null,
       parentThreadBackend: thread.parentThreadBackend ?? null,

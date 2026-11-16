@@ -8,7 +8,7 @@ import {
   waitFor,
   within,
 } from "../../../test/phase-probes";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   AuthorizeMcpConnectionResponse,
   CodexMcpServerSummary,
@@ -20,8 +20,13 @@ import { PluginsSettings as PluginsSettingsComponent } from "../PluginsSettings"
 import { pressEscape, tabEscapes } from "../../../test/tab-walk";
 import { chooseSelectOption, selectOptionLabels } from "../../../test/select";
 
+beforeEach(() => {
+  vi.stubGlobal("__pwragentHomeDir", "/Users/operator");
+});
+
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
 });
 
 const CODEX_HOME = "/Users/operator/.codex/profiles/work";
@@ -449,6 +454,33 @@ describe("PluginsSettings", () => {
     ).toBeInTheDocument();
   });
 
+  it.each([
+    "/Volumes/work/.codex",
+    "/srv/shared/.codex/profiles/ci",
+    "/Users/operator/projects/app/.codex",
+  ])("shows a custom Codex home in full: %s", async (codexHome) => {
+    render(
+      <PluginsSettings
+        desktopApi={createDesktopApi([], codexHome)}
+        snapshot={createSnapshot({ codexHome })}
+      />,
+    );
+
+    expect(await screen.findByText(codexHome, { selector: "code" })).toBeInTheDocument();
+  });
+
+  it("keeps the Codex home in full when preload has no home directory", async () => {
+    vi.stubGlobal("__pwragentHomeDir", undefined);
+    render(
+      <PluginsSettings
+        desktopApi={createDesktopApi([])}
+        snapshot={createSnapshot()}
+      />,
+    );
+
+    expect(await screen.findByText(CODEX_HOME, { selector: "code" })).toBeInTheDocument();
+  });
+
   it("does not warn about a split that does not exist on System default", async () => {
     render(
       <PluginsSettings
@@ -800,7 +832,7 @@ describe("PluginsSettings", () => {
     for (const name of ["Reauthorize", "Disconnect", "Edit", "Remove"]) {
       expect(datadogRow.getByRole("button", { name })).toBeEnabled();
     }
-    expect(screen.getByLabelText("Remote MCP URL")).toBeEnabled();
+    expect(screen.getByLabelText("MCP server URL")).toBeEnabled();
 
     // So a second sign-in can run beside the first.
     fireEvent.click(datadogRow.getByRole("button", { name: "Reauthorize" }));
@@ -1022,6 +1054,7 @@ describe("PluginsSettings", () => {
       api.setMcpConnectionEnabled = vi.fn();
       api.setMcpConnectionSelectForNewThreads = vi.fn();
       api.setMcpConnectionToolApproval = vi.fn();
+      api.setMcpConnectionProjectToolApproval = vi.fn();
       return api;
     }
 
@@ -1250,6 +1283,62 @@ describe("PluginsSettings", () => {
       expect(api.listMcpConnectionTools).toHaveBeenCalledTimes(3);
     });
 
+    it.each([
+      { token: "replacement-ticket", pending: false },
+      { token: "", pending: false },
+      { token: "", pending: true },
+    ])("retires an IPC test after saving token '$token' (pending: $pending) without consuming a new session", async ({ token, pending }) => {
+      let connection = managed({
+        id: "native-app", displayName: "Native app", authMode: "none",
+        serverUrl: "unix:///tmp/private/server.sock#/mcp", updatedAt: 1,
+        discovery: { state: "ready", lastSuccessAt: 1 },
+      });
+      const api = managedApi([connection], ["old_tool"]);
+      api.listMcpConnections = vi.fn(async () => ({ connections: [connection] }));
+      api.updateMcpConnection = vi.fn(async () => {
+        // Token changes retain URL/configured state, but revise the row.
+        connection = { ...connection, updatedAt: 2, discovery: { state: "untested" } };
+        return { connectionId: connection.id, connection };
+      });
+      // Finish loading the row and its mount effects before starting a test.
+      // The IPC effect retires earlier reads without opening a session.
+      await act(async () => {
+        render(<PluginsSettings desktopApi={api} snapshot={createSnapshot()} />);
+      });
+      const article = (await screen.findByText("Native app", { exact: true })).closest("article")!;
+      const row = within(article);
+      expect(api.listMcpConnectionTools).not.toHaveBeenCalled();
+      fireEvent.click(row.getByRole("button", { name: "Test connection" }));
+      await waitFor(() => expect(row.getByRole("status")).toHaveTextContent(/Connection test passed/));
+      expect(row.getByText("1 tool")).toBeInTheDocument();
+      let finishOldTest: (() => void) | undefined;
+      if (pending) {
+        vi.mocked(api.listMcpConnectionTools!).mockImplementationOnce(async () => await new Promise((done) => {
+          finishOldTest = () => done({ connectionId: connection.id, tools: ["stale_tool"], fetchedAt: 1 });
+        }));
+        fireEvent.click(row.getByRole("button", { name: "Test connection" }));
+        expect(row.getByRole("status")).toHaveTextContent("Testing Native app...");
+      }
+      const reads = vi.mocked(api.listMcpConnectionTools!).mock.calls.length;
+      fireEvent.click(row.getByRole("button", { name: "Edit" }));
+      const dialog = within(screen.getByRole("dialog", { name: "Edit connection" }));
+      if (token) fireEvent.change(dialog.getByLabelText("New session bearer token (leave blank to keep)"), { target: { value: token } });
+      else fireEvent.click(dialog.getByRole("button", { name: "Clear saved token" }));
+      fireEvent.click(dialog.getByRole("button", { name: "Save" }));
+      await screen.findByText("Native app was updated.");
+      expect(api.updateMcpConnection).toHaveBeenCalledWith(expect.objectContaining({ ipcBearerToken: token }));
+      await waitFor(() => expect(row.queryByRole("status")).toBeNull());
+      expect(row.queryByText("1 tool")).toBeNull();
+      expect(article).toHaveAttribute("data-health", "unknown");
+      if (finishOldTest) await act(async () => { finishOldTest!(); });
+      expect(row.queryByRole("status")).toBeNull();
+      expect(api.listMcpConnectionTools).toHaveBeenCalledTimes(reads);
+      // A new session still requires an explicit operator action.
+      fireEvent.click(row.getByRole("button", { name: "Test connection" }));
+      await waitFor(() => expect(row.getByRole("status")).toHaveTextContent(/Connection test passed/));
+      expect(api.listMcpConnectionTools).toHaveBeenCalledTimes(reads + 1);
+    });
+
     it("does not ask a connection that cannot answer", async () => {
       const api = managedApi([
         managed({ configured: false, state: "disconnected" }),
@@ -1262,6 +1351,49 @@ describe("PluginsSettings", () => {
       expect(row.getByText("Sign-in required")).toBeInTheDocument();
       expect(api.listMcpConnectionTools).not.toHaveBeenCalled();
       expect(row.getByRole("button", { name: "Test connection" })).toBeDisabled();
+    });
+
+    it.each([false, true])("refreshes authentication after a rejected tool listing (refresh=%s)", async (refresh) => {
+      const connection = managed({ id: "pwrsnap", displayName: "PwrSnap", kind: "pwrsnap" });
+      const api = managedApi([connection]);
+      let configured = true;
+      api.listMcpConnections = vi.fn(async () => ({
+        connections: [{ ...connection, configured, state: configured ? "ready" as const : "disconnected" as const }],
+      }));
+      api.readPwrSnapConnectionStatus = vi.fn(async () => ({
+        connectionId: "pwrsnap", displayName: "PwrSnap", availability: "running", configured,
+      } as const));
+      let rejectListing!: (error: Error) => void;
+      const listing = vi.fn(() => new Promise<never>((_resolve, reject) => {
+        rejectListing = reject;
+      }));
+      api.listMcpConnectionTools = refresh
+        ? vi.fn().mockResolvedValueOnce({ connectionId: "pwrsnap", tools: ["fixture_tool"], fetchedAt: 1 })
+          .mockImplementation(listing)
+        : listing;
+      render(<PluginsSettings desktopApi={api} snapshot={createSnapshot()} />);
+
+      const row = within(await findRow("PwrSnap"));
+      expect(row.getByText("Signed in")).toBeInTheDocument();
+      expect(screen.getByText("1 ready")).toBeInTheDocument();
+      if (refresh) {
+        await row.findByText("1 tool");
+        fireEvent.click(row.getByRole("button", { name: /^PwrSnap/ }));
+        fireEvent.click(row.getByRole("button", { name: "Test connection" }));
+      }
+      await waitFor(() => expect(listing).toHaveBeenCalledOnce());
+      await act(async () => {
+        configured = false;
+        rejectListing(new Error("PwrSnap rejected this connection's authorization."));
+      });
+
+      expect(await row.findByText("Sign-in required")).toBeInTheDocument();
+      expect(row.queryByText("Signed in")).not.toBeInTheDocument();
+      expect(row.getByRole("button", { name: "Connect" })).toBeInTheDocument();
+      expect(screen.getByText("0 ready · 1 to set up")).toBeInTheDocument();
+      expect(api.readPwrSnapConnectionStatus).toHaveBeenCalledTimes(2);
+      expect(api.listMcpConnections).toHaveBeenCalledTimes(2);
+      expect(row.queryByText("fixture_tool")).not.toBeInTheDocument();
     });
 
     it("says when a listing failed, instead of claiming an empty server", async () => {
@@ -1278,6 +1410,9 @@ describe("PluginsSettings", () => {
       ).toBeInTheDocument();
       expect(row.getByText("upstream answered 502")).toBeInTheDocument();
       expect(article).toHaveAttribute("data-health", "failed");
+      await waitFor(() => expect(api.listMcpConnections).toHaveBeenCalledTimes(2));
+      expect(row.getByText("Signed in")).toBeInTheDocument();
+      expect(api.listMcpConnectionTools).toHaveBeenCalledOnce();
     });
 
     /**
@@ -1344,6 +1479,64 @@ describe("PluginsSettings", () => {
         await screen.findByText("Datadog runs every tool without asking."),
       ).toBeInTheDocument();
       expect(api.setMcpConnectionSelectForNewThreads).not.toHaveBeenCalled();
+    });
+
+    it("gives a project its own tool approval and takes it away", async () => {
+      const api = managedApi([managed({
+        projectToolApprovals: [{ repository: "github.com/pwrdrvr/pwrapps", toolApproval: "approve" }],
+      })]);
+      render(<PluginsSettings desktopApi={api} snapshot={createSnapshot()} />);
+
+      const row = within(await findRow("Datadog"));
+      const projects = within(row.getByRole("group", { name: "Projects" }));
+      // Without the Directories lens a project shows as owner/repo.
+      const field = projects.getByRole("combobox", { name: "Tool approval in pwrdrvr/pwrapps" });
+      expect(field).toHaveTextContent("Allow all tools");
+      expect(projects.getByText("github.com/pwrdrvr/pwrapps")).toBeInTheDocument();
+
+      chooseSelectOption(field, "Ask for every tool");
+      await waitFor(() => {
+        expect(api.setMcpConnectionProjectToolApproval).toHaveBeenCalledWith({
+          connectionId: "datadog", repository: "github.com/pwrdrvr/pwrapps", toolApproval: "prompt",
+        });
+      });
+      expect(await screen.findByText("Datadog asks before every tool in pwrdrvr/pwrapps.")).toBeInTheDocument();
+
+      fireEvent.click(projects.getByRole("button", { name: "Remove pwrdrvr/pwrapps" }));
+      await waitFor(() => {
+        expect(api.setMcpConnectionProjectToolApproval).toHaveBeenLastCalledWith({
+          connectionId: "datadog", repository: "github.com/pwrdrvr/pwrapps", toolApproval: null,
+        });
+      });
+      expect(await screen.findByText("Threads in pwrdrvr/pwrapps follow Datadog's Tool approval again.")).toBeInTheDocument();
+
+      fireEvent.click(projects.getByRole("button", { name: "Add project" }));
+      fireEvent.change(projects.getByRole("textbox", { name: "Repository" }), {
+        target: { value: "github.com/pwrdrvr/PwrAgent" },
+      });
+      fireEvent.click(projects.getByRole("button", { name: "Add project" }));
+      await waitFor(() => {
+        expect(api.setMcpConnectionProjectToolApproval).toHaveBeenLastCalledWith({
+          connectionId: "datadog", repository: "github.com/pwrdrvr/pwragent", toolApproval: "approve",
+        });
+      });
+      // The connection's own mode never moved.
+      expect(api.setMcpConnectionToolApproval).not.toHaveBeenCalled();
+    });
+
+    it("keeps a listed project's mode when Add project names it again", async () => {
+      const api = managedApi([managed({
+        projectToolApprovals: [{ repository: "github.com/pwrdrvr/pwrapps", toolApproval: "prompt" }],
+      })]);
+      render(<PluginsSettings desktopApi={api} snapshot={createSnapshot()} />);
+      const projects = within(within(await findRow("Datadog")).getByRole("group", { name: "Projects" }));
+      fireEvent.click(projects.getByRole("button", { name: "Add project" }));
+      fireEvent.change(projects.getByRole("textbox", { name: "Repository" }), {
+        target: { value: "https://github.com/pwrdrvr/PwrApps" },
+      });
+      fireEvent.click(projects.getByRole("button", { name: "Add project" }));
+      await waitFor(() => expect(projects.queryByRole("textbox", { name: "Repository" })).not.toBeInTheDocument());
+      expect(api.setMcpConnectionProjectToolApproval).not.toHaveBeenCalled();
     });
 
     it("shows a connection an agent added without a manual refresh", async () => {

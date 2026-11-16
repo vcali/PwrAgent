@@ -14,6 +14,10 @@ import type {
   AppServerThreadStatus,
   CancelThreadExecutionModeQueueRequest,
   CancelThreadExecutionModeQueueResponse,
+  CancelQueuedTurnRequest,
+  CancelQueuedTurnResponse,
+  ReadQueuedTurnRequest,
+  ReadQueuedTurnResponse,
   CompactThreadRequest,
   CompactThreadResponse,
   SetThreadLockRequest,
@@ -89,10 +93,10 @@ import type {
 } from "./core/messaging-adapter";
 import { MessagingFederatedThreadTargetError } from "./core/messaging-adapter";
 import type { DesktopBackendRegistry } from "../app-server/backend-registry";
-import { buildMessageContent } from "../codex-app-server/client";
+import { buildMessageContent } from "../codex-app-server/desktop-client";
 import { getMainLogger } from "../log";
 import { getDesktopBackendRegistry } from "../app-server/backend-registry";
-import { getDesktopOverlayStore } from "../app-server/desktop-overlay-store";
+import { getDesktopOverlayStore } from "../storage/desktop-overlay-store";
 import { resolveScratchProjectsRoots } from "../app-server/scratch-projects";
 import { hasFederationErrorCode } from "../federation/federation-rpc";
 import { findAssistantMessageForText } from "./find-assistant-reply-message";
@@ -145,6 +149,19 @@ type AssistantImageRequest = Parameters<
 >[0];
 
 export class DesktopMessagingBackendBridge implements MessagingBackendBridge {
+  readonly ownsTurnQueue = true;
+
+  async readQueuedTurn(request: ReadQueuedTurnRequest): Promise<ReadQueuedTurnResponse> {
+    const remote = this.remoteBackend(request.federationTarget);
+    return remote ? await remote.readQueuedTurn(stripFederationTarget(request)) : await this.registry.readQueuedTurn(request);
+  }
+
+  async cancelQueuedTurn(request: CancelQueuedTurnRequest): Promise<CancelQueuedTurnResponse> {
+    const remote = this.remoteBackend(request.federationTarget);
+    return remote ? await remote.cancelQueuedTurn(stripFederationTarget(request))
+      : this.registry.cancelQueuedTurnWithDisposition(request.queueEntryId, "Cancelled from messaging.", request.expectedContentHash);
+  }
+
   private readonly assistantImageResolutions = new Map<
     string,
     Promise<MessagingImagePart[]>
@@ -1166,6 +1183,16 @@ export class DesktopMessagingBackendBridge implements MessagingBackendBridge {
       return await remote.compactThread(stripFederationTarget(request));
     }
     return await this.registry.compactThread(request);
+  }
+
+  async continueClaudeThreadInNewSession(request: {
+    threadId: string;
+    federationTarget?: FederationTarget;
+  }): Promise<{ threadId: string }> {
+    if (request.federationTarget && isRemoteFederationTarget(request.federationTarget)) {
+      throw new Error("Continue this Claude thread on its owning instance.");
+    }
+    return await this.registry.continueClaudeThreadInNewSession({ threadId: request.threadId });
   }
 
   async interruptTurn(request: InterruptTurnRequest): Promise<InterruptTurnResponse> {

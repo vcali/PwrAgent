@@ -1,11 +1,18 @@
-import type { ForgeApprovalRememberOptionId, SubmitServerRequestRequest } from "@pwragent/shared";
+import type {
+  ForgeApprovalRememberOptionId,
+  SubmitServerRequestRequest,
+  ThreadTodoMergeMethod,
+} from "@pwragent/shared";
 import {
   buildPendingRequestActions,
   buildPendingRequestResponse,
+  THREAD_TODO_MERGE_METHOD_LABELS,
 } from "@pwragent/shared";
 import {
   buildMcpElicitationResponse,
   readMcpApprovalPersistence,
+  readMcpMergeMethods,
+  readMcpProjectApprovalOffer,
   readMcpRememberOptions,
   type McpApprovalPersistence,
 } from "../thread-detail/mcp-elicitation";
@@ -62,12 +69,14 @@ function mcpApprovalChoices(wait: OperatorWait): ApprovalChoices | undefined {
     action: "accept" | "decline" | "cancel",
     persist?: McpApprovalPersistence,
     remember?: ForgeApprovalRememberOptionId,
+    mergeMethod?: ThreadTodoMergeMethod,
+    projectGrant?: boolean,
   ): ApprovalChoice => ({
     id,
     label,
     effect: action === "accept" ? "allow" : action,
     busyLabel,
-    buildResponse: () => buildMcpElicitationResponse(mcp, action, persist, remember),
+    buildResponse: () => buildMcpElicitationResponse(mcp, action, persist, remember, mergeMethod, projectGrant),
   });
   const decline = choice("decline", "Decline", "Declining…", "decline");
   if (mcp.url) return { decline, alternatives: [] };
@@ -95,6 +104,20 @@ function mcpApprovalChoices(wait: OperatorWait): ApprovalChoices | undefined {
   if (persistence.includes("always")) {
     alternatives.push(choice("always", "Always allow", "Allowing…", "accept", "always"));
   }
+  // Allow every tool on this server for the thread's project, in Settings.
+  const projectOffer = readMcpProjectApprovalOffer(mcp);
+  if (projectOffer) {
+    alternatives.push(choice(
+      "project",
+      projectOffer.label,
+      "Allowing…",
+      "accept",
+      undefined,
+      undefined,
+      undefined,
+      true,
+    ));
+  }
   // A forge approval can save the answer as a project rule, as its card can.
   for (const option of readMcpRememberOptions(mcp)) {
     alternatives.push(choice(
@@ -106,9 +129,25 @@ function mcpApprovalChoices(wait: OperatorWait): ApprovalChoices | undefined {
       option.id,
     ));
   }
+  // A merge names its method and offers the others, as its card does.
+  const mergeMethods = readMcpMergeMethods(mcp);
+  for (const method of mergeMethods?.methods ?? []) {
+    if (method === mergeMethods?.selected) continue;
+    alternatives.push(choice(
+      `merge:${method}`,
+      THREAD_TODO_MERGE_METHOD_LABELS[method].menu,
+      "Merging…",
+      "accept",
+      undefined,
+      undefined,
+      method,
+    ));
+  }
   alternatives.push(choice("cancel", "Cancel turn", "Cancelling…", "cancel"));
   return {
-    accept: choice("accept", "Allow", "Allowing…", "accept"),
+    accept: mergeMethods
+      ? choice("accept", THREAD_TODO_MERGE_METHOD_LABELS[mergeMethods.selected].button, "Merging…", "accept")
+      : choice("accept", "Allow", "Allowing…", "accept"),
     decline,
     alternatives,
   };

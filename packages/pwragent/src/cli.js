@@ -8,7 +8,7 @@ import { serve } from "./daemon.js";
 import { ACTIVE } from "./store.js";
 import { formatVersion, installedVersion, packageVersion, restartRequired } from "./version.js";
 
-const help = `PwrAgent Headless (experimental, Linux/macOS, Node >=22)
+const help = `PwrAgent Headless (experimental, Linux/macOS, Node 22.14+ (22.x) or >=23.6)
 
   pwragent serve --workspace /project --codex-home /codex-home --codex-bin /path/to/codex
   pwragent project-list
@@ -21,6 +21,9 @@ const help = `PwrAgent Headless (experimental, Linux/macOS, Node >=22)
   pwragent submit --id JOB --prompt-file /task.txt [--sandbox read-only|workspace-write]
                   [--model MODEL] [--thread THREAD_ID] [--cwd /workspace/project]
   pwragent show|read|interrupt|wait --id JOB
+  pwragent release|cancel --id QUEUED_JOB
+  pwragent pause|resume --id QUEUED_JOB
+  pwragent move --id QUEUED_JOB [--before QUEUED_JOB]
   pwragent federation-join --invite-file /invite.txt --gateway ws://127.0.0.1:47830 [--label NAME]
   pwragent federation-invite [--port 47831] [--label NAME]
   pwragent federation-status | federation-leave
@@ -32,7 +35,8 @@ serve runs in the foreground; use systemd to own its lifetime remotely.
 submit returns durable acceptance. wait exits 0 only for completed, 2 otherwise.
 Approvals are never granted. Job IDs cannot be reused for different input.
 Federation uses private retained identity files and the standard encrypted protocol.
-No provisioning, login, queue, automatic replay, or local messaging providers.
+Continued-thread jobs queue while busy; new-thread jobs require an idle daemon.
+No provisioning, login, automatic replay, or local messaging providers.
 `;
 
 export async function main(args) {
@@ -44,6 +48,7 @@ export async function main(args) {
     "codex-home": { type: "string" },
     "codex-bin": { type: "string" },
     id: { type: "string" },
+    before: { type: "string" },
     "prompt-file": { type: "string" },
     thread: { type: "string" },
     model: { type: "string" },
@@ -65,7 +70,8 @@ export async function main(args) {
     submit: ["id", "prompt-file", "thread", "model", "sandbox", "cwd"],
     "project-list": [], "project-create": ["name", "label"], "project-clone": ["name", "remote", "label"],
     "project-add": ["path", "label"], "project-remove": ["path"], "git-auth-configure": ["config-file"],
-    show: ["id"], read: ["id"], interrupt: ["id"], wait: ["id"], status: [], list: [], version: [],
+    show: ["id"], read: ["id"], interrupt: ["id"], wait: ["id"], release: ["id"], cancel: ["id"], status: [], list: [], version: [],
+    pause: ["id"], resume: ["id"], move: ["id", "before"],
     "federation-join": ["invite-file", "gateway", "label"],
     "federation-invite": ["port", "label"],
     "federation-status": [], "federation-leave": [], "federation-revoke": ["peer"],
@@ -117,7 +123,7 @@ export async function main(args) {
   if (command === "wait") {
     for (;;) {
       const job = await call(directory, "show", { id: values.id });
-      if (!ACTIVE.has(job.status)) {
+      if (job.status !== "queued" && !ACTIVE.has(job.status)) {
         console.log(JSON.stringify(job));
         return job.status === "completed" ? 0 : 2;
       }
@@ -130,6 +136,6 @@ export async function main(args) {
     console.log(JSON.stringify({ ...status, installed, restartRequired: restartRequired(status.running, installed) }));
     return 0;
   }
-  console.log(JSON.stringify(await call(directory, command, { id: values.id })));
+  console.log(JSON.stringify(await call(directory, command, { id: values.id, ...(values.before !== undefined ? { before: values.before } : {}) })));
   return 0;
 }

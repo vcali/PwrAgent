@@ -60,6 +60,65 @@ export function isThreadTodoMergeMethod(
   );
 }
 
+/**
+ * What a merge control says for each method. The button says what it will
+ * do; the menu says it as GitHub does. A to-do card and an agent's merge
+ * approval read the same words.
+ */
+export const THREAD_TODO_MERGE_METHOD_LABELS: Record<
+  ThreadTodoMergeMethod,
+  { button: string; menu: string; verb: string; description: string }
+> = {
+  squash: {
+    button: "Squash merge",
+    menu: "Squash and merge",
+    verb: "Squash merge",
+    description: "Combine the commits into one on the base branch.",
+  },
+  rebase: {
+    button: "Rebase merge",
+    menu: "Rebase and merge",
+    verb: "Rebase and merge",
+    description: "Replay each commit onto the base branch.",
+  },
+  merge: {
+    button: "Merge",
+    menu: "Create a merge commit",
+    verb: "Merge",
+    description: "Keep every commit and add a merge commit.",
+  },
+};
+
+/** The merge methods a forge accepts. GitLab takes merge and squash. */
+export function forgeMergeMethods(
+  provider: "github" | "gitlab",
+): ThreadTodoMergeMethod[] {
+  return provider === "gitlab"
+    ? THREAD_TODO_MERGE_METHODS.filter((method) => method !== "rebase")
+    : [...THREAD_TODO_MERGE_METHODS];
+}
+
+/**
+ * The method a merge runs with, before anyone is asked. The order is the one
+ * a to-do card uses, with the caller's own request first: the request, then
+ * the operator's pick for the project, then the Settings default. A choice
+ * the forge does not accept is skipped, and the first offered method is the
+ * last resort.
+ */
+export function settleMergeMethod(input: {
+  offered: readonly ThreadTodoMergeMethod[];
+  requested?: ThreadTodoMergeMethod;
+  remembered?: ThreadTodoMergeMethod;
+  fallback?: ThreadTodoMergeMethod;
+}): ThreadTodoMergeMethod {
+  const accepts = (method: ThreadTodoMergeMethod | undefined): method is ThreadTodoMergeMethod =>
+    method !== undefined && input.offered.includes(method);
+  if (accepts(input.requested)) return input.requested;
+  if (accepts(input.remembered)) return input.remembered;
+  if (accepts(input.fallback)) return input.fallback;
+  return input.offered[0] ?? DEFAULT_THREAD_TODO_MERGE_METHOD;
+}
+
 /** Provider, model and effort for a local to-do dispatch. */
 export type ThreadTodoModelSettings = {
   backend: AppServerBackendKind;
@@ -214,8 +273,9 @@ export type ThreadTodo = {
   /** Re-adding an open card with the same key updates it in place. */
   key?: string;
   /**
-   * Set when a thread dependency raised the card for the operator. One
-   * dependency raises at most one card, whatever its status.
+   * Set when a thread dependency, or a wait marked done (`merge-hold:<id>`),
+   * raised the card for the operator. Each raises at most one card, whatever
+   * its status.
    */
   dependencyId?: string;
   kind: ThreadTodoKind;
@@ -492,11 +552,13 @@ export function resolveThreadTodoMergeMethod(
   todo: Pick<ThreadTodo, "sourceProject" | "targetProject" | "mergeMethod">,
   preferences: ThreadTodoMergeMethodPreferences | undefined,
 ): ThreadTodoMergeMethod {
-  if (isThreadTodoMergeMethod(todo.mergeMethod)) return todo.mergeMethod;
   const projectKey = threadTodoActionProject(todo)?.key;
-  return (projectKey ? preferences?.byProject[projectKey] : undefined)
-    ?? preferences?.defaultMethod
-    ?? DEFAULT_THREAD_TODO_MERGE_METHOD;
+  return settleMergeMethod({
+    offered: THREAD_TODO_MERGE_METHODS,
+    requested: isThreadTodoMergeMethod(todo.mergeMethod) ? todo.mergeMethod : undefined,
+    remembered: projectKey ? preferences?.byProject[projectKey] : undefined,
+    fallback: preferences?.defaultMethod,
+  });
 }
 
 export type ResolveThreadTodoRequest = {

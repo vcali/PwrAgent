@@ -38,6 +38,7 @@ describe("desktop settings contracts", () => {
           value: true,
           source: "default",
         },
+        autoFixReviews: { value: true, source: "default" },
         passSetupVariablesToAgents: {
           value: true,
           source: "default",
@@ -111,6 +112,7 @@ describe("desktop settings contracts", () => {
         interactiveSvgSkipNotice: { value: false, source: "default" },
         interactiveSvgAutoOpen: { value: false, source: "default" },
         htmlPreviewRunScripts: { value: false, source: "default" },
+        visualizeDrawInChat: { value: true, source: "default" },
       },
       onboarding: {
         completed: { value: true, source: "default" },

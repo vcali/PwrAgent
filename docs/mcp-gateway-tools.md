@@ -35,8 +35,22 @@ In Default and Auto the gateway card is the only prompt for a gateway call,
 whichever backend runs the thread. Codex does not review PwrAgent's dynamic
 tools. A Claude query pre-allows `mcp__pwragent__call_mcp_tool` through
 `allowedTools`, so Claude does not ask through `canUseTool` before the gateway
-does. Claude's `plan` mode and the operator's own Claude `ask` and `deny`
-rules for the tool still apply. See [Claude provider](claude-provider.md).
+does. The operator's own Claude `ask` and `deny` rules for the tool still
+apply. See [Claude provider](claude-provider.md).
+
+A Claude plan turn, the composer's Plan toggle, is read-only. Claude's `plan`
+mode asks for every `call_mcp_tool` call, so in a plan turn PwrAgent's
+permission handler passes the call to the gateway without a card only when
+the SDK identifies the host-registered `pwragent` server (`source: "sdk"`)
+and no operator `ask` rule matched. Rule-forced asks, configured namesakes,
+and calls without origin metadata keep Claude's approval card. The gateway
+then runs an upstream tool marked read-only (`readOnlyHint` true and
+`destructiveHint` not true) under the connection's tool-approval policy, as in
+any other turn. It refuses any other tool before Full Access, automation
+grants or conversation approvals are consulted, shows no card, and tells
+Claude to put the step in its plan. A plan mode Claude entered on its own
+keeps Claude's own card.
+
 Selection, actor permissions, connection authorization and schema validation
 still apply to every call. No permission is cached for the generic wrapper.
 
@@ -154,6 +168,40 @@ owner checks the grant, the exact session and, for fixed gateway tools, the
 thread's selection both before it asks and before it delivers an answer.
 After a reconnect, the replacement session can be answered only by its own
 form. Nothing launches the server's desktop application to answer a form.
+
+### Messaging confirmations
+
+An upstream server can ask for a decision without requesting field values:
+`requestedSchema: { type: "object", properties: {} }`. PwrAgent presents it
+as **MCP Confirmation**, including the server's complete proposal. Its Allow
+button returns `{ action: "accept", content: {} }`; Decline and Cancel never
+accept it. Required input fields still need the desktop form. URL-mode
+acceptance still needs the desktop, which shows the address.
+
+Messaging callbacks must identify the original pending card through its
+durable handle or delivered surface. An old button never answers the newest
+request. Text approval uses the displayed `approve <card code>` phrase;
+a bare "yes", an action label or another card's phrase does not approve it.
+The code distinguishes requests; it is not a credential. Existing actor,
+conversation, binding and `approval.respond.escalation` RBAC checks apply.
+Proposals that exceed the surface's complete-card limit offer no messaging
+acceptance and direct the person to desktop. Telegram and Discord declare
+complete multipart approval delivery; Feishu declares its smaller card limit.
+These confirmations never inherit tool grants or Auto/Full Access consent.
+A disconnected or expired originating operation cannot be revived by a
+restored card or late callback.
+
+PwrDisk uses this empty-form contract to request Trash, permanent deletion
+or owner-cleanup approval for its expiring, single-use native preview. The
+server remains responsible for exact plan validation and execution guards.
+`PWRDISK_APPROVAL_TEST_BINARY=/absolute/path/to/pwrdisk pnpm test
+apps/desktop/src/main/__tests__/messaging-controller.test.ts -t 'round trips
+PwrDisk deletion through fake messaging'` runs an opt-in smoke against a real
+PwrDisk MCP binary. It uses the actual upstream relay and messaging controller
+with simulated human callbacks and a fixture-only native-window stand-in;
+only owned disposable files can be removed. It does not contact a provider,
+start a desktop window or validate installed builds. Unit suites separately
+cover gateway authority, lifecycle teardown, callbacks and actor isolation.
 
 ### Upstream links
 

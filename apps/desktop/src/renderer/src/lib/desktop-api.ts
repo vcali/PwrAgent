@@ -26,6 +26,9 @@ import type {
   ThreadReview,
   ListThreadReviewsRequest,
   UpdateThreadReviewRequest,
+  ReadReviewAutoFixRequest,
+  DisarmReviewAutoFixRequest,
+  ReviewAutoFixStatus,
   DismissOperatorQuestionRequest,
   OperatorQuestionThreadRequest,
   ListOperatorRequestsResponse,
@@ -36,7 +39,13 @@ import type {
 import type { ReadUsageActivityRequest, ReadUsageActivityResponse, AnalyzeUsageActivityRequest, AnalyzeUsageActivityResponse } from "@pwragent/shared";
 import type { ReadThreadFamilyPricingRequest, ReadThreadFamilyPricingResponse } from "@pwragent/shared";
 import type { PrActivitySnapshot } from "@pwragent/shared";
-import type { HandoffInstanceThreadRequest, HandoffInstanceThreadResult } from "@pwragent/shared";
+import type {
+  CancelThreadHandoffRequest,
+  HandoffInstanceThreadRequest,
+  HandoffInstanceThreadResult,
+  RetryThreadHandoffNowRequest,
+  ThreadHandoffProgress,
+} from "@pwragent/shared";
 import type {
   CancelComposerFilePushRequest,
   ComposerFilePushProgress,
@@ -168,6 +177,13 @@ import type {
   CodexAppServerRestartResult,
   CodexAppServerRestartStatus,
   DesktopThreadArchiveSweepStatus,
+  DesktopAutomaticArchiveRetiredNotice,
+  ThreadMaintenanceApplyRequest,
+  ThreadMaintenanceRules,
+  ThreadMaintenanceRun,
+  ThreadMaintenanceScan,
+  ThreadMaintenanceScanProgress,
+  ThreadMaintenanceScanStep,
   DraftAutomationPromptRequest,
   DraftAutomationPromptResponse,
   ConfigureFederationTailscaleRequest,
@@ -303,6 +319,8 @@ import type {
   SetThreadReactionRequest,
   SetThreadReactionResponse,
   SetThreadLockRequest,
+  SetThreadCheckoutHibernationRequest,
+  SetThreadCheckoutHibernationResponse,
   SetThreadLockResponse,
   RecentThreadLockNotesResponse,
   ThreadLockNoteRequest,
@@ -395,6 +413,7 @@ import type {
   RemoveMcpConnectionRequest,
   SetMcpConnectionEnabledRequest,
   SetMcpConnectionSelectForNewThreadsRequest,
+  SetMcpConnectionProjectToolApprovalRequest,
   SetMcpConnectionToolApprovalRequest,
   SetSandboxerCleanupOnPrCloseRequest,
   SetLinearPasteImagesRequest,
@@ -585,6 +604,8 @@ import type {
   InspectCodeSignaturesResponse,
   PickGhCommandResponse,
   PickGitCommandResponse,
+  ManagedGitActionRequest,
+  ManagedGitActionResponse,
   RefreshDesktopCodexDiscoveryRequest,
   SetCodexModelProviderApiKeyRequest,
   SetCodexModelProviderApiKeyResponse,
@@ -698,6 +719,9 @@ export type DesktopApi = Partial<NativeVoiceApi> & {
   ) => Promise<MutateMcpConnectionResponse>;
   setMcpConnectionToolApproval?: (
     request: SetMcpConnectionToolApprovalRequest,
+  ) => Promise<MutateMcpConnectionResponse>;
+  setMcpConnectionProjectToolApproval?: (
+    request: SetMcpConnectionProjectToolApprovalRequest,
   ) => Promise<MutateMcpConnectionResponse>;
   setSandboxerTransport?: (request: SetSandboxerTransportRequest) => Promise<MutateMcpConnectionResponse>;
   setSandboxerCleanupOnPrClose?: (
@@ -896,6 +920,14 @@ export type DesktopApi = Partial<NativeVoiceApi> & {
   handoffThreadToInstance?: (
     request: HandoffInstanceThreadRequest,
   ) => Promise<HandoffInstanceThreadResult>;
+  /** Cancels a handoff this window started, while it can still be taken back. */
+  cancelThreadHandoff?: (request: CancelThreadHandoffRequest) => Promise<void>;
+  /** Asks a handoff held by a dropped connection to reconnect now. */
+  retryThreadHandoffNow?: (request: RetryThreadHandoffNowRequest) => Promise<void>;
+  /** Progress of handoffs this window started. Returns an unsubscribe. */
+  onThreadHandoffProgress?: (
+    callback: (progress: ThreadHandoffProgress) => void,
+  ) => () => void;
   /**
    * Copy a file from this machine to the owner of a remote thread, for a
    * composer attachment. Resolves with the owner's path to the copy.
@@ -1014,6 +1046,26 @@ export type DesktopApi = Partial<NativeVoiceApi> & {
   getThreadArchiveSweepStatus?: () => Promise<DesktopThreadArchiveSweepStatus>;
   /** Resolves with the status of the finished sweep, joining a running one. */
   runThreadArchiveSweep?: () => Promise<DesktopThreadArchiveSweepStatus>;
+  /** Whether to tell this profile, once, that the hourly sweep no longer archives threads. */
+  getAutomaticArchiveRetiredNotice?: () => Promise<DesktopAutomaticArchiveRetiredNotice>;
+  dismissAutomaticArchiveRetiredNotice?: () => Promise<void>;
+  /** Read-only scan for the Thread maintenance dialog. Changes nothing. */
+  scanThreadMaintenance?: (request?: {
+    rules?: Partial<ThreadMaintenanceRules>;
+    projectKey?: string;
+    /** The steps to read. Absent: every step. */
+    steps?: ThreadMaintenanceScanStep[];
+    /** Idle days for this scan's hibernate step only. Settings keep theirs. */
+    hibernateIdleDays?: number;
+    /** Set to hear this scan's progress through onThreadMaintenanceScanProgress. */
+    progressId?: string;
+  }) => Promise<ThreadMaintenanceScan>;
+  /** Starts a run of selections from one scan. Resolves once it starts;
+   * progress and the result arrive through onThreadMaintenanceRunChanged. */
+  applyThreadMaintenance?: (request: ThreadMaintenanceApplyRequest) => Promise<ThreadMaintenanceRun>;
+  getThreadMaintenanceRun?: () => Promise<ThreadMaintenanceRun | null>;
+  /** Stops after the item in progress. Nothing already done is undone. */
+  stopThreadMaintenance?: () => Promise<void>;
   analyzeFocusedDiff?: (
     request: FocusedDiffAnalysisRequest
   ) => Promise<FocusedDiffAnalysisResponse>;
@@ -1139,6 +1191,10 @@ export type DesktopApi = Partial<NativeVoiceApi> & {
   ) => Promise<ListThreadTodosResponse>;
   listThreadReviews?: (request?: ListThreadReviewsRequest) => Promise<{ reviews: ThreadReview[] }>;
   updateThreadReview?: (request: UpdateThreadReviewRequest) => Promise<{ review: ThreadReview }>;
+  readReviewAutoFix?: (request: ReadReviewAutoFixRequest) => Promise<{ status: ReviewAutoFixStatus }>;
+  disarmReviewAutoFix?: (
+    request: DisarmReviewAutoFixRequest,
+  ) => Promise<{ disarmed: boolean; status: ReviewAutoFixStatus }>;
   resolveThreadTodo?: (
     request: ResolveThreadTodoRequest,
   ) => Promise<ThreadTodoMutationResponse>;
@@ -1210,6 +1266,10 @@ export type DesktopApi = Partial<NativeVoiceApi> & {
   undoThreadRewind?: (
     request: UndoThreadRewindRequest,
   ) => Promise<UndoThreadRewindResponse>;
+  /** A Claude thread whose session Claude Code deleted continues in a new one. */
+  continueClaudeThreadInNewSession?: (
+    request: { threadId: string },
+  ) => Promise<{ threadId: string }>;
   configureGrokWorkflowBudget?: (
     request: ConfigureGrokWorkflowBudgetRequest,
   ) => Promise<ConfigureGrokWorkflowBudgetResponse>;
@@ -1383,6 +1443,12 @@ export type DesktopApi = Partial<NativeVoiceApi> & {
    */
   refreshGitDiscovery?: () => Promise<ReadDesktopSettingsResponse>;
   /**
+   * Settings → Git → Updates: check for, download, cancel, choose (Use and
+   * Roll back) or remove a PwrDrvr Git release. Returns the refreshed
+   * snapshot, with `error` when the action did not complete.
+   */
+  managedGitAction?: (request: ManagedGitActionRequest) => Promise<ManagedGitActionResponse>;
+  /**
    * Reads what the platform's code-signing system says about executables
    * PwrAgent runs but does not ship. Deliberately separate from discovery
    * so the probes only run for rows a settings pane is showing; results
@@ -1530,6 +1596,10 @@ export type DesktopApi = Partial<NativeVoiceApi> & {
   setThreadLock?: (
     request: SetThreadLockRequest,
   ) => Promise<SetThreadLockResponse>;
+  /** Restore a hibernated checkout now, or set Keep it awake. Runs on the owner. */
+  setThreadCheckoutHibernation?: (
+    request: SetThreadCheckoutHibernationRequest,
+  ) => Promise<SetThreadCheckoutHibernationResponse>;
   listRecentThreadLockNotes?: () => Promise<RecentThreadLockNotesResponse>;
   rememberThreadLockNote?: (
     request: ThreadLockNoteRequest,
@@ -1786,6 +1856,17 @@ export type DesktopApi = Partial<NativeVoiceApi> & {
   ) => () => void;
   onThreadArchiveSweepStatusChanged?: (
     callback: (status: DesktopThreadArchiveSweepStatus) => void,
+  ) => () => void;
+  onThreadMaintenanceRunChanged?: (
+    callback: (run: ThreadMaintenanceRun) => void,
+  ) => () => void;
+  /** Progress of a scan this window started with a progressId. */
+  onThreadMaintenanceScanProgress?: (
+    callback: (progress: ThreadMaintenanceScanProgress) => void,
+  ) => () => void;
+  /** File → Thread Maintenance…, an agent, or a project's context menu. */
+  onOpenThreadMaintenanceRequested?: (
+    callback: (request: { projectKey?: string }) => void,
   ) => () => void;
   onGithubPrSamlEnforcement?: (
     callback: (event: GithubPrSamlEnforcementEvent) => void,

@@ -9,10 +9,10 @@ import type {
 } from "@pwragent/shared";
 import { buildPullRequestStatusKey } from "@pwragent/shared";
 import type {
-  OverlayStoreLike,
+  PrStatusWatchStorage,
   PrStatusWatchClaim,
   PrStatusWatchThreadRef,
-} from "../state/overlay-store-sqlite.js";
+} from "@pwragent/owner-core/pr-status-storage";
 import {
   fallbackTerminalDetails,
   formatTerminalDetailsLines,
@@ -22,17 +22,6 @@ import {
 export const PR_STATUS_WATCH_MAX_DISPATCH_ATTEMPTS = 3;
 export const PR_STATUS_WATCH_LEASE_MS = 60_000;
 const PR_STATUS_WATCH_HEARTBEAT_MS = 20_000;
-
-type PrStatusWatchStore = Pick<
-  OverlayStoreLike,
-  | "claimThreadPrStatusWatches"
-  | "finishThreadPrStatusWatch"
-  | "releaseThreadPrStatusWatch"
-  | "renewThreadPrStatusWatchLease"
-  | "advanceThreadPrStatusWatches"
-  | "claimThreadPrTerminalWatches"
-  | "finishThreadPrTerminalWatch"
->;
 
 type PrStatusWatchRegistry = {
   submitTurnIfIdle(params: {
@@ -55,7 +44,7 @@ export class PrStatusWatchCoordinator {
 
   constructor(
     private readonly options: {
-      store: PrStatusWatchStore;
+      store: PrStatusWatchStorage;
       registry: PrStatusWatchRegistry;
       isBackgroundPollingEnabled?: () => boolean;
       /**
@@ -156,15 +145,18 @@ export class PrStatusWatchCoordinator {
   async handleTerminalSnapshot(
     pr: PrSummary,
     observedAt: number,
+    options: { fromSavedObservation?: boolean; pendingOnly?: boolean } = {},
   ): Promise<number> {
     if (this.options.isBackgroundPollingEnabled?.() === false) return 0;
     const outcome = terminalOutcomeOf(pr);
     if (!outcome) return 0;
     await this.options.prepareClaims?.();
     const now = this.now();
+    const retired = options.pendingOnly ? []
+      : await this.options.store.observeThreadPrTerminalWatches({ pr, observedAt, outcome, now });
+    await this.notifyWatchesChanged(retired);
     const claimed = await this.options.store.claimThreadPrTerminalWatches({
       prKey: buildPullRequestStatusKey(pr),
-      outcome,
       now,
       ownerId: this.ownerId,
       leaseExpiresAt: now + PR_STATUS_WATCH_LEASE_MS,
@@ -174,6 +166,7 @@ export class PrStatusWatchCoordinator {
     // sandbox cleanup, so it all happens once the project allows it.
     const claims: PrStatusWatchClaim[] = [];
     for (const claim of claimed) {
+      if (!await this.claimIsActive(claim)) continue;
       if (this.options.allowsWatchDispatch?.(claim.watch) === false) {
         await this.options.store.releaseThreadPrStatusWatch({
           watchId: claim.watch.watchId,
@@ -193,20 +186,27 @@ export class PrStatusWatchCoordinator {
       this.startLeaseHeartbeat(claim.watch.watchId)
     );
     try {
-      const details = await this.resolveTerminalDetails(pr);
-      // Each thread's sandbox cleanup can wait on a remote MCP, so prepare
-      // every wake at once rather than one thread after another.
-      const extraLines = details
-        ? await Promise.all(claims.map((claim) => this.prepareTerminalWake(claim, pr)))
-        : [];
+      const detailReads = new Map<string, Promise<PullRequestTerminalDetails | undefined>>();
+      const wakes = await Promise.all(claims.map(async (claim) => {
+        const observation = claim.terminalObservation ?? { pr, observedAt };
+        const key = JSON.stringify(observation);
+        let read = detailReads.get(key);
+        if (!read) {
+          const newlyObserved = retired.some((thread) =>
+            thread.backend === claim.watch.backend && thread.threadId === claim.watch.threadId
+          );
+          read = this.resolveTerminalDetails(observation.pr, {
+            cachedOnly: options.fromSavedObservation || !newlyObserved,
+          });
+          detailReads.set(key, read);
+        }
+        const details = await read;
+        const extraLines = details ? await this.prepareTerminalWake(claim, observation.pr) : [];
+        return { observation, details, extraLines };
+      }));
       for (const [index, claim] of claims.entries()) {
-        await this.dispatchTerminalClaim(
-          claim,
-          pr,
-          details,
-          observedAt,
-          extraLines[index] ?? [],
-        );
+        const { observation, details, extraLines } = wakes[index]!;
+        await this.dispatchTerminalClaim(claim, observation.pr, details, observation.observedAt, extraLines);
       }
     } finally {
       for (const stop of stopHeartbeats) stop();
@@ -217,6 +217,7 @@ export class PrStatusWatchCoordinator {
   /** Forge details when available, else what cached status can say. */
   async resolveTerminalDetails(
     pr: PrSummary,
+    options: { cachedOnly?: boolean } = {},
   ): Promise<PullRequestTerminalDetails | undefined> {
     const prKey = buildPullRequestStatusKey(pr);
     const outcome = terminalOutcomeOf(pr);
@@ -225,6 +226,9 @@ export class PrStatusWatchCoordinator {
     const cacheKey = JSON.stringify([prKey, outcome, pr.mergedAt ?? pr.closedAt ?? null]);
     const cached = this.terminalDetailsCache.get(cacheKey);
     if (cached) return cached;
+    if (options.cachedOnly) {
+      return fallbackTerminalDetails(pr, "Using the saved terminal observation.");
+    }
     if (!this.options.fetchTerminalDetails) {
       return fallbackTerminalDetails(pr, "No forge lookup is configured.");
     }
@@ -258,6 +262,7 @@ export class PrStatusWatchCoordinator {
     claim: PrStatusWatchClaim,
     pr: PrSummary,
   ): Promise<string[]> {
+    if (!await this.claimIsActive(claim)) return [];
     try {
       return await this.options.prepareTerminalWake?.({
         watch: claim.watch,
@@ -275,6 +280,7 @@ export class PrStatusWatchCoordinator {
     observedAt: number,
     extraLines: string[],
   ): Promise<void> {
+    if (!await this.claimIsActive(claim)) return;
     const release = async (spendAttempt: boolean) =>
       await this.releaseClaim(claim, spendAttempt);
     const outcome = terminalOutcomeOf(pr);
@@ -333,6 +339,7 @@ export class PrStatusWatchCoordinator {
     observedAt: number,
     failureCoveredThreadKeys: ReadonlySet<string>,
   ): Promise<void> {
+    if (!await this.claimIsActive(claim)) return;
     if (
       this.options.isBackgroundPollingEnabled?.() === false
       || this.options.allowsWatchDispatch?.(claim.watch) === false
@@ -395,6 +402,10 @@ export class PrStatusWatchCoordinator {
     } finally {
       stopHeartbeat();
     }
+  }
+
+  private async claimIsActive(claim: PrStatusWatchClaim): Promise<boolean> {
+    return await this.options.store.isThreadPrStatusWatchClaimActive({ watchId: claim.watch.watchId, ownerId: this.ownerId });
   }
 
   private async releaseClaim(

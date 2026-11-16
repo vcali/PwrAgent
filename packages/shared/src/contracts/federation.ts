@@ -41,6 +41,7 @@ export const FEDERATION_CAPABILITIES = [
   "file_pull",
   "event_subscriptions",
   "turn_input_blobs",
+  "resumable_blobs",
   "transport_brotli",
   "shutdown_notice",
   /**
@@ -115,6 +116,13 @@ export const FEDERATION_CAPABILITIES = [
    * A viewer offers no Forge Automation menu items without it.
    */
   "project_forge_automation",
+  /**
+   * The owner answers `backend.manageThreadDependencies`: a viewer manages
+   * Continue After on the owner's threads, finds the owner's registrations
+   * that wait on its own threads, and marks a prerequisite done there. A
+   * viewer offers Continue After on an older owner's threads read-only.
+   */
+  "thread_dependencies_v1",
 ] as const;
 
 export const FEDERATION_SHUTDOWN_METHOD = "federation/shutdown";
@@ -930,6 +938,8 @@ export type FederationNotificationEnvelope<
  */
 export type FederationBlobChunkEnvelope = FederationEnvelopeBase & {
   kind: "blob_chunk";
+  /** Durable file push; absent for the original turn-input blob protocol. */
+  purpose?: "file_push";
   transferId: string;
   chunkIndex: number;
   chunkCount: number;

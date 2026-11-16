@@ -28,7 +28,7 @@ code side).
 
 | Permission ID | Group | What it gates |
 |---|---|---|
-| `message.reply` | conversation | Send a plain message turn to a bound thread. The baseline floor. Also gates the agent `send_messaging_file` tool. |
+| `message.reply` | conversation | Send a plain message turn to a bound thread. The baseline floor. Also gates the agent `send_messaging_file` tool and Claude's "Continue in a new session" recovery (`/continue`). |
 | `elicitation.answer` | conversation | Respond to the agent's elicitation prompts (questionnaire buttons + freeform fallback). |
 | `thread.status.view` | session | Read the binding status card and transcript. |
 | `thread.resume` | session | Attach the conversation to an existing thread (`/resume`, `/agent`, and the agent-driven `attach_thread_here`). |
@@ -48,12 +48,12 @@ code side).
 | `thread.control.stop` | control | Interrupt the running turn. |
 | `thread.control.compact` | control | Compact the thread's context. |
 | `thread.control.handoff` | control | Move a thread between local/worktree/branches (all `handoff:*` actions), or to another project (`mutate_thread` `projectPath`). Lock or unlock a thread (the status card's Lock/Unlock toggle, `status:lock`, and `mutate_thread` `locked` and `lockNote`). |
-| `thread.control.archive` | control (danger: med) | Let the agent archive a thread (`mutate_thread` `archive: true`), removing the worktrees PwrAgent created for it, or restore an archived one (`archive: false`). Admin only by default. |
+| `thread.control.archive` | control (danger: med) | Let the agent archive a thread (`mutate_thread` `archive: true`), removing the worktrees PwrAgent created for it, or restore an archived one (`archive: false`). Also gates `apply_thread_maintenance`, which archives idle threads and removes archived checkouts from a reviewed scan after the operator confirms a card. Admin only by default. |
 | `thread.control.organize` | control | Let the agent pin or unpin a thread (`mutate_thread` `pinned`), mark it read or unread (`unread`), group it under another thread as a sub-thread or make it top-level again (`parentThreadId`, `parentBackend`, `detachFromParent`), and mark an entire project read (`mark_project_read`). |
 | `thread.control.schedule` | control | Queue a message to the bound thread for later (`/schedule`) and list or cancel the queue (`/scheduled`). |
 | `approval.respond.default` | interactive | Approve or deny non-escalation approval requests. |
 | `approval.respond.escalation` | interactive (danger: med) | Approve or deny network / exec / filesystem escalation requests. |
-| `tools.thread_inspection` | tools (danger: med) | Let the agent search and read OTHER threads on the actor's behalf (`search_threads`, `read_thread`, thread status, PR inspection, `read_star_map_view`), and point the desktop Star Map at them (`fly_star_map_to`, `highlight_star_map_threads`, `set_star_map_view`). |
+| `tools.thread_inspection` | tools (danger: med) | Let the agent search and read OTHER threads on the actor's behalf (`search_threads`, `read_thread`, thread status, PR inspection, `read_star_map_view`), point the desktop Star Map at them (`fly_star_map_to`, `highlight_star_map_threads`, `set_star_map_view`), scan for idle threads (`scan_thread_maintenance`), and open the desktop Thread maintenance dialog (`open_thread_maintenance`). |
 | `tools.thread_orchestration` | tools (danger: med) | Let the agent inject messages into other threads, hand off tasks, attach directories, and attach PRs. |
 | `tools.instance_management` | tools (danger: med) | Let the agent manage PwrAgent itself and inspect automations (`manage_pwragent`). |
 | `thread.execution.full_access` | danger (danger: high) | Select or resume into full-access execution — near-complete control of the host. |
@@ -158,6 +158,11 @@ All enforcement funnels through `requirePermission` in
   `approval.respond.escalation` by the pending request's kind (fail-closed:
   an approval that cannot be classified requires the escalation permission),
 - the `message.reply` floor for plain turns,
+- Claude's deleted-session recovery button and `/continue`, also gated on
+  `message.reply`. The backend refuses while Claude still has the session or
+  the thread is busy or locked; recovery preserves messages and execution
+  settings. It therefore needs no additional session-control permission.
+  Like desktop recovery, it runs only on the thread's owning instance,
 - the full-access double-gate inside the escalation/runtime-mode paths, and
 - agent dynamic-tool calls, attributed to the RBAC actor who started the turn
   (`checkDynamicToolPermission`), with `mutate_thread` gated per mutated field

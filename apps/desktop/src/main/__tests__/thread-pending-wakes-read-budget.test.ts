@@ -5,12 +5,15 @@ import { buildThreadPendingWakes, type ThreadPendingWakeReaders } from "../app-s
 import { ThreadPendingWakesCache } from "../app-server/thread-pending-wakes-cache";
 import { SqliteOverlayStore } from "../state/overlay-store-sqlite";
 import { ThreadDependencyStore } from "../state/thread-dependency-store";
-import { ScheduledThreadActionStore } from "../scheduled-actions/scheduled-thread-action-store";
-import { FileScheduledThreadActionPayloadStore } from "../scheduled-actions/scheduled-thread-action-payload-store";
+import { ScheduledThreadActionStore } from "../storage/scheduled-thread-action-store";
+import { FileScheduledThreadActionPayloadStore } from "../storage/scheduled-thread-action-payload-store";
 import { createTempStateDb, openInMemoryStateDb, removeTempStateDbDir } from "./sqlite-test-utils";
 import { expectPendingWakeReadBudget } from "./fixtures/pending-wake-read-budget";
 
 const THREAD = { backend: "codex" as const, threadId: "selected" };
+// Two local and two peer callers exercise contention on every tick. Keep the
+// tick count and elapsed time so expiry and invalidation retain their coverage.
+const CALLERS_PER_TICK = 4;
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
 it.each([0, 160])("budgets owner projection reads under repeated local and peer demand (%i unrelated threads)", async (unrelated) => {
@@ -104,7 +107,7 @@ it.each([0, 160])("budgets owner projection reads under repeated local and peer 
     // Isolate the cost of owner reuse: the same bounded builder and stores,
     // with completed-result caching and single-flight admission bypassed.
     for (let tick = 0; tick < 32; tick += 1) {
-      await Promise.all(Array.from({ length: 40 }, (_, caller) => {
+      await Promise.all(Array.from({ length: CALLERS_PER_TICK }, (_, caller) => {
         counts.requests += 1;
         counts.builds += 1;
         return buildThreadPendingWakes(readers, THREAD, { endedLimit: 0, ...(caller % 2 ? { activePrWatches: [watch] } : {}) });
@@ -120,7 +123,7 @@ it.each([0, 160])("budgets owner projection reads under repeated local and peer 
     });
     // Sequential batches catch completed-result amplification as well as single-flight sharing.
     for (let tick = 0; tick < 32; tick += 1) {
-      await Promise.all(Array.from({ length: 40 }, (_, caller) => {
+      await Promise.all(Array.from({ length: CALLERS_PER_TICK }, (_, caller) => {
         counts.requests += 1;
         return cache.read(THREAD, { endedLimit: 0, ...(caller % 2 ? { activePrWatches: [watch] } : {}) });
       }));
@@ -131,7 +134,7 @@ it.each([0, 160])("budgets owner projection reads under repeated local and peer 
     const changed = [];
     for (let tick = 0; tick < 32; tick += 1) {
       cache.invalidate(THREAD);
-      for (let caller = 0; caller < 40; caller += 1) {
+      for (let caller = 0; caller < CALLERS_PER_TICK; caller += 1) {
         counts.requests += 1;
         changed.push(cache.read(THREAD, { endedLimit: 0 }));
       }

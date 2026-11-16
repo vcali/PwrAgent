@@ -250,8 +250,45 @@ jobs:
         timeout-minutes: 5
 
       - name: Test
+        id: unit-tests
+        continue-on-error: true
         timeout-minutes: 10
-        run: pnpm test --shard=${{ matrix.lane }}/2
+        env:
+          PWRAGENT_CI_TEST_REPORT: ${{ github.workspace }}/.local/ci/retry/unit-first.json
+        run: pnpm test --shard=${{ matrix.lane }}/2 --reporter=default --reporter=./scripts/ci/vitest-ci-reporter.mjs
+
+      - name: Verify the unit slice completed
+        id: unit-completion
+        if: steps.unit-tests.outcome == 'success'
+        run: node scripts/ci/run-retry-failures.mjs unit-verify
+
+      - name: Retry failed unit tests
+        id: unit-retry
+        if: steps.unit-tests.outcome == 'failure'
+        run: pnpm exec node scripts/ci/run-retry-failures.mjs unit
+
+      - name: Record retry slice
+        if: ${{ !cancelled() && always() }}
+        continue-on-error: true
+        uses: ./.github/actions/flake-slice
+        with:
+          kind: unit
+          platform: linux
+          lane: ${{ matrix.lane }}
+          sample: 1
+          job-status: ${{ job.status }}
+          first-outcome: ${{ steps.unit-tests.outcome }}
+          retry-outcome: ${{ steps.unit-retry.outcome }}
+
+      - name: Upload unit retry reports
+        if: ${{ !cancelled() && (steps.unit-tests.outcome == 'failure' || steps.unit-completion.outcome == 'failure') }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-unit-retry-lane-${{ matrix.lane }}
+          path: .local/ci/retry/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Test standalone headless CLI
         if: matrix.lane == 1
@@ -368,8 +405,15 @@ jobs:
           cache-electron: "true"
 
       - name: Test
+        id: unit-tests
+        continue-on-error: true
+        # Native diagnostic builds and SQLite fixtures use os.tmpdir(). Keep
+        # their outputs off the same stalling OS volume as the E2E fixtures.
         env:
           PWRAGENT_UNBORN_WORKSPACE_TRACE: "1"
+          PWRAGENT_CI_TEST_REPORT: ${{ github.workspace }}/.local/ci/retry/unit-first.json
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
         timeout-minutes: 20
         # Keep a common MSYS parent alive while parallel workers launch Git
         # and Bash. Independent starts from PowerShell can race MSYS shared
@@ -378,7 +422,45 @@ jobs:
         shell: bash
         # The deploy-isolation test launches pnpm's native executable directly
         # to avoid Windows .cmd handoffs; pnpm supplies it in npm_execpath.
-        run: pnpm test --project desktop-main --shard=${{ matrix.lane }}/2
+        run: pnpm test --project desktop-main --shard=${{ matrix.lane }}/2 --reporter=default --reporter=./scripts/ci/vitest-ci-reporter.mjs
+
+      - name: Verify the unit slice completed
+        id: unit-completion
+        if: steps.unit-tests.outcome == 'success'
+        run: node scripts/ci/run-retry-failures.mjs unit-verify
+
+      - name: Retry failed unit tests
+        id: unit-retry
+        if: steps.unit-tests.outcome == 'failure'
+        shell: bash
+        env:
+          PWRAGENT_UNBORN_WORKSPACE_TRACE: "1"
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+        run: pnpm exec node scripts/ci/run-retry-failures.mjs unit
+
+      - name: Record retry slice
+        if: ${{ !cancelled() && always() }}
+        continue-on-error: true
+        uses: ./.github/actions/flake-slice
+        with:
+          kind: unit
+          platform: windows-main
+          lane: ${{ matrix.lane }}
+          sample: 1
+          job-status: ${{ job.status }}
+          first-outcome: ${{ steps.unit-tests.outcome }}
+          retry-outcome: ${{ steps.unit-retry.outcome }}
+
+      - name: Upload unit retry reports
+        if: ${{ !cancelled() && (steps.unit-tests.outcome == 'failure' || steps.unit-completion.outcome == 'failure') }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-main-unit-retry-lane-${{ matrix.lane }}
+          path: .local/ci/retry/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
 
   windows-renderer-packages:
     name: Windows renderer + packages (lane ${{ matrix.lane }} of 2)
@@ -408,7 +490,11 @@ jobs:
         uses: ./.github/actions/install-ripgrep
 
       - name: Test
+        id: unit-tests
+        continue-on-error: true
         timeout-minutes: 20
+        env:
+          PWRAGENT_CI_TEST_REPORT: ${{ github.workspace }}/.local/ci/retry/unit-first.json
         run: >-
           pnpm exec vitest run --config vitest.workspace.ts
           --project desktop-renderer
@@ -417,6 +503,40 @@ jobs:
           --project owner-core
           --project shared
           --shard=${{ matrix.lane }}/2
+          --reporter=default --reporter=./scripts/ci/vitest-ci-reporter.mjs
+
+      - name: Verify the unit slice completed
+        id: unit-completion
+        if: steps.unit-tests.outcome == 'success'
+        run: node scripts/ci/run-retry-failures.mjs unit-verify
+
+      - name: Retry failed unit tests
+        id: unit-retry
+        if: steps.unit-tests.outcome == 'failure'
+        run: pnpm exec node scripts/ci/run-retry-failures.mjs unit
+
+      - name: Record retry slice
+        if: ${{ !cancelled() && always() }}
+        continue-on-error: true
+        uses: ./.github/actions/flake-slice
+        with:
+          kind: unit
+          platform: windows-renderer
+          lane: ${{ matrix.lane }}
+          sample: 1
+          job-status: ${{ job.status }}
+          first-outcome: ${{ steps.unit-tests.outcome }}
+          retry-outcome: ${{ steps.unit-retry.outcome }}
+
+      - name: Upload unit retry reports
+        if: ${{ !cancelled() && (steps.unit-tests.outcome == 'failure' || steps.unit-completion.outcome == 'failure') }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-renderer-unit-retry-lane-${{ matrix.lane }}
+          path: .local/ci/retry/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
 
   windows-package:
     name: Windows installer (label-gated)
@@ -535,10 +655,14 @@ jobs:
           sudo apt-get install --no-install-recommends -y openbox x11-utils
 
       - name: Run desktop replay-backed Electron tests
+        id: e2e-tests
+        continue-on-error: true
         timeout-minutes: 10
         env:
           # Lane sizes by test count; see the strategy comment above.
           PWTEST_SHARD_WEIGHTS: "83:82:67:88"
+          PWRAGENT_CI_TEST_REPORT: ${{ github.workspace }}/.local/ci/retry/e2e-first.json
+          PLAYWRIGHT_LAST_RUN_OUTPUT_FILE: ${{ github.workspace }}/.local/ci/retry/e2e-last.json
         # Wide-layout specs request 1440px windows. Keep the virtual desktop
         # larger so Openbox does not constrain them to Xvfb's default width.
         # Keep Xvfb from resetting while short-lived readiness probes disconnect
@@ -548,6 +672,49 @@ jobs:
           --server-args="-screen 0 1920x1080x24 -noreset"
           bash .github/scripts/run-linux-desktop-e2e.sh
           --shard=${{ matrix.lane }}/4
+          --retries=0
+
+      - name: Verify the E2E slice completed
+        if: steps.e2e-tests.outcome == 'success'
+        run: node scripts/ci/run-retry-failures.mjs e2e-first-verify
+
+      - name: Select failed E2E tests
+        id: e2e-selection
+        if: steps.e2e-tests.outcome == 'failure'
+        run: node scripts/ci/run-retry-failures.mjs e2e-prepare
+
+      - name: Retry failed E2E tests
+        id: e2e-retry
+        if: steps.e2e-tests.outcome == 'failure'
+        continue-on-error: true
+        env:
+          PWRAGENT_E2E_PREBUILT: "1"
+          PWRAGENT_CI_TEST_REPORT: ${{ github.workspace }}/.local/ci/retry/e2e-retry.json
+          PLAYWRIGHT_LAST_RUN_OUTPUT_FILE: ${{ github.workspace }}/.local/ci/retry/e2e-last.json
+        run: >-
+          xvfb-run --auto-servernum
+          --server-args="-screen 0 1920x1080x24 -noreset"
+          bash .github/scripts/run-linux-desktop-e2e.sh
+          --last-failed --retries=0 --trace=retain-on-failure
+
+      - name: Check E2E retry results
+        if: steps.e2e-tests.outcome == 'failure' && steps.e2e-selection.outcome == 'success'
+        env:
+          PWRAGENT_RETRY_OUTCOME: ${{ steps.e2e-retry.outcome }}
+        run: node scripts/ci/run-retry-failures.mjs e2e-verify
+
+      - name: Record retry slice
+        if: ${{ !cancelled() && always() }}
+        continue-on-error: true
+        uses: ./.github/actions/flake-slice
+        with:
+          kind: e2e
+          platform: linux
+          lane: ${{ matrix.lane }}
+          sample: 1
+          job-status: ${{ job.status }}
+          first-outcome: ${{ steps.e2e-tests.outcome }}
+          retry-outcome: ${{ steps.e2e-retry.outcome }}
 
       - name: Upload desktop Playwright artifacts
         uses: actions/upload-artifact@v7
@@ -558,6 +725,8 @@ jobs:
           path: |
             apps/desktop/playwright-report/
             apps/desktop/test-results/
+            .local/ci/retry/
+          include-hidden-files: true
           retention-days: 30
 
   desktop-e2e-result:
@@ -703,24 +872,55 @@ jobs:
         uses: ./.github/actions/select-xcode-for-actool
 
       - name: Test (unit)
+        id: unit-tests
+        continue-on-error: true
         env:
           # Require the icon compile check wherever Vitest assigns its suite.
           DEVELOPER_DIR: ${{ steps.xcode.outputs.developer-dir }}
           PWRAGENT_REQUIRE_ACTOOL: "1"
-        run: pnpm test --shard=${{ matrix.lane }}/4 --reporter=default --reporter=json --outputFile=.local/ci/macos-unit-results.json
+          PWRAGENT_CI_TEST_REPORT: ${{ github.workspace }}/.local/ci/retry/unit-first.json
+        run: pnpm test --shard=${{ matrix.lane }}/4 --reporter=default --reporter=json --reporter=./scripts/ci/vitest-ci-reporter.mjs --outputFile=.local/ci/macos-unit-results.json
+
+      - name: Verify the unit slice completed
+        id: unit-completion
+        if: steps.unit-tests.outcome == 'success'
+        run: node scripts/ci/run-retry-failures.mjs unit-verify
+
+      - name: Retry failed unit tests
+        id: unit-retry
+        if: steps.unit-tests.outcome == 'failure'
+        env:
+          DEVELOPER_DIR: ${{ steps.xcode.outputs.developer-dir }}
+          PWRAGENT_REQUIRE_ACTOOL: "1"
+        run: pnpm exec node scripts/ci/run-retry-failures.mjs unit
+
+      - name: Record retry slice
+        if: ${{ !cancelled() && always() }}
+        continue-on-error: true
+        uses: ./.github/actions/flake-slice
+        with:
+          kind: unit
+          platform: macos
+          lane: ${{ matrix.lane }}
+          sample: 1
+          job-status: ${{ job.status }}
+          first-outcome: ${{ steps.unit-tests.outcome }}
+          retry-outcome: ${{ steps.unit-retry.outcome }}
 
       - name: Upload unit timings
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: macos-unit-timings-lane-${{ matrix.lane }}
-          path: .local/ci/macos-unit-results.json
+          path: |
+            .local/ci/macos-unit-results.json
+            .local/ci/retry/
           include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 7
 
       - name: Upload failed unit shutdown probes
-        if: failure() || cancelled()
+        if: steps.unit-tests.outcome == 'failure' || steps.unit-completion.outcome == 'failure' || failure() || cancelled()
         uses: actions/upload-artifact@v7
         with:
           name: macos-unit-shutdown-probes-lane-${{ matrix.lane }}
@@ -753,8 +953,11 @@ jobs:
       # Indexing competes with dependency extraction and Electron startup on
       # fresh hosted VMs. Stop it before checkout can enqueue more work. The
       # same-run comparison and per-spec timings are recorded in
-      # docs/macos-desktop-e2e-timings.md.
+      # docs/macos-desktop-e2e-timings.md. This optional tuning must not gate
+      # tests when a hosted volume is still transitioning its indexing state.
       - name: Disable Spotlight indexing on the hosted VM
+        continue-on-error: true
+        timeout-minutes: 2
         run: |
           sudo mdutil -a -i off
           mdutil -a -s
@@ -780,12 +983,16 @@ jobs:
         # E2E keeps GPU coverage. test:e2e builds apps/desktop/out first.
         # The shutdown circuit is macOS-lane-only: two consecutive closes at
         # or above 4s (or requiring force-kill) stop this shard after cleanup.
+        id: e2e-tests
+        continue-on-error: true
         env:
           PWRAGENT_E2E_DISABLE_GPU: "1"
           PWRAGENT_E2E_SHUTDOWN_CIRCUIT_BREAKER: "1"
           # Same lane sizes as Linux and Windows; see the desktop-e2e
           # strategy comment.
           PWTEST_SHARD_WEIGHTS: "83:82:67:88"
+          PWRAGENT_CI_TEST_REPORT: ${{ github.workspace }}/.local/ci/retry/e2e-first.json
+          PLAYWRIGHT_LAST_RUN_OUTPUT_FILE: ${{ github.workspace }}/.local/ci/retry/e2e-last.json
         # The wrapper keeps a cancelled step alive until Playwright has closed
         # Electron, and kills Electron's main first if the runner escalates.
         # Without it, the runner's orphan reap killed the renderer under a
@@ -795,6 +1002,51 @@ jobs:
           exec bash ./scripts/ci/macos-e2e-run-lane.sh
           pnpm --filter @pwragent/desktop test:e2e
           --shard=${{ matrix.lane }}/4
+          --retries=0
+
+      - name: Verify the E2E slice completed
+        if: steps.e2e-tests.outcome == 'success'
+        run: node scripts/ci/run-retry-failures.mjs e2e-first-verify
+
+      - name: Select failed E2E tests
+        id: e2e-selection
+        if: steps.e2e-tests.outcome == 'failure'
+        env:
+          PWRAGENT_E2E_SHUTDOWN_CIRCUIT_BREAKER: "1"
+        run: node scripts/ci/run-retry-failures.mjs e2e-prepare
+
+      - name: Retry failed E2E tests
+        id: e2e-retry
+        if: steps.e2e-tests.outcome == 'failure'
+        continue-on-error: true
+        env:
+          PWRAGENT_E2E_DISABLE_GPU: "1"
+          PWRAGENT_E2E_SHUTDOWN_CIRCUIT_BREAKER: "1"
+          PWRAGENT_CI_TEST_REPORT: ${{ github.workspace }}/.local/ci/retry/e2e-retry.json
+          PLAYWRIGHT_LAST_RUN_OUTPUT_FILE: ${{ github.workspace }}/.local/ci/retry/e2e-last.json
+        run: >-
+          exec bash ./scripts/ci/macos-e2e-run-lane.sh
+          pnpm --filter @pwragent/desktop exec playwright test -c playwright.config.ts
+          --last-failed --retries=0 --trace=retain-on-failure
+
+      - name: Check E2E retry results
+        if: steps.e2e-tests.outcome == 'failure' && steps.e2e-selection.outcome == 'success'
+        env:
+          PWRAGENT_RETRY_OUTCOME: ${{ steps.e2e-retry.outcome }}
+        run: node scripts/ci/run-retry-failures.mjs e2e-verify
+
+      - name: Record retry slice
+        if: ${{ !cancelled() && always() }}
+        continue-on-error: true
+        uses: ./.github/actions/flake-slice
+        with:
+          kind: e2e
+          platform: macos
+          lane: ${{ matrix.lane }}
+          sample: 1
+          job-status: ${{ job.status }}
+          first-outcome: ${{ steps.e2e-tests.outcome }}
+          retry-outcome: ${{ steps.e2e-retry.outcome }}
 
       - name: Upload macOS Playwright artifacts
         uses: actions/upload-artifact@v7
@@ -805,6 +1057,8 @@ jobs:
           path: |
             apps/desktop/playwright-report/
             apps/desktop/test-results/
+            .local/ci/retry/
+          include-hidden-files: true
           retention-days: 30
 
   windows-e2e:
@@ -868,10 +1122,17 @@ jobs:
             throw "Official Handle signature verification failed; diagnostics will be unavailable."
           }
           "PWRAGENT_WINDOWS_HANDLE_EXE=$diagnosticHandlePath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          $diagnosticCdbPath = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\Debuggers\x64\cdb.exe"
-          $diagnosticCdbSignature = Get-AuthenticodeSignature -LiteralPath $diagnosticCdbPath
-          if ($diagnosticCdbSignature.Status -ne "Valid" -or $diagnosticCdbSignature.SignerCertificate.Subject -notmatch "(^|, )O=Microsoft Corporation(,|$)") {
-            throw "Installed CDB signature verification failed; native stacks will be unavailable."
+          # Run the debugger from the runner temp volume. CDB's startup loads its
+          # engine and extension packages from disk inside a 5 s readiness
+          # check, and the OS volume (C:) stalls for minutes at a time.
+          $diagnosticDebuggerDirectory = Join-Path $env:RUNNER_TEMP "pwragent-cdb"
+          Copy-Item -LiteralPath (Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\Debuggers\x64") -Destination $diagnosticDebuggerDirectory -Recurse -Force
+          $diagnosticCdbPath = Join-Path $diagnosticDebuggerDirectory "cdb.exe"
+          foreach ($diagnosticDebuggerFile in @($diagnosticCdbPath, (Join-Path $diagnosticDebuggerDirectory "dbgeng.dll"))) {
+            $diagnosticCdbSignature = Get-AuthenticodeSignature -LiteralPath $diagnosticDebuggerFile
+            if ($diagnosticCdbSignature.Status -ne "Valid" -or $diagnosticCdbSignature.SignerCertificate.Subject -notmatch "(^|, )O=Microsoft Corporation(,|$)") {
+              throw "Installed CDB signature verification failed; native stacks will be unavailable."
+            }
           }
           "PWRAGENT_WINDOWS_CDB_EXE=$diagnosticCdbPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
@@ -884,11 +1145,67 @@ jobs:
         # `parallel` mode) and the same weights. A Windows-only failure is
         # then attributable to Windows and not to a different lane split.
         # See the desktop-e2e strategy comment.
+        #
+        # TEMP and TMP move every fixture root, Electron profile, state
+        # database and app-spawned temp file off the OS volume (C:) onto the
+        # runner temp volume, beside the checkout. C: stalls disk I/O for
+        # minutes at a time; Electron's main process then outlives its quit
+        # in CreateFile/FlushFileBuffers and keeps the launcher pipe open.
+        # scripts/windows-e2e-temp-volume-workflow.test.mjs holds the evidence.
+        id: e2e-tests
+        continue-on-error: true
         env:
           PWTEST_SHARD_WEIGHTS: "83:82:67:88"
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          PWRAGENT_CI_TEST_REPORT: ${{ github.workspace }}/.local/ci/retry/e2e-first.json
+          PLAYWRIGHT_LAST_RUN_OUTPUT_FILE: ${{ github.workspace }}/.local/ci/retry/e2e-last.json
         run: >-
           pnpm ${{ contains(github.event.pull_request.labels.*.name, 'ci:windows-shutdown-diagnostics') && 'test:desktop-e2e:windows-diagnostics' || 'test:desktop-e2e' }}
           --shard=${{ matrix.lane }}/4
+          --retries=0
+
+      - name: Verify the E2E slice completed
+        if: steps.e2e-tests.outcome == 'success'
+        run: node scripts/ci/run-retry-failures.mjs e2e-first-verify
+
+      - name: Select failed E2E tests
+        id: e2e-selection
+        if: steps.e2e-tests.outcome == 'failure'
+        run: node scripts/ci/run-retry-failures.mjs e2e-prepare
+
+      - name: Retry failed E2E tests
+        id: e2e-retry
+        if: steps.e2e-tests.outcome == 'failure'
+        continue-on-error: true
+        env:
+          PWRAGENT_E2E_PREBUILT: "1"
+          PWRAGENT_CI_TEST_REPORT: ${{ github.workspace }}/.local/ci/retry/e2e-retry.json
+          PLAYWRIGHT_LAST_RUN_OUTPUT_FILE: ${{ github.workspace }}/.local/ci/retry/e2e-last.json
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+        run: >-
+          pnpm ${{ contains(github.event.pull_request.labels.*.name, 'ci:windows-shutdown-diagnostics') && 'test:desktop-e2e:windows-diagnostics' || '--filter @pwragent/desktop exec playwright test -c playwright.config.ts' }}
+          --last-failed --retries=0 --trace=retain-on-failure
+
+      - name: Check E2E retry results
+        if: steps.e2e-tests.outcome == 'failure' && steps.e2e-selection.outcome == 'success'
+        env:
+          PWRAGENT_RETRY_OUTCOME: ${{ steps.e2e-retry.outcome }}
+        run: node scripts/ci/run-retry-failures.mjs e2e-verify
+
+      - name: Record retry slice
+        if: ${{ !cancelled() && always() }}
+        continue-on-error: true
+        uses: ./.github/actions/flake-slice
+        with:
+          kind: e2e
+          platform: windows
+          lane: ${{ matrix.lane }}
+          sample: ${{ matrix.sample }}
+          job-status: ${{ job.status }}
+          first-outcome: ${{ steps.e2e-tests.outcome }}
+          retry-outcome: ${{ steps.e2e-retry.outcome }}
 
       - name: Upload desktop Playwright artifacts
         uses: actions/upload-artifact@v7
@@ -898,4 +1215,33 @@ jobs:
           path: |
             apps/desktop/playwright-report/
             apps/desktop/test-results/
+            .local/ci/retry/
+          include-hidden-files: true
+          retention-days: 30
+
+  flake-report:
+    name: Consolidate test retries
+    runs-on: ubuntu-latest
+    needs: [changes, test, test-macos, windows-desktop-main, windows-renderer-packages, desktop-e2e, desktop-e2e-macos, windows-e2e]
+    if: ${{ always() && !cancelled() && needs.changes.outputs.code_impacting == 'true' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Download compact slice reports
+        uses: actions/download-artifact@v8
+        with:
+          pattern: flake-slice-${{ github.run_attempt }}-*
+          path: .local/ci/flake-slices
+      - name: Consolidate reports
+        env:
+          FLAKE_SAMPLES: ${{ contains(github.event.pull_request.labels.*.name, 'ci:windows-shutdown-diagnostics') && '3' || '1' }}
+          FLAKE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: node scripts/ci/write-flake-report.mjs aggregate
+      - name: Upload consolidated report
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-flake-report-${{ github.run_attempt }}
+          path: .local/ci/flake-report/
+          include-hidden-files: true
+          if-no-files-found: error
           retention-days: 30

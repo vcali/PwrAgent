@@ -2,12 +2,12 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import fc from "fast-check";
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page } from "./fixtures/electron-test";
 import { launchElectronApp } from "./fixtures/electron-app";
 import { stateDbPathForHomeRoot } from "./fixtures/readme-state-seeding";
 import { StateDb } from "../src/main/state/state-db";
 import { ThreadTodoService } from "../src/main/thread-todos/thread-todo-service";
-import { ThreadTodoStore } from "../src/main/thread-todos/thread-todo-store";
+import { ThreadTodoStore } from "../src/main/storage/thread-todo-store";
 
 type Labels = { chip: string; machineLine: string; title: string; branch: string; project: string; machine: string };
 

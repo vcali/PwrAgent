@@ -1,5 +1,7 @@
+import { projectClaudeSessionThread } from "@pwragent/owner-core/claude-profile-storage";
 import { createHash, randomUUID } from "node:crypto";
 import { readFile, rm } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
@@ -19,6 +21,8 @@ import type {
 import { getMainLogger } from "../log";
 import { resolveActiveProfilePath } from "../profile";
 import { toTranscriptImageProtocolUrl } from "../transcript-image-protocol";
+import { ClaudeSessionReaderError, type ClaudeSessionReader, type ClaudeSessionReads } from "./claude-session-reader";
+import { buildClaudeSessionPrimer } from "./claude-session-primer";
 import { CLAUDE_SETUP_INSTRUCTIONS, claudeEnvironment, inspectClaudeInstallation, type ClaudeInstallation } from "./claude-executable";
 import {
   CLAUDE_EXIT_PLAN_TOOL, claudeAllowedTools, createClaudePermissionHandler, claudePermissionMode,
@@ -37,7 +41,9 @@ import { backUpRewindFiles, recordRewoundFiles, restoreRewindFiles } from "./cla
 import { ClaudeSessionStore, type ClaudeSession } from "./claude-session-store";
 import { ClaudeSessionWakeTracker, claudeSessionWakeHooks } from "./claude-session-wakes";
 import { claudeSelfStartedTurn, claudeSelfStartedTurnHooks, type ClaudeSelfStartedTurn } from "./claude-self-started-turns";
-import { ClaudeTaskTracker, claudeTaskRow, type ClaudeTaskSettlement } from "./claude-tasks";
+import {
+  ClaudeTaskTracker, claudeTaskRow, isClaudeSubAgentTask, type ClaudeSubAgentCard, type ClaudeTaskSettlement,
+} from "./claude-tasks";
 import {
   CLAUDE_ARTIFACT_TOOLS, CLAUDE_TODO_TOOL, claudeArtifactAction, claudeArtifactResult, claudeArtifactShowsOutput,
   claudeFileDiff, claudeShellCommand, claudeTodoSteps, claudeToolCallArguments, claudeToolCallDetail, claudeToolDetail,
@@ -55,10 +61,13 @@ import type { NamedReviewPullRequest } from "../../shared/review-command";
 import { formatReviewOutputText, reviewEntryFindings } from "../../shared/review-output";
 
 export type ClaudeBackendOptions = {
+  assertOwnerAdmission?: () => void;
   store?: ClaudeSessionStore;
   query?: typeof query;
   getSessionInfo?: typeof getSessionInfo;
   getSessionMessages?: typeof getSessionMessages;
+  /** Session reads for a Claude launched under another CLAUDE_CONFIG_DIR. */
+  openSessionReader?: (env: NodeJS.ProcessEnv) => ClaudeSessionReader;
   inspectInstallation?: typeof inspectClaudeInstallation;
   discoverModels?: typeof discoverClaudeModels;
   readCommands?: (params: { executable: string; env: NodeJS.ProcessEnv; cwd: string }) => Promise<SlashCommand[]>;
@@ -96,6 +105,11 @@ export type ClaudeBackendOptions = {
    * False lets the turn run.
    */
   holdSelfStartedTurn?: (params: ClaudeSelfStartedTurn & { threadId: string }) => Promise<boolean>;
+  /**
+   * Saves the Sub-agents cards for Claude's own sub-agents (Agent tool
+   * tasks). Called with the cards that changed, as each one starts and ends.
+   */
+  recordSubAgents?: (params: { threadId: string; subAgents: ClaudeSubAgentCard[] }) => Promise<void>;
 };
 
 const claudeBackendLog = getMainLogger("pwragent:claude-backend");
@@ -130,14 +144,41 @@ function claudeResultFailure(message: SDKResultMessage): string | undefined {
 const CLAUDE_SESSION_CLEANUP_NOTE = "Claude Code deletes sessions that have been idle longer than its "
   + "cleanupPeriodDays setting (30 days by default). This thread's transcript is still here.";
 
+const CLAUDE_CONTINUE_NOTE = "Choose Continue in a new session to carry on "
+  + "with this thread's own record of the conversation.";
+
 export const CLAUDE_SESSION_GONE_MESSAGE = "Claude no longer has this conversation, so it cannot continue it. "
-  + `${CLAUDE_SESSION_CLEANUP_NOTE} Start a new thread to keep working.`;
+  + `${CLAUDE_SESSION_CLEANUP_NOTE} ${CLAUDE_CONTINUE_NOTE}`;
 
 export const CLAUDE_FORK_SOURCE_GONE_MESSAGE = "Claude no longer has the conversation this thread was forked from, "
-  + `so it cannot continue it. ${CLAUDE_SESSION_CLEANUP_NOTE} Start a new thread to keep working.`;
+  + `so it cannot continue it. ${CLAUDE_SESSION_CLEANUP_NOTE} ${CLAUDE_CONTINUE_NOTE}`;
+
+export const CLAUDE_SESSION_STILL_PRESENT_MESSAGE = "Claude still has this conversation. Send your message again to continue it.";
 
 export const CLAUDE_SESSION_GONE_REWIND_MESSAGE = "Claude no longer has this conversation, so it cannot rewind it. "
   + CLAUDE_SESSION_CLEANUP_NOTE;
+
+/**
+ * Whether the SDK's session reads (`getSessionInfo`, `getSessionMessages`)
+ * see the sessions of a Claude launched with `env`. They read this process's
+ * CLAUDE_CONFIG_DIR (default `~/.claude`), not `Options.env`, and the SDK has
+ * no option to point them elsewhere.
+ */
+function claudeSessionReadsSee(env: NodeJS.ProcessEnv | undefined): boolean {
+  const configDir = (value: string | undefined) => path.resolve(value ?? path.join(homedir(), ".claude"));
+  return configDir(env?.CLAUDE_CONFIG_DIR) === configDir(process.env.CLAUDE_CONFIG_DIR);
+}
+
+/** True only when Claude has no file for the session in any project folder. */
+async function claudeSessionGone(sdkSessionId: string, reader: ClaudeSessionReads): Promise<boolean> {
+  try {
+    return await reader.getSessionInfo(sdkSessionId) === undefined;
+  } catch (error) {
+    // A failed reader knows nothing of the session; say why it failed.
+    if (error instanceof ClaudeSessionReaderError) throw error;
+    return false;
+  }
+}
 
 /**
  * Resuming a deleted session fails before the session starts, with this
@@ -359,9 +400,11 @@ type LiveSession = {
   titleEnv?: NodeJS.ProcessEnv;
   /** Shell commands and sub-agents this process runs. */
   tasks: ClaudeTaskTracker;
-  /** The rows last published through `thread/backgroundTasks/updated`. */
+  /** The rows last published through `thread/backgroundTasks/updated`: commands only. */
   publishedTasks: AppServerBackgroundTask[];
   publishedTaskKey: string;
+  /** Each sub-agent card as last recorded, keyed by monitor id. */
+  recordedSubAgentKeys: Map<string, string>;
   /** Turns Claude scheduled in this process: /loop wake-ups and session crons. */
   sessionWakes: ClaudeSessionWakeTracker;
   /** The set last published through `thread/sessionWakes/updated`. */
@@ -619,6 +662,7 @@ export class ClaudeBackend {
         // Claude runs no reviews itself, but this owner accepts a run mode
         // for a Claude thread whose review runs on another provider.
         reviewRunMode: true,
+        reviewAutoFix: true,
         // File checkpoints restore what Edit, Write, and NotebookEdit changed.
         threadRewind: { files: true, undo: true },
       },
@@ -725,21 +769,70 @@ export class ClaudeBackend {
    * the saved mode does not. Undefined when no process is open.
    */
   liveExecutionMode(threadId: string): ThreadExecutionMode | undefined {
-    const live = this.sessions.get(threadId);
-    return live ? threadExecutionModeForClaudePermission(live.config.permissionMode) : undefined;
+    const mode = this.livePermissionMode(threadId);
+    return mode ? threadExecutionModeForClaudePermission(mode) : undefined;
   }
 
-  async listThreads(params: { archived?: boolean; filter?: string } = {}): Promise<AppServerThreadSummary[]> {
+  /** Keep plan distinct for callers that must refuse writes rather than ask. */
+  livePermissionMode(threadId: string): Options["permissionMode"] {
+    return this.sessions.get(threadId)?.config.permissionMode;
+  }
+
+  /** See `ClaudeSessionStore.changeToken`. */
+  async archiveCleanupChangeToken(): Promise<string> {
+    return await this.store.changeToken();
+  }
+
+  async listThreads(params: { archived?: boolean; filter?: string; requireComplete?: boolean } = {}): Promise<AppServerThreadSummary[]> {
     const filter = params.filter?.toLowerCase();
-    // Metadata from builds that could not move a Claude thread still carries
-    // their refusal; this build can, so drop it. The working directory is the
-    // thread's `projectKey`, as Codex reports it: it names which linked
-    // directory is the thread's home once `@`-referenced ones join it.
-    return (await this.store.list()).map(({ cwd, thread: { workspaceHandoff: _refusal, ...thread } }) => ({
-      ...thread, projectKey: cwd,
-      threadStatus: this.sessions.get(thread.id)?.turn ? "active" as const : "idle" as const,
-    })).filter((thread) => Boolean(thread.archivedAt) === Boolean(params.archived)
-      && (!filter || thread.title.toLowerCase().includes(filter) || thread.id.includes(filter)));
+    return (await this.store.list({ requireComplete: params.requireComplete })).map((session) => this.threadSummary(session))
+      .filter((thread) => Boolean(thread.archivedAt) === Boolean(params.archived)
+        && (!filter || thread.title.toLowerCase().includes(filter) || thread.id.includes(filter)));
+  }
+
+  /** One stored thread, as listThreads reports it, or undefined when its
+   * metadata is gone or unreadable. */
+  async readThreadSummary(threadId: string): Promise<AppServerThreadSummary | undefined> {
+    try {
+      return this.threadSummary(await this.store.read(threadId));
+    } catch {
+      return undefined;
+    }
+  }
+
+  private threadDeletionBusy(threadId: string): boolean {
+    return this.sessions.has(threadId) || this.starting.has(threadId)
+      || this.rewinding.has(threadId) || this.rewindQueries.has(threadId);
+  }
+
+  /** Only a missing metadata file confirms absence; unreadable state retains recovery material. */
+  async confirmThreadAbsent(threadId: string): Promise<boolean> {
+    return await this.store.withMutation(threadId, async () => {
+      if (this.threadDeletionBusy(threadId)) return false;
+      try { await this.store.read(threadId); return false; }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      if (this.threadDeletionBusy(threadId)) return false;
+      await this.store.delete(threadId);
+      return true;
+    });
+  }
+
+  /** The registry owns retention, checkout ownership and lifecycle admission. */
+  async deleteThread(threadId: string): Promise<void> {
+    await this.store.withMutation(threadId, async () => {
+      if (this.threadDeletionBusy(threadId)) throw new Error("Claude is still using this thread.");
+      const session = await this.store.read(threadId);
+      if (session.thread.archivedAt === undefined) throw new Error("Archive this Claude thread before deleting it.");
+      if (this.threadDeletionBusy(threadId)) throw new Error("Claude is still using this thread.");
+      await this.store.delete(threadId);
+    });
+    await this.emit({ method: "thread/deleted", params: { threadId } });
+  }
+
+  private threadSummary(session: ClaudeSession): AppServerThreadSummary {
+    return projectClaudeSessionThread(session, Boolean(this.sessions.get(session.thread.id)?.turn));
   }
 
   /**
@@ -794,9 +887,11 @@ export class ClaudeBackend {
     }
     // Only Claude's own scheduled wakes keep this process; archiving ends them.
     if (live) await this.closeSession(live);
-    const session = await this.store.read(threadId);
-    session.thread.archivedAt = archived ? Date.now() : undefined;
-    await this.store.save(session);
+    await this.store.withMutation(threadId, async () => {
+      const session = await this.store.read(threadId);
+      session.thread.archivedAt = archived ? Date.now() : undefined;
+      await this.store.save(session);
+    });
   }
 
   /**
@@ -924,12 +1019,19 @@ export class ClaudeBackend {
       const executable = await this.requireInstallation();
       const session = await this.store.read(threadId);
       if (session.thread.archivedAt) throw new Error("Restore this Claude thread before sending a message.");
-      const content = await claudeInput(params.input);
+      const prompted = await claudeInput(params.input);
+      // After a deleted session, the new one opens with the thread's own
+      // record of the conversation. Read before this turn's message joins it.
+      const primer = session.primerPending && !session.ephemeral && !session.sdkSessionId && !session.forkFromSdkSessionId
+        ? buildClaudeSessionPrimer(await this.store.entries(threadId))
+        : undefined;
+      const content: SDKUserMessage["message"]["content"] = !primer ? prompted
+        : [{ type: "text", text: primer }, ...typeof prompted === "string" ? [{ type: "text" as const, text: prompted }] : prompted];
       controller.signal.throwIfAborted();
       const current: LiveSession = live = {
         session, controller, input: new ClaudeInputStream(), inputWrites: Promise.resolve(),
         config: claudeSessionConfig(params, session), turn, lastTurnId: turn.turnId, onClosed: [],
-        tasks: new ClaudeTaskTracker(), publishedTasks: [], publishedTaskKey: "[]", toolRows: new Map(), launchedToolUseIds: new Set(),
+        tasks: new ClaudeTaskTracker(), publishedTasks: [], publishedTaskKey: "[]", recordedSubAgentKeys: new Map(), toolRows: new Map(), launchedToolUseIds: new Set(),
         sessionWakes: new ClaudeSessionWakeTracker(), publishedWakeKey: "[]",
         messageSeq: 0, lastResultSeq: 0, lastActivitySeq: 0, lastNotificationSeq: 0, heldSelfStarts: 0,
         wake: claudeWakeSignal(), stderr: "",
@@ -951,7 +1053,9 @@ export class ClaudeBackend {
       // prompt leaves the thread with no session to resume, and that id is
       // taken, so the next session gets its own.
       // An ephemeral session has no file to resume, so each launch starts fresh.
-      const freshSdkSessionId = session.rewinds?.length || session.ephemeral ? randomUUID() : threadId;
+      // A deleted session's id may still be Claude's: never reuse it.
+      const freshSdkSessionId = session.rewinds?.length || session.sessionRestarts?.length || session.ephemeral
+        ? randomUUID() : threadId;
       const resumedSdkSessionId = session.ephemeral ? undefined : session.sdkSessionId ?? session.forkFromSdkSessionId;
       if (resumedSdkSessionId) current.resumed = { sdkSessionId: resumedSdkSessionId, fork: !session.sdkSessionId };
       const sdkOptions: Options = {
@@ -1030,6 +1134,7 @@ export class ClaudeBackend {
           message: { role: "user", content } };
         yield* input;
       }
+      this.options.assertOwnerAdmission?.();
       current.query = (this.options.query ?? query)({ prompt: prompt(), options: sdkOptions });
       // Older PwrAgent metadata has no cost baseline. Read the official
       // session totals before releasing the prompt, so this turn cannot race
@@ -1369,6 +1474,9 @@ export class ClaudeBackend {
             current.sdkSessionId = message.session_id;
             delete current.resumeSessionAt;
             delete current.forkFromSdkSessionId;
+            // The new session now holds the primer; later turns resume it.
+            delete current.primerPending;
+            session.primerPending = undefined;
             if (newSession) delete current.sdkSessionDir;
             await this.store.save(current);
             // A new turn ends every rewind's undo; drop the files kept for one.
@@ -1637,9 +1745,12 @@ export class ClaudeBackend {
     catch (error) { failure ??= claudeExceptionMessage(error, live.stderr); }
     const cancelled = live.controller.signal.aborted;
     await this.closeOrphanedTaskRows(live, cancelled);
+    // Claude's sub-agents end with its process.
+    live.tasks.endRunningSubAgents(cancelled ? "stopped" : "failed");
+    await this.recordSubAgents(live);
     const release = async () => {
       if (this.sessions.get(threadId) === live) this.sessions.delete(threadId);
-      if (live.publishedTasks.length > 0) {
+      if (live.publishedTaskKey !== "[]") {
         live.publishedTasks = [];
         live.publishedTaskKey = "[]";
         await this.emit({ method: "thread/backgroundTasks/updated", params: { threadId, tasks: [] } });
@@ -1734,8 +1845,10 @@ export class ClaudeBackend {
           id: turnId, status: "cancelled", startedAt: turn.startedAt,
         } } });
       } else if (failure) {
+        const recovery = failure === CLAUDE_SESSION_GONE_MESSAGE || failure === CLAUDE_FORK_SOURCE_GONE_MESSAGE
+          ? { recovery: "claudeSessionGone" as const } : {};
         await this.emit({ method: "turn/failed", params: { threadId, turnId, turn: {
-          id: turnId, status: "failed", startedAt: turn.startedAt, error: { message: failure },
+          id: turnId, status: "failed", startedAt: turn.startedAt, error: { message: failure, ...recovery },
         } } });
       } else {
         await this.emit({ method: "turn/completed", params: { threadId, turnId, turn: {
@@ -1827,13 +1940,44 @@ export class ClaudeBackend {
     if (settled) await this.settleTaskToolCall(live, settled);
   }
 
+  /**
+   * Commands go to the Actions panel; sub-agents go to the Sub-agents panel
+   * as cards. A running sub-agent still keeps the thread working, so a change
+   * in which ones run republishes the set even when its rows are unchanged.
+   */
   private async publishTasks(live: LiveSession): Promise<void> {
+    await this.recordSubAgents(live);
     const tasks = this.taskRows(live);
-    const key = JSON.stringify(tasks);
+    const runningSubAgents = live.tasks.active().filter(isClaudeSubAgentTask).map((task) => task.taskId);
+    // "[]" is the empty set, which `backgroundTaskThreadIds` reads.
+    const key = tasks.length === 0 && runningSubAgents.length === 0 ? "[]" : JSON.stringify({ tasks, runningSubAgents });
     if (key === live.publishedTaskKey) return;
     live.publishedTasks = tasks;
     live.publishedTaskKey = key;
     await this.emit({ method: "thread/backgroundTasks/updated", params: { threadId: live.session.thread.id, tasks } });
+  }
+
+  /**
+   * Records the sub-agent cards that changed since the last record. A card
+   * counts as recorded only once its write succeeds, so a failed write is
+   * retried with the next task event or when the session closes.
+   */
+  private async recordSubAgents(live: LiveSession): Promise<void> {
+    if (!this.options.recordSubAgents) return;
+    const changed = live.tasks.subAgentCards().flatMap((card) => {
+      const key = JSON.stringify(card);
+      return live.recordedSubAgentKeys.get(card.monitorId) === key ? [] : [{ card, key }];
+    });
+    if (changed.length === 0) return;
+    try {
+      await this.options.recordSubAgents({
+        threadId: live.session.thread.id, subAgents: changed.map(({ card }) => card),
+      });
+      for (const { card, key } of changed) live.recordedSubAgentKeys.set(card.monitorId, key);
+    } catch (error) {
+      // A card is a view of the task; the task itself goes on.
+      claudeBackendLog.warn("Could not record Claude sub-agents", { threadId: live.session.thread.id, error });
+    }
   }
 
   /**
@@ -1863,8 +2007,8 @@ export class ClaudeBackend {
     await this.emit({ method: "thread/sessionWakes/updated", params: { threadId: live.session.thread.id, wakes } });
   }
 
-  private taskRows(live: LiveSession): AppServerBackgroundTask[] {
-    return live.tasks.active().map((task) => {
+  private taskRows(live: LiveSession, tasks = live.tasks.actionTasks()): AppServerBackgroundTask[] {
+    return tasks.map((task) => {
       const row = task.toolUseId ? live.toolRows.get(task.toolUseId) : undefined;
       const command = claudeShellCommand(row?.entry.details[0]);
       return claudeTaskRow(task, { cwd: live.session.cwd, ...(command !== undefined ? { command } : {}) });
@@ -1915,9 +2059,28 @@ export class ClaudeBackend {
     return this.sessions.get(threadId)?.sessionWakes.pending() ?? [];
   }
 
-  /** Commands and sub-agents Claude is running for the thread. */
+  /** Commands Claude is running for the thread. Its sub-agents are cards instead. */
   listBackgroundTasks(threadId: string): { supported: true; terminals: AppServerBackgroundTask[] } {
     return { supported: true, terminals: this.sessions.get(threadId)?.publishedTasks ?? [] };
+  }
+
+  /** Commands and sub-agents Claude is running for the thread. */
+  activeTaskCount(threadId: string): number {
+    return this.sessions.get(threadId)?.tasks.active().length ?? 0;
+  }
+
+  /**
+   * Everything Claude continues the thread after, for Waiting For: its
+   * commands and its sub-agents. Actions lists only the commands.
+   */
+  listWaitingTasks(threadId: string): AppServerBackgroundTask[] {
+    const live = this.sessions.get(threadId);
+    return live ? this.taskRows(live, live.tasks.active()) : [];
+  }
+
+  /** Whether Claude's live process is running the task. */
+  runsTask(threadId: string, taskId: string): boolean {
+    return this.sessions.get(threadId)?.tasks.active().some((task) => task.taskId === taskId) ?? false;
   }
 
   /** Stops one task. Claude reports the stop through the task's notification. */
@@ -1943,13 +2106,13 @@ export class ClaudeBackend {
   }
 
   /**
-   * Threads with published background tasks. Each change to that set emits
-   * `thread/backgroundTasks/updated`, including the clear when the session
-   * closes, so navigation can follow it without polling.
+   * Threads running background commands or sub-agents. Each change to that
+   * set emits `thread/backgroundTasks/updated`, including the clear when the
+   * session closes, so navigation can follow it without polling.
    */
   backgroundTaskThreadIds(): string[] {
     return [...this.sessions]
-      .filter(([, live]) => live.publishedTasks.length > 0)
+      .filter(([, live]) => live.publishedTaskKey !== "[]")
       .map(([threadId]) => threadId);
   }
 
@@ -1960,14 +2123,15 @@ export class ClaudeBackend {
     try {
       let current = await this.store.read(threadId);
       if (current.thread.titleSource === "explicit" || !session.sdkSessionId || live.controller.signal.aborted) return false;
-      // getSessionInfo uses the SDK host's config directory, not Options.env.
-      // Do not inspect a different account's session store.
+      // Do not inspect a different account's session store. A session
+      // reader would start a process at every turn's end for a title the
+      // query's own title control also supplies.
       // The SDK may spawn Git in this workspace (with its own timeout).
       // Unlike query telemetry, this read cannot be cancelled by closing the
       // query. Keep it owned by the turn so shutdown cannot release the
       // workspace while an abandoned read still holds its directory open.
       let title: string | undefined;
-      if (live.titleEnv?.CLAUDE_CONFIG_DIR === process.env.CLAUDE_CONFIG_DIR) {
+      if (claudeSessionReadsSee(live.titleEnv)) {
         try {
           const info = await (this.options.getSessionInfo ?? getSessionInfo)(session.sdkSessionId, {
             dir: session.sdkSessionDir ?? session.cwd,
@@ -2864,12 +3028,79 @@ export class ClaudeBackend {
    */
   private async rewindPoint(session: ClaudeSession, target: ThreadRewindTarget): Promise<ClaudeRewindPoint> {
     if (!session.sdkSessionId) throw new Error("Claude has no conversation to rewind yet.");
+    const sdkSessionId = session.sdkSessionId;
+    return await this.withSessionReader(async (reader) => await this.findRewindPoint(session, sdkSessionId, target, reader));
+  }
+
+  /**
+   * Run SDK session reads where Claude's environment applies. The SDK's reads
+   * see this process's account, not the one turns launch with, and another
+   * account's store would read as a missing prompt or a deleted session.
+   */
+  private async withSessionReader<T>(work: (reader: ClaudeSessionReads) => Promise<T>): Promise<T> {
+    const env = claudeEnvironment(await this.options.resolveEnv?.() ?? process.env);
+    const reader: ClaudeSessionReader = claudeSessionReadsSee(env)
+      ? {
+        getSessionMessages: this.options.getSessionMessages ?? getSessionMessages,
+        getSessionInfo: this.options.getSessionInfo ?? getSessionInfo,
+        close: () => {},
+      }
+      : this.openSessionReader(env);
+    try {
+      return await work(reader);
+    } finally {
+      reader.close();
+    }
+  }
+
+  /**
+   * Continue a thread whose Claude session Claude Code deleted. The gone
+   * session is forgotten and the next one opens with the thread's own record
+   * of the conversation. Refused while Claude still has the session, so a
+   * live conversation is never dropped.
+   */
+  async continueInNewSession(threadId: string): Promise<{ threadId: string }> {
+    const busy = () => this.sessions.has(threadId) || this.starting.has(threadId)
+      || this.rewinding.has(threadId) || this.rewindQueries.has(threadId);
+    if (busy()) throw new ClaudeTurnActiveError("Wait for Claude to finish with this thread first.");
+    const session = await this.store.read(threadId);
+    if (session.ephemeral) throw new Error("This thread has no Claude session to replace.");
+    const previous = session.sdkSessionId ?? session.forkFromSdkSessionId;
+    if (!previous) throw new Error("This thread has no Claude session to replace.");
+    if (!await this.withSessionReader(async (reader) => await claudeSessionGone(previous, reader))) {
+      throw new Error(CLAUDE_SESSION_STILL_PRESENT_MESSAGE);
+    }
+    if (busy()) throw new ClaudeTurnActiveError("Wait for Claude to finish with this thread first.");
+    const current = await this.store.read(threadId);
+    if ((current.sdkSessionId ?? current.forkFromSdkSessionId) !== previous) {
+      throw new Error("This thread's Claude session changed. Send your message again.");
+    }
+    current.sessionRestarts = [...current.sessionRestarts ?? [], { at: Date.now(), previousSdkSessionId: previous }];
+    current.primerPending = true;
+    delete current.sdkSessionId;
+    delete current.forkFromSdkSessionId;
+    delete current.resumeSessionAt;
+    delete current.sdkSessionDir;
+    await this.store.save(current);
+    claudeBackendLog.info("Claude thread continues in a new session", { threadId, previousSdkSessionId: previous });
+    return { threadId };
+  }
+
+  private openSessionReader(env: NodeJS.ProcessEnv): ClaudeSessionReader {
+    if (!this.options.openSessionReader) {
+      throw new Error("Claude's conversation could not be read: it is under another CLAUDE_CONFIG_DIR.");
+    }
+    return this.options.openSessionReader(env);
+  }
+
+  private async findRewindPoint(
+    session: ClaudeSession, sdkSessionId: string, target: ThreadRewindTarget, reader: ClaudeSessionReads,
+  ): Promise<ClaudeRewindPoint> {
     const promptUuid = target.messageId.startsWith("user:") ? target.messageId.slice("user:".length) : undefined;
-    const read = this.options.getSessionMessages ?? getSessionMessages;
-    const local = await read(session.sdkSessionId, { dir: session.sdkSessionDir ?? session.cwd });
+    const local = await reader.getSessionMessages(sdkSessionId, { dir: session.sdkSessionDir ?? session.cwd });
     // An undone rewind can return to a session written before an earlier
     // move, so search every project folder when the expected one lacks it.
-    const messages = (local.length > 0 ? local : await read(session.sdkSessionId))
+    const messages = (local.length > 0 ? local : await reader.getSessionMessages(sdkSessionId))
       .filter((message) => message.parent_tool_use_id === null);
     const index = promptUuid ? messages.findIndex((message) => message.uuid === promptUuid && message.type === "user") : -1;
     // A pending rewind already dropped the entries after its point.
@@ -2879,11 +3110,12 @@ export class ClaudeBackend {
     if (!promptUuid || index < 0 || (resumeIndex >= 0 && index > resumeIndex)) {
       // A deleted session reads as empty. Search every project folder before
       // saying so, since an empty read alone also fits an unreadable file.
-      if (messages.length === 0 && await this.claudeSessionGone(session.sdkSessionId)) {
+      if (messages.length === 0 && await claudeSessionGone(sdkSessionId, reader)) {
         throw new Error(CLAUDE_SESSION_GONE_REWIND_MESSAGE);
       }
       throw new Error("Claude's conversation does not have this prompt, so it cannot rewind to before it. "
-        + "Prompts sent before rewind support, or before Claude compacted the conversation, cannot be rewound.");
+        + "Prompts sent before rewind support, or before Claude compacted the conversation, cannot be rewound."
+        + (session.sessionRestarts?.length ? " Neither can prompts from before the thread continued in a new Claude session." : ""));
     }
     return {
       promptUuid,
@@ -2891,15 +3123,6 @@ export class ClaudeBackend {
       // A pending rewind already ends the conversation at its point.
       leafUuid: session.resumeSessionAt ?? messages.at(-1)?.uuid,
     };
-  }
-
-  /** True only when Claude has no file for the session in any project folder. */
-  private async claudeSessionGone(sdkSessionId: string): Promise<boolean> {
-    try {
-      return await (this.options.getSessionInfo ?? getSessionInfo)(sdkSessionId) === undefined;
-    } catch {
-      return false;
-    }
   }
 
   /**
@@ -2932,6 +3155,7 @@ export class ClaudeBackend {
     const executable = await this.requireInstallation();
     const env = claudeEnvironment(await this.options.resolveEnv?.() ?? process.env);
     const input = new ClaudeInputStream();
+    this.options.assertOwnerAdmission?.();
     const control = (this.options.query ?? query)({
       prompt: input,
       options: {

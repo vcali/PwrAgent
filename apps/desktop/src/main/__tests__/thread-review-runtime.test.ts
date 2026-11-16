@@ -7,9 +7,16 @@ import { getThreadReviewService } from "../thread-reviews/thread-review-runtime"
 import {
   getThreadTodoService,
   installThreadTodoRuntime,
+  readProjectMergeMethodPreference,
   resetThreadTodoServiceForTests,
 } from "../thread-todos/thread-todo-runtime";
 import { claudeReviewOutput } from "../claude/claude-review-findings";
+import {
+  getReviewAutoFixArming,
+  readReviewAutoFixStatus,
+  resetReviewAutoFixArmingForTests,
+} from "../thread-reviews/review-auto-fix";
+import { localThreadTodoOperations } from "../thread-todos/thread-todo-operations";
 import { createTempStateDb, removeTempStateDbDir } from "./sqlite-test-utils";
 
 let db: StateDb;
@@ -31,14 +38,18 @@ describe("review tracking runtime eligibility", () => {
   });
   afterEach(() => {
     resetThreadTodoServiceForTests();
+    resetReviewAutoFixArmingForTests();
     db.close();
     removeTempStateDbDir(temp.tempDir);
   });
 
+  const submitTurn = vi.fn(async () => ({ status: "queued" }));
   function install() {
+    submitTurn.mockClear();
     const registry = {
       onEvent: (listener: typeof onEvent) => { onEvent = listener; return () => {}; },
       setPwrAgentThreadTodoHandler: (value: PwrAgentThreadTodoHandler) => { handler = value; },
+      submitTurn,
     } as unknown as DesktopBackendRegistry;
     installThreadTodoRuntime({ registry, broadcast, listProjects: async () => [], readDefaultMergeMethod: () => "squash",
       feed: { loadOwners: async () => [], managedThreadKeys: () => new Set(), onDelta: () => {} } });
@@ -177,5 +188,188 @@ describe("review tracking runtime eligibility", () => {
     // This global inventory event can restore ACP owners as well as Codex.
     expect(broadcast).toHaveBeenCalledExactlyOnceWith({ at: expect.any(Number) });
     expect(getThreadReviewService().list({ status: "all" })).toEqual([]);
+  });
+  /**
+   * Rule: a review started with auto-fix hands its open findings to the
+   * thread's own agent the moment it lands, as a turn that queues behind any
+   * running one. A review started to wait, or one that lands in another
+   * turn, sends nothing.
+   */
+  describe("auto-fix", () => {
+    const findingsOutput = (turnId: string, id: string) => ({ backend: THREAD.backend, notification: {
+      method: "item/completed" as const, params: { threadId: THREAD.threadId, turnId, item: {
+        id, type: "exitedReviewMode", review: "",
+        data: { reviewOutput: claudeReviewOutput({ findings: [
+          { file: "src/a.ts", line: 3, summary: "Minor naming.", failureScenario: "Confuses readers." },
+          { file: "src/b.ts", line: 9, summary: "Drops a write.", failureScenario: "Loses data." },
+        ] }, "/repo") },
+      } },
+    } }) as AgentEvent;
+
+    it("sends the thread's agent the open findings when an armed review lands", async () => {
+      install();
+      getReviewAutoFixArming().starting(THREAD, "auto-fix").accepted("review-turn");
+      onEvent(findingsOutput("review-turn", "armed-review"));
+      await vi.waitFor(() => expect(submitTurn).toHaveBeenCalledTimes(1));
+      const [review] = getThreadReviewService().list();
+      const call = (submitTurn.mock.calls as unknown as [Record<string, unknown>][])[0]![0];
+      expect(call).toMatchObject({
+        ...THREAD,
+        origin: "automation",
+        messageOrigin: { kind: "pwragent", reviewAutoFix: { reviewId: review!.id, findingCount: 2 } },
+      });
+      const text = (call.input as { text: string }[])[0]!.text;
+      expect(text).toContain("Decide which ones to fix.");
+      expect(text).toContain("`update_review_item`");
+      // Once only: the same artifact again sends nothing more.
+      onEvent(findingsOutput("review-turn", "armed-review"));
+      await Promise.resolve();
+      expect(submitTurn).toHaveBeenCalledTimes(1);
+    });
+
+    it("sends nothing for a review started to wait, or one PwrAgent did not start", async () => {
+      install();
+      getReviewAutoFixArming().starting(THREAD, "wait").accepted("wait-turn");
+      onEvent(findingsOutput("wait-turn", "waiting-review"));
+      onEvent(findingsOutput("typed-turn", "typed-review"));
+      await Promise.resolve();
+      expect(getThreadReviewService().list()).toHaveLength(2);
+      expect(submitTurn).not.toHaveBeenCalled();
+    });
+
+    it("sends nothing once an armed review's turn ended without a result", async () => {
+      install();
+      getReviewAutoFixArming().starting(THREAD, "auto-fix").accepted("review-turn");
+      onEvent({ backend: THREAD.backend, notification: {
+        method: "turn/completed", params: { threadId: THREAD.threadId, turnId: "review-turn",
+          turn: { id: "review-turn", status: "interrupted" } },
+      } } as AgentEvent);
+      onEvent(findingsOutput("later-turn", "later-review"));
+      await Promise.resolve();
+      expect(submitTurn).not.toHaveBeenCalled();
+    });
+
+    /**
+     * Rule: viewers learn a running review is armed, and Don't auto-fix
+     * keeps it from fixing when it lands. Each change reaches them on the
+     * thread's to-do change event.
+     */
+    it("lists an armed running review and disarms it", async () => {
+      install();
+      broadcast.mockClear();
+      getReviewAutoFixArming().starting(THREAD, "auto-fix").accepted("review-turn");
+      expect(broadcast).toHaveBeenCalledWith(expect.objectContaining(THREAD));
+      expect(localThreadTodoOperations.readReviewAutoFix(THREAD).status.armedTurnIds).toEqual(["review-turn"]);
+      expect(localThreadTodoOperations.disarmReviewAutoFix({ ...THREAD, turnId: "review-turn" }))
+        .toEqual({ disarmed: true, status: { armedTurnIds: [], runs: {} } });
+      onEvent(findingsOutput("review-turn", "disarmed-review"));
+      await Promise.resolve();
+      expect(submitTurn).not.toHaveBeenCalled();
+    });
+
+    /**
+     * Rule: the card follows the Auto-fix turn by the review id its queue
+     * entry carries: queued, then running, then finished.
+     */
+    it("follows the Auto-fix turn through the queue", async () => {
+      install();
+      getReviewAutoFixArming().starting(THREAD, "auto-fix").accepted("review-turn");
+      onEvent(findingsOutput("review-turn", "queued-review"));
+      await vi.waitFor(() => expect(submitTurn).toHaveBeenCalledTimes(1));
+      const [review] = getThreadReviewService().list();
+      const queue = (status: string) => onEvent({ backend: THREAD.backend, notification: {
+        method: "thread/turnQueue/updated", params: { threadId: THREAD.threadId, queueEntryId: "entry", status,
+          messageOrigin: { kind: "pwragent", reviewAutoFix: { reviewId: review!.id, findingCount: 2 } } },
+      } } as AgentEvent);
+      broadcast.mockClear();
+      queue("queued");
+      expect(readReviewAutoFixStatus(THREAD).runs[review!.id]?.phase).toBe("queued");
+      expect(broadcast).toHaveBeenCalledWith(expect.objectContaining(THREAD));
+      queue("started");
+      expect(readReviewAutoFixStatus(THREAD).runs[review!.id]?.phase).toBe("running");
+      queue("terminal");
+      expect(readReviewAutoFixStatus(THREAD).runs[review!.id]?.phase).toBe("finished");
+    });
+
+    it("tells the card why the Auto-fix send failed", async () => {
+      install();
+      submitTurn.mockRejectedValueOnce(new Error("Thread is locked."));
+      getReviewAutoFixArming().starting(THREAD, "auto-fix").accepted("review-turn");
+      onEvent(findingsOutput("review-turn", "refused-review"));
+      const [review] = getThreadReviewService().list();
+      await vi.waitFor(() => expect(readReviewAutoFixStatus(THREAD).runs[review!.id])
+        .toEqual({ phase: "failed", at: expect.any(Number), reason: "Thread is locked." }));
+    });
+
+    it("drops a failed send once someone settles a finding", async () => {
+      install();
+      submitTurn.mockRejectedValueOnce(new Error("Thread is locked."));
+      getReviewAutoFixArming().starting(THREAD, "auto-fix").accepted("review-turn");
+      onEvent(findingsOutput("review-turn", "refused-review"));
+      const [review] = getThreadReviewService().list();
+      await vi.waitFor(() => expect(readReviewAutoFixStatus(THREAD).runs[review!.id]?.phase).toBe("failed"));
+      broadcast.mockClear();
+      // The operator fixed it by hand, and the agent recorded the fix.
+      getThreadReviewService().update(
+        { id: review!.id, itemId: review!.items[0]!.id, status: "addressed", note: "Fixed by hand." }, "agent");
+      expect(readReviewAutoFixStatus(THREAD).runs[review!.id]).toBeUndefined();
+      expect(broadcast).toHaveBeenCalledWith(expect.objectContaining({ backend: THREAD.backend, threadId: THREAD.threadId }));
+    });
+
+    it("keeps a failed send when only the reviewer reports its own outcomes", async () => {
+      install();
+      submitTurn.mockRejectedValueOnce(new Error("Thread is locked."));
+      getReviewAutoFixArming().starting(THREAD, "auto-fix").accepted("review-turn");
+      onEvent(findingsOutput("review-turn", "refused-review"));
+      const [review] = getThreadReviewService().list();
+      await vi.waitFor(() => expect(readReviewAutoFixStatus(THREAD).runs[review!.id]?.phase).toBe("failed"));
+      const settled = getThreadReviewService().applyReportedOutcomes(THREAD, review!.sourceKey, [{ index: 0, outcome: "fixed" }]);
+      expect(settled?.items[0]?.status).toBe("addressed");
+      expect(readReviewAutoFixStatus(THREAD).runs[review!.id]?.phase).toBe("failed");
+    });
+  });
+});
+
+describe("project merge-method preference", () => {
+  let temp: ReturnType<typeof createTempStateDb>;
+  beforeEach(() => {
+    temp = createTempStateDb("pwragent-merge-pref-");
+    db = StateDb.open(temp.dbPath);
+  });
+  afterEach(() => {
+    resetThreadTodoServiceForTests();
+    db.close();
+    removeTempStateDbDir(temp.tempDir);
+  });
+
+  it("shares the to-do cards' per-project pick and publishes a new one to open to-do views", async () => {
+    const onDelta = vi.fn();
+    const registry = {
+      onEvent: () => () => {},
+      setPwrAgentThreadTodoHandler: () => {},
+      resolveThreadPrimaryDirectory: async () => ({ id: "atlas", label: "atlas", path: "/work/atlas" }),
+    } as unknown as DesktopBackendRegistry;
+    installThreadTodoRuntime({ registry, broadcast: vi.fn(), listProjects: async () => [], readDefaultMergeMethod: () => "squash",
+      feed: { loadOwners: async () => [], managedThreadKeys: () => new Set(), onDelta } });
+
+    const first = await readProjectMergeMethodPreference(registry, THREAD);
+    expect(first.remembered).toBeUndefined();
+    first.remember!("rebase");
+    // A pick that changed no card still reaches open merge cards' labels.
+    const byProject = getThreadTodoService().mergeMethodPreferences().byProject;
+    expect(Object.values(byProject)).toEqual(["rebase"]);
+    expect(onDelta).toHaveBeenCalledTimes(1);
+    expect(onDelta.mock.calls[0]![0]).toMatchObject({ mergeMethods: { defaultMethod: "squash", byProject } });
+
+    const second = await readProjectMergeMethodPreference(registry, THREAD);
+    expect(second.remembered).toBe("rebase");
+    onDelta.mockClear();
+    second.remember!("rebase");
+    expect(onDelta).not.toHaveBeenCalled();
+  });
+
+  it("has no pick to read or keep for a thread without a project", async () => {
+    const registry = { resolveThreadPrimaryDirectory: async () => undefined } as unknown as DesktopBackendRegistry;
+    await expect(readProjectMergeMethodPreference(registry, THREAD)).resolves.toEqual({});
   });
 });

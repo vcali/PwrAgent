@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // A protocol fixture, not a model/provider. All state is test-owned.
 import assert from "node:assert/strict";
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, readFileSync, renameSync, watch, writeFileSync } from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { spawn } from "node:child_process";
@@ -15,10 +15,21 @@ let initialized = false;
 let acknowledged = false;
 let active;
 let sequence = 0;
+const helpers = new Set();
+const helperControl = () => {
+  try { return JSON.parse(readFileSync(path.join(directory, "helper-title.json"), "utf8")); }
+  catch (error) { if (error.code !== "ENOENT") throw error; return undefined; }
+};
 const records = path.join(directory, "fixture-threads.json");
 let threads;
 try { threads = JSON.parse(readFileSync(records, "utf8")); } catch { threads = {}; }
-const persist = () => writeFileSync(records, JSON.stringify(threads));
+const persist = () => {
+  // Daemon shutdown may kill this fixture during a native-name update. Keep
+  // the preceding complete provider snapshot until its replacement is ready.
+  const temporary = `${records}.${process.pid}.tmp`;
+  writeFileSync(temporary, JSON.stringify(threads));
+  renameSync(temporary, records);
+};
 const complete = (status) => {
   if (!active) return;
   clearTimeout(active.timer);
@@ -46,22 +57,52 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
     assert.equal(initialized, false);
     assert.equal(params.capabilities.experimentalApi, true);
     initialized = true;
-    reply({ userAgent: "fixture-codex/0.159.2" });
+    reply({ userAgent: "fixture-codex/0.159.2", codexHome: process.env.CODEX_HOME, platformFamily: "unix", platformOs: "linux" });
   } else if (method === "initialized") {
     assert.ok(initialized);
     acknowledged = true;
   } else {
     assert.ok(acknowledged);
-    if (method === "model/list") {
-      reply({ data: [{ id: "fixture-model", displayName: "Fixture model", isDefault: true, supportedReasoningEfforts: [] }] });
-    } else if (method === "thread/start" || method === "thread/resume") {
+    const stalled = helperControl()?.stalledMethod;
+    if (method === stalled
+      && (method !== "thread/start" || params.ephemeral === true)
+      && (method !== "turn/start" || helpers.has(params.threadId))
+      && (method !== "thread/name/set" || params.name === "Helper generated title")) continue;
+    if (method === "config/read" && helperControl()) {
+      reply({ config: { mcp_servers: {} } });
+    } else if (method === "account/read") {
+      reply({ account: null, requiresOpenaiAuth: false });
+    } else if (method === "mcpServerStatus/list" && helpers.has(params.threadId)) {
+      reply({ data: [], nextCursor: null });
+    } else if (method === "thread/unsubscribe" && helpers.has(params.threadId)) {
+      helpers.delete(params.threadId);
+      reply({});
+    } else if (method === "thread/start" && params.ephemeral === true && helperControl()) {
       assert.equal(params.approvalPolicy, "never");
-      assert.ok(["read-only", "workspace-write"].includes(params.sandbox));
-      assert.ok(params.cwd === process.cwd() || params.cwd.startsWith(process.cwd() + path.sep));
+      assert.equal(params.sandbox, "read-only");
+      assert.equal(params.config.project_doc_max_bytes, 0);
+      assert.equal(params.config.features.hooks, false);
+      assert.deepEqual(params.config.notify, []);
+      assert.equal(params.dynamicTools, undefined);
+      const threadId = `helper-${++sequence}`;
+      helpers.add(threadId);
+      reply({ thread: { id: threadId, cwd: params.cwd, ephemeral: true, turns: [] }, instructionSources: [] });
+    } else if (method === "turn/start" && helpers.has(params.threadId)) {
+      assert.ok(params.outputSchema);
+      reply({ turn: { id: `helper-turn-${++sequence}`, status: "completed", items: [
+        { type: "agentMessage", text: JSON.stringify({ title: helperControl().title }) },
+      ] } });
+    } else if (method === "model/list") {
+      reply({ data: [{ id: "fixture-model", displayName: "Fixture model", isDefault: true, hidden: false,
+        supportedReasoningEfforts: [], defaultReasoningEffort: "medium", inputModalities: ["text"], additionalSpeedTiers: [], serviceTiers: [] }], nextCursor: null });
+    } else if (method === "thread/start" || method === "thread/resume") {
+      if (params.approvalPolicy !== undefined) assert.equal(params.approvalPolicy, "never");
+      if (params.sandbox !== undefined) assert.ok(["read-only", "workspace-write"].includes(params.sandbox));
+      if (params.cwd !== undefined) assert.ok(params.cwd === process.cwd() || params.cwd.startsWith(process.cwd() + path.sep));
       const threadId = params.threadId || `thread-${Date.now()}-${++sequence}`;
       if (method === "thread/resume") {
         assert.ok(threads[threadId]);
-        if (!threads[threadId].turns.length) {
+        if (!threads[threadId].turns.length && active?.threadId !== threadId) {
           send({ id, error: { code: -32600, message: `no rollout found for thread id ${threadId}` } });
           continue;
         }
@@ -88,9 +129,22 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
           callId: `call-${active.id}`, namespace: "pwragent", tool: tool.operation, arguments: tool.args || {} } });
         continue;
       }
+      if (prompt === "returned") {
+        const turn = { id: active.id, status: "completed", items: [{ type: "agentMessage", text: "Returned result" }] };
+        threads[active.threadId].turns.push(turn);
+        persist();
+        active = null;
+        reply({ turn });
+        continue;
+      }
       if (prompt === "early") { complete("completed"); reply(initial); continue; }
       reply(initial);
-      if (prompt === "crash") { setTimeout(() => process.exit(7), 30); continue; }
+      if (prompt === "crash") {
+        process.once("SIGUSR1", () => process.exit(7));
+        send({ method: "turn/started", params: { threadId: active.threadId, turn: initial.turn } });
+        writeFileSync(path.join(directory, "crash.ready"), active.id);
+        continue;
+      }
       if (prompt === "descendant") {
         const child = spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{}); require('node:fs').writeFileSync(process.argv[1], 'ready'); setInterval(()=>{},1000)", path.join(directory, "descendant.ready")], { stdio: "ignore" });
         writeFileSync(path.join(directory, "descendant.pid"), String(child.pid));
@@ -105,6 +159,16 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
       }, ["slow", "descendant", "approval", "question"].includes(prompt) ? 30000 : 100);
     } else if (method === "turn/steer") {
       assert.equal(params.expectedTurnId, active.id);
+      if (params.input?.[0]?.text === "hold-steer-ack") {
+        const turnId = active.id;
+        const watcher = watch(directory, (_event, file) => {
+          if (file !== "steer.release") return;
+          watcher.close();
+          reply({ turnId });
+        });
+        writeFileSync(path.join(directory, "steer.ready"), turnId);
+        continue;
+      }
       reply({ turnId: active.id });
     } else if (method === "turn/interrupt") {
       assert.equal(params.threadId, active.threadId);
@@ -113,6 +177,23 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
       reply({});
     } else if (method === "thread/read") {
       reply({ thread: { ...threads[params.threadId], path: `/fixture-provider/${params.threadId}` } });
+    } else if (method === "thread/list") {
+      // Other owners/tests can retire native records between complete walks.
+      // This file belongs to the fixture; no provider storage is inspected.
+      try { threads = JSON.parse(readFileSync(records, "utf8")); } catch (error) { if (error.code !== "ENOENT") throw error; }
+      let control;
+      try { control = JSON.parse(readFileSync(path.join(directory, "discovery-control.json"), "utf8")); }
+      catch (error) { if (error.code !== "ENOENT") throw error; }
+      reply(control?.repeatArchived === (params.archived === true)
+        ? { data: [], nextCursor: "fixture-repeated-cursor" }
+        : { data: Object.values(threads).filter(thread => Boolean(thread.archived) === (params.archived === true)), nextCursor: null });
+    } else if (method === "thread/turns/list") {
+      reply({ data: threads[params.threadId].turns.slice().reverse().map((turn) => ({ ...turn, itemsView: "full" })), nextCursor: null });
+    } else if (method === "thread/name/set") {
+      threads[params.threadId].name = params.name;
+      persist();
+      reply({});
+      send({ method: "thread/name/updated", params: { threadId: params.threadId, threadName: params.name } });
     } else if (method === "fs/readFile") {
       const thread = threads[path.basename(params.path)];
       assert.ok(thread);
@@ -127,6 +208,10 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
       threads[params.threadId].archived = true;
       persist();
       reply({});
+    } else if (method === "thread/unarchive") {
+      threads[params.threadId].archived = false;
+      persist();
+      reply({ thread: threads[params.threadId] });
     } else {
       send({ id, error: { code: -32601, message: "Fixture method not found" } });
     }

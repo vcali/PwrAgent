@@ -18,6 +18,17 @@ export const FEDERATION_GENERATE_INVITE_CHANNEL = "federation:generate-invite";
 export const FEDERATION_IMPORT_INVITE_CHANNEL = "federation:import-invite";
 export const FEDERATION_REVOKE_PEER_CHANNEL = "federation:revoke-peer";
 export const FEDERATION_HANDOFF_THREAD_CHANNEL = "federation:handoff-thread";
+export const FEDERATION_CANCEL_HANDOFF_THREAD_CHANNEL =
+  "federation:handoff-thread-cancel";
+export const FEDERATION_RETRY_HANDOFF_THREAD_NOW_CHANNEL =
+  "federation:handoff-thread-retry-now";
+export const FEDERATION_HANDOFF_THREAD_PROGRESS_CHANNEL =
+  "federation:handoff-thread-progress";
+/**
+ * The rejection a handoff call ends with when the operator's Cancel stopped
+ * it, so the window can tell a cancel from a failure without reading prose.
+ */
+export const THREAD_HANDOFF_CANCELLED_MESSAGE = "thread_handoff_cancelled";
 export const FEDERATION_PUSH_COMPOSER_FILE_CHANNEL =
   "federation:push-composer-file";
 export const FEDERATION_CANCEL_COMPOSER_FILE_PUSH_CHANNEL =
@@ -123,6 +134,28 @@ export const APP_SERVER_RUN_THREAD_ARCHIVE_SWEEP_CHANNEL =
   "app-server:run-thread-archive-sweep";
 export const THREAD_ARCHIVE_SWEEP_STATUS_CHANGED_EVENT_CHANNEL =
   "app-server:thread-archive-sweep-status-changed";
+/** The one-time notice that the hourly sweep no longer archives threads. */
+export const APP_SERVER_GET_AUTOMATIC_ARCHIVE_RETIRED_NOTICE_CHANNEL =
+  "app-server:get-automatic-archive-retired-notice";
+export const APP_SERVER_DISMISS_AUTOMATIC_ARCHIVE_RETIRED_NOTICE_CHANNEL =
+  "app-server:dismiss-automatic-archive-retired-notice";
+/** Thread maintenance: a reviewed scan of idle threads and archived
+ * checkouts, and a run of the operator's selections from one scan. */
+export const APP_SERVER_SCAN_THREAD_MAINTENANCE_CHANNEL =
+  "app-server:scan-thread-maintenance";
+export const APP_SERVER_APPLY_THREAD_MAINTENANCE_CHANNEL =
+  "app-server:apply-thread-maintenance";
+export const APP_SERVER_GET_THREAD_MAINTENANCE_RUN_CHANNEL =
+  "app-server:get-thread-maintenance-run";
+export const APP_SERVER_STOP_THREAD_MAINTENANCE_CHANNEL =
+  "app-server:stop-thread-maintenance";
+/** A scan's live position, sent only to the window that asked for the scan. */
+export const THREAD_MAINTENANCE_SCAN_PROGRESS_EVENT_CHANNEL =
+  "thread-maintenance:scan-progress";
+export const THREAD_MAINTENANCE_RUN_CHANGED_EVENT_CHANNEL =
+  "app-server:thread-maintenance-run-changed";
+/** Main asks the focused main window to open the Thread maintenance dialog. */
+export const WINDOW_OPEN_THREAD_MAINTENANCE_CHANNEL = "window:open-thread-maintenance";
 export const GITHUB_PR_SAML_ENFORCEMENT_EVENT_CHANNEL =
   "app-server:github-pr-saml-enforcement";
 export const MANAGED_GROK_SIGNATURE_REJECTED_EVENT_CHANNEL =
@@ -188,6 +221,10 @@ export const SCHEDULED_ACTIONS_SEND_NOW_CHANNEL = "scheduled-actions:send-now";
 export const THREAD_TODOS_LIST_CHANNEL = "thread-todos:list";
 export const THREAD_REVIEWS_LIST_CHANNEL = "thread-reviews:list";
 export const THREAD_REVIEWS_UPDATE_CHANNEL = "thread-reviews:update";
+/** A thread's armed reviews and Auto-fix runs, read from its owner. */
+export const THREAD_REVIEWS_READ_AUTO_FIX_CHANNEL = "thread-reviews:read-auto-fix";
+/** Don't auto-fix: turns Auto-fix off for one running review. */
+export const THREAD_REVIEWS_DISARM_AUTO_FIX_CHANNEL = "thread-reviews:disarm-auto-fix";
 export const THREAD_TODOS_RESOLVE_CHANNEL = "thread-todos:resolve";
 export const THREAD_TODOS_RUN_ACTION_CHANNEL = "thread-todos:run-action";
 export const THREAD_TODOS_LIST_PROJECTS_CHANNEL = "thread-todos:list-projects";
@@ -230,6 +267,8 @@ export const AGENT_STEER_TURN_CHANNEL = "agent:steer-turn";
 export const AGENT_REWIND_THREAD_CHANNEL = "agent:rewind-thread";
 export const AGENT_PREVIEW_THREAD_REWIND_CHANNEL = "agent:preview-thread-rewind";
 export const AGENT_UNDO_THREAD_REWIND_CHANNEL = "agent:undo-thread-rewind";
+export const AGENT_CONTINUE_CLAUDE_THREAD_IN_NEW_SESSION_CHANNEL =
+  "agent:continue-claude-thread-in-new-session";
 export const AGENT_CONFIGURE_GROK_WORKFLOW_BUDGET_CHANNEL =
   "agent:configure-grok-workflow-budget";
 export const AGENT_SET_THREAD_EXECUTION_MODE_CHANNEL = "agent:set-thread-execution-mode";
@@ -322,6 +361,8 @@ export const MCP_CONNECTION_SET_SELECT_FOR_NEW_THREADS_CHANNEL =
   "mcp-connection:set-select-for-new-threads";
 export const MCP_CONNECTION_SET_TOOL_APPROVAL_CHANNEL =
   "mcp-connection:set-tool-approval";
+export const MCP_CONNECTION_SET_PROJECT_TOOL_APPROVAL_CHANNEL =
+  "mcp-connection:set-project-tool-approval";
 export const MCP_CONNECTION_SET_SANDBOXER_TRANSPORT_CHANNEL =
   "mcp-connection:set-sandboxer-transport";
 export const MCP_CONNECTION_SET_SANDBOXER_CLEANUP_ON_PR_CLOSE_CHANNEL =
@@ -337,14 +378,9 @@ export const MCP_CONNECTION_READ_THREAD_CHANNEL =
   "mcp-connection:read-thread";
 export const MCP_CONNECTION_DESCRIBE_THREAD_CHANNEL =
   "mcp-connection:describe-thread";
+export const OWNER_REQUEST_CHANNEL = "owner:request";
 export const NAVIGATION_SNAPSHOT_CHANNEL = "navigation:get-snapshot";
-export const NAVIGATION_QUERY_PAGE_CHANNEL = "navigation:get-query-page";
 export const NAVIGATION_QUERY_RELEASE_CHANNEL = "navigation:release-query";
-export const NAVIGATION_LAUNCHPAD_CONFIG_CHANNEL = "navigation:get-launchpad-config";
-export const NAVIGATION_SELECTED_DETAIL_CHANNEL =
-  "navigation:get-selected-detail";
-export const NAVIGATION_QUEUE_PROJECTION_CHANNEL =
-  "navigation:get-queue-projection";
 export const NAVIGATION_SET_BROWSE_MODE_CHANNEL =
   "navigation:set-browse-mode";
 export const NAVIGATION_SET_RESUME_STATE_CHANNEL = "navigation:set-resume-state";
@@ -354,6 +390,7 @@ export const NAVIGATION_MARK_THREAD_SEEN_CHANNEL = "navigation:mark-thread-seen"
 export const NAVIGATION_SET_THREAD_REACTION_CHANNEL =
   "navigation:set-thread-reaction";
 export const NAVIGATION_SET_THREAD_LOCK_CHANNEL = "navigation:set-thread-lock";
+export const NAVIGATION_SET_THREAD_CHECKOUT_HIBERNATION_CHANNEL = "navigation:set-thread-checkout-hibernation";
 export const NAVIGATION_RECENT_THREAD_LOCK_NOTES_CHANNEL =
   "navigation:recent-thread-lock-notes";
 export const NAVIGATION_REMEMBER_THREAD_LOCK_NOTE_CHANNEL =
@@ -810,6 +847,8 @@ export const SETTINGS_PICK_GIT_COMMAND_CHANNEL =
 export const SETTINGS_RECEIVING_FOLDER_CHANNEL = "settings:receiving-folder";
 export const SETTINGS_REFRESH_GIT_DISCOVERY_CHANNEL =
   "settings:refresh-git-discovery";
+export const SETTINGS_MANAGED_GIT_ACTION_CHANNEL =
+  "settings:managed-git-action";
 export const SETTINGS_INSPECT_CODE_SIGNATURES_CHANNEL =
   "settings:inspect-code-signatures";
 export const ONBOARDING_COMPLETE_CODEX_BOOTSTRAP_CHANNEL =

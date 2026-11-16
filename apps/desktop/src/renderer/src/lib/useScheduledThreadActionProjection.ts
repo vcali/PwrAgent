@@ -421,6 +421,7 @@ function projectionFromAction(action: ScheduledThreadAction) {
             cwd: action.review.cwd,
             displayText: action.displayText,
             runMode: action.review.runMode,
+            ...(action.review.afterReview ? { afterReview: action.review.afterReview } : {}),
             target: action.review.target,
             // A scheduled review can also be released client-side, so the
             // picked reviewer has to survive the round trip through this
@@ -472,7 +473,7 @@ function scopeKeyForAction(action: ScheduledThreadAction, target: FederationTarg
   return buildThreadComposerScopeKey(action.backend, action.threadId, target);
 }
 
-function isScheduledThreadAction(value: unknown): value is ScheduledThreadAction {
+export function isScheduledThreadAction(value: unknown): value is ScheduledThreadAction {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<ScheduledThreadAction>;
   return (

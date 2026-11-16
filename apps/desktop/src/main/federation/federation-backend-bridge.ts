@@ -1,3 +1,5 @@
+import { registerNavigationBackendHandlers, type NavigationBackendOperations } from "./federation-navigation-handlers";
+import type { ManageThreadDependenciesRequest, ManageThreadDependenciesResponse } from "@pwragent/shared";
 import { authenticateMessageOrigin, type ResolvedSourceInstance } from "@pwragent/federation/federation-message-origin";
 import {
   FEDERATION_BACKEND_METHODS,
@@ -145,6 +147,8 @@ import type {
   SetThreadReactionRequest,
   SetThreadReactionResponse,
   SetThreadLockRequest,
+  SetThreadCheckoutHibernationRequest,
+  SetThreadCheckoutHibernationResponse,
   SetThreadLockResponse,
   SetThreadPinRequest,
   SetThreadPinResponse,
@@ -156,6 +160,10 @@ import type {
   SendThreadPrAutoDispatchNowResponse,
   ReorderThreadPinsRequest,
   ReorderThreadPinsResponse,
+  SetDirectoryPinRequest,
+  SetDirectoryPinResponse,
+  ReorderDirectoryPinsRequest,
+  ReorderDirectoryPinsResponse,
   NavigationQueryPage,
   NavigationQueryRequest,
   NavigationQueueProjection,
@@ -269,18 +277,13 @@ import type {
   DurableSteerReceipt,
   FederationSubmitDurableSteerRequest,
 } from "@pwragent/shared";
-import { DurableTurnRequestError, type DurableTurnRequestService } from "./durable-turn-request-service";
+import { DurableTurnRequestError, type DurableTurnRequestService } from "@pwragent/owner-core/durable-turn-request-service";
 
 export const FEDERATION_RESPONSE_BYTE_BUDGET =
   FEDERATION_MAX_FRAME_BYTES - 64 * 1024;
 
-/** A delegated device can only occupy its authenticated issuer's namespace. */
-export function durableFederationCallerScope(sourceInstanceId: string, callerScope?: string): string {
-  if (callerScope !== undefined && (typeof callerScope !== "string" || !callerScope || callerScope.length > 256)) {
-    throw new DurableTurnRequestError("request_invalid");
-  }
-  return JSON.stringify(["federation", sourceInstanceId, callerScope ?? ""]);
-}
+import { durableFederationCallerScope } from "@pwragent/shared";
+export { durableFederationCallerScope } from "@pwragent/shared";
 
 /**
  * Load queries answer from in-memory OS counters plus one statfs, so a
@@ -582,26 +585,10 @@ export function additionalFederationBackendCapabilities(
   return request?.fallback ? ["scheduled_actions"] : [];
 }
 
-export type FederationBackendOperations = {
-  getNavigationQueryPage?(
-    request: NavigationQueryRequest,
-    rpcOptions?: FederationRpcRequestOptions,
-  ): Promise<NavigationQueryPage>;
+export type FederationBackendOperations = NavigationBackendOperations & {
   releaseNavigationAttentionView?(request: NavigationAttentionViewReleaseRequest, rpcOptions?: FederationRpcRequestOptions): Promise<void>;
   markNavigationDirectorySeen?(request: MarkNavigationDirectorySeenRequest, rpcOptions?: FederationRpcRequestOptions): Promise<MarkNavigationDirectorySeenResponse>;
   removeNavigationDirectory?(request: RemoveNavigationDirectoryRequest, rpcOptions?: FederationRpcRequestOptions): Promise<RemoveNavigationDirectoryResponse>;
-  getNavigationLaunchpadConfig?(
-    request: NavigationLaunchpadConfigRequest,
-    rpcOptions?: FederationRpcRequestOptions,
-  ): Promise<NavigationLaunchpadConfigResponse>;
-  getNavigationSelectedDetail?(
-    request: NavigationSelectedDetailRequest,
-    rpcOptions?: FederationRpcRequestOptions,
-  ): Promise<NavigationSelectedDetailResponse>;
-  getNavigationQueueProjection?(
-    request: NavigationQueueProjectionRequest,
-    rpcOptions?: FederationRpcRequestOptions,
-  ): Promise<NavigationQueueProjection>;
   getProjectPage?(
     request: FederationProjectPageRequest,
     rpcOptions?: FederationRpcRequestOptions,
@@ -682,14 +669,28 @@ export type FederationBackendOperations = {
   setThreadReaction(
     request: SetThreadReactionRequest,
   ): Promise<SetThreadReactionResponse>;
+  /**
+   * Wait Until Done, which v1.3.15 folded into Continue After. Peers on
+   * v1.3.13–14 still call it: reads answer that nothing waits, and changes
+   * are refused with a request to update.
+   */
+  legacyManageThreadMergeHolds(request: unknown): Promise<{ holds: []; dependents: [] }>;
+  /**
+   * Continue After on this owner's threads. Optional on owner adapters so a
+   * viewer of an older owner receives method_not_found.
+   */
+  manageThreadDependencies?(request: unknown, options?: { requesterInstanceId?: string }): Promise<ManageThreadDependenciesResponse>;
   setThreadLock(
     request: SetThreadLockRequest,
     options?: { requesterInstanceId?: string },
   ): Promise<SetThreadLockResponse>;
+  setThreadCheckoutHibernation?(request: SetThreadCheckoutHibernationRequest): Promise<SetThreadCheckoutHibernationResponse>;
   setThreadPin(request: SetThreadPinRequest): Promise<SetThreadPinResponse>;
   reorderThreadPins(
     request: ReorderThreadPinsRequest,
   ): Promise<ReorderThreadPinsResponse>;
+  setDirectoryPin?(request: Omit<SetDirectoryPinRequest, "federationTarget">): Promise<SetDirectoryPinResponse>;
+  reorderDirectoryPins?(request: Omit<ReorderDirectoryPinsRequest, "federationTarget">): Promise<ReorderDirectoryPinsResponse>;
   mountRemoteChild(
     request: FederationMountRemoteChildRequest,
   ): Promise<FederationMountRemoteChildResponse>;
@@ -984,19 +985,7 @@ export function registerFederationBackendHandlers(params: {
     }
   };
 
-  if (params.backend.getNavigationQueryPage) {
-    params.router.registerHandler(
-      FEDERATION_BACKEND_METHODS.getNavigationQueryPage,
-      async (envelope) => {
-        const request = envelope.params as NavigationQueryRequest;
-        if (request.inventory === "viewer") throw new Error("Viewer navigation inventory is available only on its local machine.");
-        return await params.backend.getNavigationQueryPage!(request, {
-          deadlineAt: envelope.deadlineAt,
-          requesterInstanceId: envelope.sourceInstanceId,
-        });
-      },
-    );
-  }
+  registerNavigationBackendHandlers(params);
   if (params.backend.releaseNavigationAttentionView) {
     params.router.registerHandler(FEDERATION_BACKEND_METHODS.releaseNavigationAttentionView,
       async (envelope) => params.backend.releaseNavigationAttentionView!(envelope.params as NavigationAttentionViewReleaseRequest,
@@ -1017,42 +1006,6 @@ export function registerFederationBackendHandlers(params: {
       async (envelope) => params.backend.removeNavigationDirectory!({
         ...envelope.params as RemoveNavigationDirectoryRequest, archiveThreads: true, federationTarget: undefined,
       }));
-  }
-  if (params.backend.getNavigationLaunchpadConfig) {
-    params.router.registerHandler(
-      FEDERATION_BACKEND_METHODS.getNavigationLaunchpadConfig,
-      async (envelope) => await params.backend.getNavigationLaunchpadConfig!(
-        envelope.params as NavigationLaunchpadConfigRequest,
-        {
-          deadlineAt: envelope.deadlineAt,
-          requesterInstanceId: envelope.sourceInstanceId,
-        },
-      ),
-    );
-  }
-  if (params.backend.getNavigationSelectedDetail) {
-    params.router.registerHandler(
-      FEDERATION_BACKEND_METHODS.getNavigationSelectedDetail,
-      async (envelope) => await params.backend.getNavigationSelectedDetail!(
-        envelope.params as NavigationSelectedDetailRequest,
-        {
-          deadlineAt: envelope.deadlineAt,
-          requesterInstanceId: envelope.sourceInstanceId,
-        },
-      ),
-    );
-  }
-  if (params.backend.getNavigationQueueProjection) {
-    params.router.registerHandler(
-      FEDERATION_BACKEND_METHODS.getNavigationQueueProjection,
-      async (envelope) => await params.backend.getNavigationQueueProjection!(
-        envelope.params as NavigationQueueProjectionRequest,
-        {
-          deadlineAt: envelope.deadlineAt,
-          requesterInstanceId: envelope.sourceInstanceId,
-        },
-      ),
-    );
   }
   for (const method of [FEDERATION_BACKEND_METHODS.getNavigationSnapshot, FEDERATION_BACKEND_METHODS.getNavigationDescendantPage]) {
     params.router.registerHandler(method, async () => {
@@ -1312,6 +1265,12 @@ export function registerFederationBackendHandlers(params: {
       ),
   );
   params.router.registerHandler(
+    FEDERATION_BACKEND_METHODS.manageThreadMergeHolds,
+    async (envelope) => await params.backend.legacyManageThreadMergeHolds(
+      envelope.params,
+    ),
+  );
+  params.router.registerHandler(
     FEDERATION_BACKEND_METHODS.setThreadLock,
     async (envelope) =>
       await params.backend.setThreadLock(
@@ -1319,6 +1278,17 @@ export function registerFederationBackendHandlers(params: {
         { requesterInstanceId: envelope.sourceInstanceId },
       ),
   );
+  if (params.backend.setThreadCheckoutHibernation) {
+    params.router.registerHandler(FEDERATION_BACKEND_METHODS.setThreadCheckoutHibernation, async (envelope) => {
+      const request = envelope.params as SetThreadCheckoutHibernationRequest;
+      return await params.backend.setThreadCheckoutHibernation!({
+        backend: request.backend,
+        threadId: request.threadId,
+        ...(typeof request.restore === "boolean" ? { restore: request.restore } : {}),
+        ...(typeof request.keepAwake === "boolean" ? { keepAwake: request.keepAwake } : {}),
+      });
+    });
+  }
   params.router.registerHandler(
     FEDERATION_BACKEND_METHODS.setThreadPin,
     async (envelope) =>
@@ -1333,6 +1303,22 @@ export function registerFederationBackendHandlers(params: {
         envelope.params as ReorderThreadPinsRequest,
       ),
   );
+  if (params.backend.setDirectoryPin) {
+    params.router.registerHandler(FEDERATION_BACKEND_METHODS.setDirectoryPin, async (envelope) => {
+      const request = envelope.params as SetDirectoryPinRequest;
+      return await params.backend.setDirectoryPin!({
+        directoryKey: request.directoryKey,
+        pinned: request.pinned,
+        pinnedRank: request.pinnedRank,
+      });
+    });
+  }
+  if (params.backend.reorderDirectoryPins) {
+    params.router.registerHandler(FEDERATION_BACKEND_METHODS.reorderDirectoryPins, async (envelope) => {
+      const request = envelope.params as ReorderDirectoryPinsRequest;
+      return await params.backend.reorderDirectoryPins!({ directoryKeys: request.directoryKeys, move: request.move });
+    });
+  }
   params.router.registerHandler(
     FEDERATION_BACKEND_METHODS.mountRemoteChild,
     async (envelope) =>
@@ -1401,6 +1387,14 @@ export function registerFederationBackendHandlers(params: {
         envelope.params as SendThreadPrAutoDispatchNowRequest,
       ),
   );
+  if (params.backend.manageThreadDependencies) {
+    params.router.registerHandler(
+      FEDERATION_BACKEND_METHODS.manageThreadDependencies,
+      async (envelope) => await params.backend.manageThreadDependencies!(
+        envelope.params, { requesterInstanceId: envelope.sourceInstanceId },
+      ),
+    );
+  }
   if (params.backend.manageThreadPrWatchesV1) {
     params.router.registerHandler(
       FEDERATION_BACKEND_METHODS.manageThreadPrWatchesV1,
@@ -2497,12 +2491,31 @@ export class FederationRemoteBackendClient implements FederationBackendOperation
     });
   }
 
+  async legacyManageThreadMergeHolds(request: unknown): Promise<{ holds: []; dependents: [] }> {
+    return await this.rpc.request<{ holds: []; dependents: [] }>({ method: FEDERATION_BACKEND_METHODS.manageThreadMergeHolds, params: request });
+  }
+
+  async manageThreadDependencies(request: ManageThreadDependenciesRequest): Promise<ManageThreadDependenciesResponse> {
+    return await this.rpc.request<ManageThreadDependenciesResponse>({ method: FEDERATION_BACKEND_METHODS.manageThreadDependencies, params: request });
+  }
+
   async setThreadLock(
     request: SetThreadLockRequest,
   ): Promise<SetThreadLockResponse> {
     return await this.rpc.request<SetThreadLockResponse>({
       method: FEDERATION_BACKEND_METHODS.setThreadLock,
       params: request,
+    });
+  }
+
+  async setThreadCheckoutHibernation(
+    request: SetThreadCheckoutHibernationRequest,
+  ): Promise<SetThreadCheckoutHibernationResponse> {
+    // A restore runs Git and can run project setup on the owner.
+    return await this.rpc.request<SetThreadCheckoutHibernationResponse>({
+      method: FEDERATION_BACKEND_METHODS.setThreadCheckoutHibernation,
+      params: request,
+      timeoutMs: 600_000,
     });
   }
 
@@ -2513,6 +2526,29 @@ export class FederationRemoteBackendClient implements FederationBackendOperation
       method: FEDERATION_BACKEND_METHODS.reorderThreadPins,
       params: request,
     });
+  }
+
+  async setDirectoryPin(
+    request: Omit<SetDirectoryPinRequest, "federationTarget">,
+  ): Promise<SetDirectoryPinResponse> {
+    return await this.requestDirectoryPins(FEDERATION_BACKEND_METHODS.setDirectoryPin, request);
+  }
+
+  async reorderDirectoryPins(
+    request: Omit<ReorderDirectoryPinsRequest, "federationTarget">,
+  ): Promise<ReorderDirectoryPinsResponse> {
+    return await this.requestDirectoryPins(FEDERATION_BACKEND_METHODS.reorderDirectoryPins, request);
+  }
+
+  private async requestDirectoryPins<T>(method: FederationBackendMethod, params: unknown): Promise<T> {
+    try {
+      return await this.rpc.request<T>({ method, params });
+    } catch (error) {
+      if (hasFederationErrorCode(error, "method_not_found")) {
+        throw new Error("Update PwrAgent on the owning instance to change project pins from this window.");
+      }
+      throw error;
+    }
   }
 
   async mountRemoteChild(

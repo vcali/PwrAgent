@@ -1,3 +1,4 @@
+import { ReviewAutoFixSwitch } from "../composer/ReviewAutoFixSwitch";
 import { resolveReviewRunMode } from "../../lib/review-run-mode";
 import { ReviewLocationDropdown } from "../composer/ReviewLocationDropdown";
 import { reviewThreadForWorkspace } from "../../../../shared/pull-request-review";
@@ -15,6 +16,7 @@ import {
   findPreferredReviewWorkspaceCwd,
   type AppServerReviewTarget,
   type BackendSummary,
+  type ReviewAfterAction,
   type ReviewRunMode,
   type NavigationThreadSummary,
 } from "@pwragent/shared";
@@ -26,6 +28,7 @@ type ReviewDirectory = Pick<NavigationDirectorySummary, "key" | "path"> & {
 
 export type StarMapReviewRequest = {
   runMode?: ReviewRunMode;
+  afterReview?: ReviewAfterAction;
   cwd?: string;
   target: AppServerReviewTarget;
 };
@@ -37,6 +40,8 @@ type StarMapReviewSetupProps = {
   error?: string;
   onCancel: () => void;
   onSubmit: (request: StarMapReviewRequest) => void;
+  /** Settings -> General -> Reviews. The switch starts here and still changes one review. */
+  reviewAutoFixDefault?: boolean;
   submitting: boolean;
   thread: NavigationThreadSummary;
 };
@@ -228,6 +233,15 @@ export function StarMapReviewSetup(props: StarMapReviewSetupProps) {
     }
   }, [branchEdited, branchOptions]);
 
+  // Follows the Settings default until the operator clicks, as the composer
+  // panel does, so a setting that loads after the card opens still applies.
+  // A click lasts for this one review.
+  const [autoFixChoice, setAutoFixChoice] = useState<boolean>();
+  const autoFix = autoFixChoice ?? props.reviewAutoFixDefault !== false;
+  const autoFixSupported = props.backend?.capabilities.reviewAutoFix === true;
+  const afterReview: ReviewAfterAction | undefined = autoFixSupported
+    ? autoFix ? "auto-fix" : "wait"
+    : undefined;
   const reviewRunModeDecision = resolveReviewRunMode({
     ownerSummary: props.backend,
     requestedRunMode: runMode,
@@ -267,7 +281,7 @@ export function StarMapReviewSetup(props: StarMapReviewSetupProps) {
 
   const submit = (event: FormEvent<HTMLFormElement>): void => {
     event.preventDefault();
-    if (canSubmit && request) onSubmit(request);
+    if (canSubmit && request) onSubmit({ ...request, ...(afterReview ? { afterReview } : {}) });
   };
 
   useEffect(() => {
@@ -337,7 +351,7 @@ export function StarMapReviewSetup(props: StarMapReviewSetupProps) {
       }
       event.preventDefault();
       event.stopPropagation();
-      onSubmit(nextRequest);
+      onSubmit({ ...nextRequest, ...(afterReview ? { afterReview } : {}) });
     };
 
     // Capture is intentional: the Star Map layer owns Escape at its root,
@@ -345,6 +359,7 @@ export function StarMapReviewSetup(props: StarMapReviewSetupProps) {
     document.addEventListener("keydown", handleKeyDown, true);
     return () => document.removeEventListener("keydown", handleKeyDown, true);
   }, [
+    afterReview,
     branch,
     busy,
     commit,
@@ -508,6 +523,13 @@ export function StarMapReviewSetup(props: StarMapReviewSetupProps) {
         </div>
 
         <footer className="star-map-review-setup__actions">
+          {autoFixSupported ? (
+            <ReviewAutoFixSwitch
+              checked={autoFix}
+              disabled={props.submitting}
+              onToggle={() => setAutoFixChoice(!autoFix)}
+            />
+          ) : null}
           <button
             className="composer__secondary-action"
             data-review-dismiss

@@ -7,6 +7,8 @@ const repoRoot = resolve(import.meta.dirname, "..");
 const scanRoots = [
   "apps/desktop/src/main",
   "packages/pwragent/src",
+  "packages/owner-core/src",
+  "packages/sqlite-storage/src",
   "scripts",
 ];
 
@@ -169,7 +171,7 @@ function runSelfTests() {
     }
   `;
   assertWouldFlag({
-    relPath: "apps/desktop/src/main/codex-app-server/client.ts",
+    relPath: "packages/owner-core/src/codex-app-server/client.ts",
     line: 'const handle = await open(sessionPath, "r");',
     context: oldFallback,
   });

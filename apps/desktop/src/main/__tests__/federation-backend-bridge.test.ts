@@ -4120,6 +4120,35 @@ describe("federation backend bridge", () => {
     ]);
   });
 
+  it("routes Continue After requests to the owner with authenticated peer provenance", async () => {
+    const manageThreadDependencies = vi.fn(async () => ({ dependencies: [] }));
+    const replies: FederationProtocolEnvelope[] = [];
+    const router = new FederationRouter({ localInstanceId: "waiting-owner", methodCapabilities: FEDERATION_BACKEND_METHOD_CAPABILITIES, now: () => 2_000 });
+    router.registerConnection({ peerId: "windows", capabilities: ["turn_control"], sendEnvelope: (envelope) => replies.push(envelope) });
+    registerFederationBackendHandlers({ router, backend: { manageThreadDependencies } as unknown as FederationBackendOperations });
+    const request = { action: "mark_done", backend: "codex", threadId: "waiting", dependencyId: "dep-17", note: "Windows findings reconciled" };
+    await router.routeEnvelope({ sourcePeerId: "windows", envelope: {
+      id: "mark-done", kind: "request", method: FEDERATION_BACKEND_METHODS.manageThreadDependencies, params: request,
+      protocolVersion: 1, sourceInstanceId: "windows", targetInstanceId: "waiting-owner", createdAt: 1_000,
+    } });
+    expect(manageThreadDependencies).toHaveBeenCalledWith(request, { requesterInstanceId: "windows" });
+    expect(replies.at(-1)).toMatchObject({ kind: "response", result: { dependencies: [] } });
+    expect(FEDERATION_BACKEND_METHOD_CAPABILITIES[FEDERATION_BACKEND_METHODS.manageThreadDependencies]).toBe("turn_control");
+  });
+
+  it("still answers the retired Wait Until Done method for older peers", async () => {
+    const legacyManageThreadMergeHolds = vi.fn(async () => ({ holds: [], dependents: [] }));
+    const replies: FederationProtocolEnvelope[] = [];
+    const router = new FederationRouter({ localInstanceId: "waiting-owner", methodCapabilities: FEDERATION_BACKEND_METHOD_CAPABILITIES, now: () => 2_000 });
+    router.registerConnection({ peerId: "windows", capabilities: ["turn_control"], sendEnvelope: (envelope) => replies.push(envelope) });
+    registerFederationBackendHandlers({ router, backend: { legacyManageThreadMergeHolds } as unknown as FederationBackendOperations });
+    await router.routeEnvelope({ sourcePeerId: "windows", envelope: {
+      id: "list-holds", kind: "request", method: FEDERATION_BACKEND_METHODS.manageThreadMergeHolds, params: { action: "active" },
+      protocolVersion: 1, sourceInstanceId: "windows", targetInstanceId: "waiting-owner", createdAt: 1_000,
+    } });
+    expect(replies.at(-1)).toMatchObject({ kind: "response", result: { holds: [], dependents: [] } });
+  });
+
   it("maps expanded remote control operations to capability-guarded handlers", async () => {
     const backend: FederationBackendOperations = {
       getNavigationSnapshot: vi.fn(),
@@ -4137,6 +4166,7 @@ describe("federation backend bridge", () => {
       markThreadSeen: vi.fn(),
       setThreadReaction: vi.fn(),
       setThreadLock: vi.fn(),
+      legacyManageThreadMergeHolds: vi.fn(),
       setThreadPin: vi.fn(),
       reorderThreadPins: vi.fn(),
       mountRemoteChild: vi.fn(),
@@ -4663,6 +4693,7 @@ describe("federation backend bridge", () => {
         markThreadSeen: vi.fn(),
         setThreadReaction: vi.fn(),
         setThreadLock: vi.fn(),
+      legacyManageThreadMergeHolds: vi.fn(),
       setThreadPin: vi.fn(),
       reorderThreadPins: vi.fn(),
         mountRemoteChild: vi.fn(),
@@ -5294,6 +5325,23 @@ describe("federation workspace recovery methods", () => {
       backend: "codex", threadId: "t1", worktreePath: "/wt", detached: true,
     });
     expect(moveThreadToMainCheckout).toHaveBeenCalledWith({ backend: "codex", threadId: "t1", worktreePath: "/wt" });
+  });
+
+  it("restores or keeps awake a hibernated checkout on the owner, with only those fields", async () => {
+    const setThreadCheckoutHibernation = vi.fn(async () => ({ backend: "codex", threadId: "t1", keepAwake: true, hibernated: false }));
+    const { request } = route({ setThreadCheckoutHibernation } as never, ["turn_control"]);
+    await request("awake", FEDERATION_BACKEND_METHODS.setThreadCheckoutHibernation, {
+      backend: "codex", threadId: "t1", keepAwake: true, restore: "yes", worktreePath: "/elsewhere",
+      federationTarget: { scope: "remote", instanceId: "elsewhere" },
+    });
+    expect(setThreadCheckoutHibernation).toHaveBeenCalledWith({ backend: "codex", threadId: "t1", keepAwake: true });
+
+    const viewer = route({ setThreadCheckoutHibernation } as never, ["thread_detail"]);
+    const refused = await viewer.request("restore", FEDERATION_BACKEND_METHODS.setThreadCheckoutHibernation, {
+      backend: "codex", threadId: "t1", restore: true,
+    });
+    expect(refused).toMatchObject({ kind: "error" });
+    expect(setThreadCheckoutHibernation).toHaveBeenCalledTimes(1);
   });
 
   it("refuses a viewer without turn control", async () => {

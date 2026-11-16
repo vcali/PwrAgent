@@ -60,6 +60,9 @@ export const PWRAGENT_THREAD_INSPECTION_OPERATION_NAMES = [
   "manage_thread_dependencies",
   "mutate_thread",
   "mark_project_read",
+  "scan_thread_maintenance",
+  "apply_thread_maintenance",
+  "open_thread_maintenance",
 ] as const;
 
 export type PwrAgentThreadInspectionOperationName =
@@ -89,6 +92,8 @@ export type PwrAgentThreadInspectionContext = {
   now?: number;
   /** Trusted invoking turn, used when owner resolution reaches a peer. */
   turnId?: string;
+  /** Trusted tool call id, used to anchor an operator confirmation card. */
+  callId?: string;
 };
 
 export type SearchThreadsToolArgs = {
@@ -188,6 +193,145 @@ export type MarkProjectReadResult = {
   instanceId: FederationInstanceId;
   isLocal: boolean;
   changedCount: number;
+};
+
+export type ScanThreadMaintenanceToolArgs = {
+  /** Limit the scan to one project: its main checkout path. */
+  projectKey?: string;
+  rules?: Partial<import("../thread-maintenance").ThreadMaintenanceRules>;
+  /** Read a scan an earlier call started, waiting while it runs. Pass alone. */
+  scanId?: string;
+};
+
+export type ApplyThreadMaintenanceToolArgs = {
+  scanId: string;
+  archive?: import("../thread-maintenance").ThreadMaintenanceApplyRequest["archive"];
+  removeCheckouts?: import("../thread-maintenance").ThreadMaintenanceApplyRequest["removeCheckouts"];
+  trashCheckouts?: import("../thread-maintenance").ThreadMaintenanceApplyRequest["trashCheckouts"];
+  removeBuildOutputs?: import("../thread-maintenance").ThreadMaintenanceApplyRequest["removeBuildOutputs"];
+  removeEmptyFolders?: boolean;
+  /** Idle checkouts to hibernate, from the scan's hibernate list. */
+  hibernate?: import("../thread-maintenance").ThreadMaintenanceApplyRequest["hibernate"];
+  /** Return what would run without asking the operator or changing anything. */
+  dryRun?: boolean;
+};
+
+export type OpenThreadMaintenanceToolArgs = {
+  projectKey?: string;
+};
+
+/** A bounded, agent-sized view of one maintenance scan. */
+export type ThreadMaintenanceScanToolResult = {
+  scanId: string;
+  finishedAt: number;
+  rules: import("../thread-maintenance").ThreadMaintenanceRules;
+  projectKey?: string;
+  threads: {
+    checked: number;
+    idleCount: number;
+    kept: Record<string, number>;
+    skipped?: string;
+    projects: Array<{
+      key: string;
+      label: string;
+      idleCount: number;
+      kept: Record<string, number>;
+      idle: Array<{
+        backend: string;
+        threadId: ThreadIdentifier;
+        title: string;
+        lastActivityAt: number;
+        workspace: import("../thread-maintenance").ThreadMaintenanceWorkspace["kind"];
+        changedFiles?: number;
+        changedBytes?: number;
+        worktreePath?: string;
+        subThreads: number;
+        space?: import("../thread-maintenance").ThreadMaintenanceSpace;
+      }>;
+    }>;
+    /** True when idle rows were cut to fit. idleCount stays exact. */
+    truncated: boolean;
+  };
+  checkouts: {
+    /** Largest reviewed Cargo profiles, capped independently of checkout rows. */
+    buildOutputs?: import("../thread-maintenance").ThreadMaintenanceBuildOutput[];
+    /** Complete count and allocation, including rows omitted by the cap. */
+    buildOutputCount?: number;
+    buildOutputSpace?: import("../thread-maintenance").ThreadMaintenanceSpace;
+    removable: Array<{ backend: string; threadId: ThreadIdentifier; worktreePath: string; workspace?: string; space?: import("../thread-maintenance").ThreadMaintenanceSpace }>;
+    repositoryGone: Array<{ worktreePath: string; missingRepositoryPath?: string; space?: import("../thread-maintenance").ThreadMaintenanceSpace }>;
+    /** PwrAgent checkouts no thread refers to. Review them in the dialog. */
+    unreferenced: Array<{ worktreePath: string; workspace: string; space?: import("../thread-maintenance").ThreadMaintenanceSpace }>;
+    coverage?: import("../thread-maintenance").ThreadMaintenanceCoverage;
+    kept: Record<string, number>;
+    emptyFolders: number;
+    skipped?: string;
+    truncated: boolean;
+  };
+  /** Idle checkouts that can hibernate. Absent from owners without the step. */
+  hibernate?: {
+    idleDays: number;
+    maxSnapshotMb: number;
+    checked: number;
+    items: Array<{
+      backend: string;
+      threadId: ThreadIdentifier;
+      title: string;
+      worktreePath: string;
+      lastActivityAt: number;
+      changedFiles: number;
+      changedBytes: number;
+      space?: import("../thread-maintenance").ThreadMaintenanceSpace;
+      /** The archive list offers this thread too. Pick one, not both. */
+      offeredForArchive?: boolean;
+    }>;
+    /** Active within idleDays; not idle yet. */
+    notIdleYet?: number;
+    /** Already hibernated; not counted in `checked`. */
+    alreadyHibernated?: number;
+    coverage?: import("../thread-maintenance").ThreadMaintenanceCoverage;
+    kept: Record<string, number>;
+    skipped?: string;
+    truncated: boolean;
+  };
+  expired: { enabled: boolean; retentionDays: number };
+  failureCount: number;
+  failures: import("../thread-maintenance").ThreadMaintenanceFailure[];
+  /** The latest run, when one exists. */
+  run?: ThreadMaintenanceRunToolResult;
+  guidance: string;
+};
+
+/** A scan still running when the call's wait ended. It keeps running. */
+export type ThreadMaintenanceScanPendingToolResult = {
+  scanId: string;
+  running: true;
+  startedAt: number;
+  projectKey?: string;
+  run?: ThreadMaintenanceRunToolResult;
+  guidance: string;
+};
+
+export type ThreadMaintenanceRunToolResult = {
+  runId: string;
+  scanId: string;
+  running: boolean;
+  startedAt: number;
+  finishedAt?: number;
+  steps: import("../thread-maintenance").ThreadMaintenanceStepResult[];
+  problems: import("../thread-maintenance").ThreadMaintenanceProblem[];
+  guidance?: string;
+};
+
+export type ThreadMaintenancePlanToolResult = {
+  scanId: string;
+  archive: number;
+  removeCheckouts: number;
+  trashCheckouts: number;
+  removeBuildOutputs?: number;
+  removeEmptyFolders: boolean;
+  hibernate: number;
+  snapshotApprovals: Array<{ threadId: ThreadIdentifier; title: string; bytes: number }>;
 };
 
 export type MutateThreadToolArgs = {
@@ -559,6 +703,8 @@ export type ThreadInspectionSummary = {
   projectKey?: string;
   createdAt?: number;
   updatedAt?: number;
+  /** Provider archive membership, including when no archive timestamp exists. */
+  archived?: boolean;
   archivedAt?: number;
   agent?: ThreadAgentMetadata;
   handoffOrigin?: ThreadHandoffOrigin;
@@ -833,6 +979,9 @@ export type PwrAgentThreadInspectionToolArgsByOperation = {
   rename_current_thread: RenameCurrentThreadToolArgs;
   mutate_thread: MutateThreadToolArgs;
   mark_project_read: MarkProjectReadToolArgs;
+  scan_thread_maintenance: ScanThreadMaintenanceToolArgs;
+  apply_thread_maintenance: ApplyThreadMaintenanceToolArgs;
+  open_thread_maintenance: OpenThreadMaintenanceToolArgs;
 };
 
 export type PwrAgentThreadInspectionToolArgs<
@@ -898,6 +1047,22 @@ export type PwrAgentThreadInspectionResponse =
           }
         | {
             projectRead: MarkProjectReadResult;
+          }
+        | {
+            maintenanceScan: ThreadMaintenanceScanToolResult;
+          }
+        | {
+            maintenanceScanPending: ThreadMaintenanceScanPendingToolResult;
+          }
+        | {
+            maintenanceRun: ThreadMaintenanceRunToolResult;
+          }
+        | {
+            maintenancePlan: ThreadMaintenancePlanToolResult;
+            dryRun: true;
+          }
+        | {
+            maintenanceDialog: { opened: boolean };
           };
     }
   | {

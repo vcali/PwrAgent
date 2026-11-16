@@ -1,15 +1,18 @@
 import { NavigationQueryStore } from "../app-server/navigation-query-store";
+import { ThreadTurnQueue } from "@pwragent/owner-core/thread-turn-queue";
 import { currentMessagingModels, messagingModelCatalog, otherMessagingModels } from "./fixtures/messaging-model-catalog";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import fc from "fast-check";
 import type {
   AgentEvent,
   AppServerBackendKind,
   AppServerListSkillsResponse,
   AppServerPendingRequestNotification,
+  AppServerTurnInputItem,
   BackendSummary,
   CancelThreadExecutionModeQueueRequest,
   EnsureDirectoryLaunchpadRequest,
@@ -52,13 +55,14 @@ import {
   messagingQuestionnaireActions,
 } from "@pwragent/messaging-interface";
 import { PERMISSIVE_CAPABILITY_PROFILE } from "@pwragent/messaging-interface/testing";
-import { textForDiscordIntent } from "@pwragent/messaging-provider-discord";
+import { actionsForDiscordIntent, textForDiscordIntent } from "@pwragent/messaging-provider-discord";
 import { textForFeishuIntent } from "@pwragent/messaging-provider-feishu";
 import { textForLineIntent } from "@pwragent/messaging-provider-line";
 import { textForMattermostIntent } from "@pwragent/messaging-provider-mattermost";
-import { textForSlackIntent } from "@pwragent/messaging-provider-slack";
+import { actionsForSlackIntent, textForSlackIntent } from "@pwragent/messaging-provider-slack";
 import {
   TelegramAdapter,
+  actionsForTelegramIntent,
   textForTelegramIntent,
   type TelegramBotApi,
   type TelegramEditMessageTextRequest,
@@ -157,6 +161,7 @@ async function settleHarnessWork(): Promise<void> {
   for (const controller of harnessControllers.splice(0)) {
     controller.dispose();
     await controller.whenToolUpdatesSettled();
+    await controller.whenQueuedTurnActionsSettled();
   }
   await Promise.all(tempStores.splice(0).map((store) => store.whenIdle()));
 }
@@ -1073,6 +1078,165 @@ describe("MessagingController", () => {
         review: { runMode: "pwragent-sub-agent" },
         body: expect.stringContaining("Update"),
       });
+    }
+    await harness.controller.handleInboundEvent(buildCallbackEvent({ actionId: "review:summary:start" }));
+    expect(harness.submitReview).not.toHaveBeenCalled();
+    expect(harness.delivered.at(-1)).toMatchObject({ kind: "error", body: expect.stringContaining("Update") });
+  });
+
+  it.each([true, false, undefined])("offers Auto-fix only when the owner advertises it (%s)", async (supported) => {
+    const harness = await createHarness({ listBackends: async () => ({
+      fetchedAt: 1000,
+      backends: [
+        buildBackendSummary({ capabilities: {
+          ...buildBackendSummary().capabilities, reviewAutoFix: supported,
+        } }),
+        buildBackendSummary({ kind: "acp:grok", capabilities: {
+          ...buildBackendSummary().capabilities, reviewRunner: true, reviewAutoFix: !supported,
+        } }),
+      ],
+    }) });
+    await bindThread(harness);
+    await harness.controller.handleInboundEvent(buildCommandEvent("/review"));
+    const intent = harness.delivered.at(-1);
+    expect(intent?.kind).toBe("review");
+    if (intent?.kind !== "review") throw new Error("Expected review configurator");
+    expect(intent.actions.some((action) => action.id === "review:summary:auto-fix")).toBe(supported === true);
+    expect(intent.review.afterReview).toBe(supported ? "auto-fix" : undefined);
+    if (supported) expect(intent.body).toContain("Auto-fix findings: On");
+    await harness.controller.handleInboundEvent(buildCallbackEvent({ actionId: "review:summary:reviewer" }));
+    expect(harness.delivered.at(-1)).toMatchObject({
+      actions: expect.not.arrayContaining([expect.objectContaining({ value: { backend: "codex" } })]),
+    });
+  });
+
+  it.each(["picker", "command", "text"])("defaults Auto-fix on for the %s review start path", async (path) => {
+    const harness = await createHarness({ listBackends: async () => ({
+      fetchedAt: 1000, backends: [buildBackendSummary({ capabilities: {
+        ...buildBackendSummary().capabilities, reviewAutoFix: true,
+      } })],
+    }) });
+    await bindThread(harness);
+    await harness.controller.handleInboundEvent(path === "text"
+      ? buildTextEvent("/review main", { botMention: true })
+      : buildCommandEvent(path === "picker" ? "/review" : "/review main"));
+    if (path === "picker") {
+      await harness.controller.handleInboundEvent(buildCallbackEvent({ actionId: "review:summary:start" }));
+    }
+    expect(harness.submitReview).toHaveBeenCalledWith(expect.objectContaining({ afterReview: "auto-fix" }));
+  });
+
+  it("preserves the Auto-fix choice under any sequence of toggles and picker navigation", async () => {
+    // Model: new reviews fix by default; only a toggle changes that choice.
+    await fc.assert(fc.asyncProperty(
+      fc.array(fc.constantFrom("toggle", "scope", "mode", "reviewer"), { maxLength: 6 }),
+      async (steps) => {
+        const harness = await createHarness({ listBackends: async () => ({
+          fetchedAt: 1000, backends: [
+            buildBackendSummary({ capabilities: {
+              ...buildBackendSummary().capabilities, reviewRunner: true,
+              reviewRunMode: true, reviewCodexSubAgent: true, reviewAutoFix: true,
+            } }),
+            buildBackendSummary({ kind: "acp:grok", capabilities: {
+              ...buildBackendSummary().capabilities, reviewRunner: true, reviewAutoFix: false,
+            } }),
+          ],
+        }) });
+        await bindThread(harness);
+        await harness.controller.handleInboundEvent(buildCommandEvent("/review"));
+        let autoFix = true;
+        for (const step of steps) {
+          const actions = step === "toggle" ? ["review:summary:auto-fix"]
+            : step === "scope" ? ["review:summary:target", "review:target:current-changes"]
+              : step === "mode" ? ["review:summary:mode", "review:mode:pwragent-sub-agent"]
+                : ["review:summary:reviewer", "review:reviewer:provider:1", "review:reviewer:model:default"];
+          for (const actionId of actions) {
+            await harness.controller.handleInboundEvent(buildCallbackEvent({ actionId }));
+          }
+          if (step === "toggle") autoFix = !autoFix;
+          expect(harness.delivered.at(-1)).toMatchObject({
+            review: { afterReview: autoFix ? "auto-fix" : "wait" },
+            body: expect.stringContaining(`Auto-fix findings: ${autoFix ? "On" : "Off"}`),
+          });
+        }
+        await harness.controller.handleInboundEvent(buildCallbackEvent({ actionId: "review:summary:start" }));
+        expect(harness.submitReview).toHaveBeenCalledWith(expect.objectContaining({
+          afterReview: autoFix ? "auto-fix" : "wait",
+        }));
+        await settleHarnessWork();
+      },
+    ), { numRuns: 25 });
+  });
+
+  it("keeps Auto-fix off in a restored pending review and resets it for the next review", async () => {
+    const options = { listBackends: async () => ({
+      fetchedAt: 1000, backends: [buildBackendSummary({ capabilities: {
+        ...buildBackendSummary().capabilities, reviewAutoFix: true,
+      } })],
+    }) };
+    const original = await createHarness(options);
+    await bindThread(original);
+    await original.controller.handleInboundEvent(buildCommandEvent("/review"));
+    await original.controller.handleInboundEvent(buildCallbackEvent({ actionId: "review:summary:auto-fix" }));
+    original.controller.dispose();
+    const restored = await createHarness({ ...options, store: original.store });
+    await restored.controller.handleInboundEvent(buildCallbackEvent({ actionId: "review:summary:base-branch" }));
+    await restored.controller.handleInboundEvent(buildTextEvent("release"));
+    await restored.controller.handleInboundEvent(buildCallbackEvent({ actionId: "review:summary:start" }));
+    expect(restored.submitReview).toHaveBeenCalledWith(expect.objectContaining({
+      afterReview: "wait", target: { type: "baseBranch", branch: "release" },
+    }));
+    await restored.controller.handleInboundEvent(buildCommandEvent("/review"));
+    expect(restored.delivered.at(-1)).toMatchObject({ review: { afterReview: "auto-fix" } });
+  });
+
+  it("budgets SQLite writes for an Auto-fix toggle", async () => {
+    const previous = process.env[SQLITE_WRITE_METRICS_ENV];
+    process.env[SQLITE_WRITE_METRICS_ENV] = "1";
+    const { tempDir, dbPath } = createTempStateDb("pwragent-review-autofix-writes-");
+    tempDirs.push(tempDir);
+    const db = StateDb.open(dbPath);
+    try {
+      const harness = await createHarness({
+        store: new SqliteMessagingStore(db),
+        listBackends: async () => ({
+          fetchedAt: 1000, backends: [buildBackendSummary({ capabilities: {
+            ...buildBackendSummary().capabilities, reviewAutoFix: true,
+          } })],
+        }),
+      });
+      await bindThread(harness);
+      await harness.controller.handleInboundEvent(buildCommandEvent("/review"));
+      const { writes } = await measureSqliteWrites(async () => {
+        await harness.controller.handleInboundEvent(buildCallbackEvent({ actionId: "review:summary:auto-fix" }));
+      });
+      expectSqliteWriteBudget({
+        scenario: "messaging-review-auto-fix-toggle",
+        note: "One Auto-fix toggle: 2 boundary commits, 28840 WAL bytes; 0.577 MB/day at 20 toggles/day; no idle/timer writes.",
+        writes,
+      });
+    } finally {
+      await settleHarnessWork();
+      db.close();
+      if (previous === undefined) delete process.env[SQLITE_WRITE_METRICS_ENV];
+      else process.env[SQLITE_WRITE_METRICS_ENV] = previous;
+    }
+  });
+
+  it.each([false, true])("retains Auto-fix after an owner downgrade and blocks Start (rebuild: %s)", async (rebuild) => {
+    let supported = true;
+    const harness = await createHarness({ listBackends: async () => ({
+      fetchedAt: 1000, backends: [buildBackendSummary({ capabilities: {
+        ...buildBackendSummary().capabilities, reviewAutoFix: supported,
+      } })],
+    }) });
+    await bindThread(harness);
+    await harness.controller.handleInboundEvent(buildCommandEvent("/review"));
+    supported = false;
+    if (rebuild) {
+      await harness.controller.handleInboundEvent(buildCallbackEvent({ actionId: "review:summary:target" }));
+      await harness.controller.handleInboundEvent(buildCallbackEvent({ actionId: "review:back" }));
+      expect(harness.delivered.at(-1)).toMatchObject({ review: { afterReview: "auto-fix" } });
     }
     await harness.controller.handleInboundEvent(buildCallbackEvent({ actionId: "review:summary:start" }));
     expect(harness.submitReview).not.toHaveBeenCalled();
@@ -6577,7 +6741,7 @@ describe("MessagingController", () => {
       },
     } satisfies AgentEvent);
 
-    expect(harness.startTurn).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(harness.startTurn).toHaveBeenCalledTimes(2));
     await expect(
       harness.controller.handlePwrAgentMessagingRequest({
         operation: "get_current_messaging_surface",
@@ -10442,6 +10606,99 @@ describe("MessagingController", () => {
         body: "The model 'gpt-image-2' does not exist.",
       }),
     );
+  });
+
+  it.each([
+    ["telegram", actionsForTelegramIntent, textForTelegramIntent],
+    ["discord", actionsForDiscordIntent, textForDiscordIntent],
+    ["slack", actionsForSlackIntent, textForSlackIntent],
+  ] as const)("offers Claude session recovery on %s and confirms the next message starts it", async (channel, actionsForIntent, textForIntent) => {
+    const harness = await createHarness({ channel });
+    const inbound = buildCommandEvent("/continue");
+    inbound.channel.channel = channel;
+    const binding = await harness.store.upsertBinding({
+      id: "claude-binding", backend: "claude", threadId: "thread-1", channel: inbound.channel,
+      authorizedActorIds: ["user-1"], createdAt: 1000, updatedAt: 1000,
+    });
+    const failure: AgentEvent = {
+      backend: "claude",
+      notification: { method: "turn/failed", params: {
+        threadId: "thread-1", turnId: "failed-turn", turn: {
+          id: "failed-turn", status: "failed", error: { message: "Claude deleted this session.", recovery: "claudeSessionGone" },
+        },
+      } },
+    };
+    await harness.controller.handleBackendEvent(failure);
+    await harness.controller.handleBackendEvent(failure);
+    const notices = harness.delivered.filter((intent) => intent.kind === "confirmation" && intent.title === "Turn failed");
+    expect(notices).toHaveLength(1);
+    const notice = notices[0]!;
+    expect(textForIntent(notice)).toContain("Claude deleted this session.");
+    const action = actionsForIntent(notice)[0]!;
+    expect(action).toMatchObject({
+      id: "claude:continue-session", label: "Continue in a new session",
+      value: { bindingId: binding.id, threadId: binding.threadId }, fallbackText: "/continue",
+    });
+    await harness.controller.handleInboundEvent(buildCallbackEvent({
+      actionId: action.id, value: action.value, channel: inbound.channel,
+    }));
+    expect(harness.continueClaudeThreadInNewSession).toHaveBeenCalledWith({ threadId: "thread-1" });
+    expect(harness.delivered.at(-1)).toMatchObject({
+      kind: "confirmation", body: expect.stringContaining("Your next message starts a new Claude session"),
+    });
+    expect(harness.startTurn).not.toHaveBeenCalled();
+  });
+
+  it("offers a command fallback on a text-only surface", async () => {
+    const harness = await createHarness({ capabilityProfile: { ...PERMISSIVE_CAPABILITY_PROFILE, actions: undefined } });
+    await harness.store.upsertBinding({
+      id: "claude-binding", backend: "claude", threadId: "thread-1", channel: buildCommandEvent("/continue").channel,
+      authorizedActorIds: ["user-1"], createdAt: 1000, updatedAt: 1000,
+    });
+    await harness.controller.handleBackendEvent({
+      backend: "claude",
+      notification: { method: "turn/failed", params: {
+        threadId: "thread-1", turnId: "failed-turn", turn: {
+          id: "failed-turn", status: "failed", error: { message: "Claude deleted this session.", recovery: "claudeSessionGone" },
+        },
+      } },
+    });
+    expect(harness.delivered).toContainEqual(expect.objectContaining({
+      kind: "confirmation", actions: [], body: expect.stringContaining("Send /continue"),
+    }));
+    await harness.controller.handleInboundEvent(buildCommandEvent("/continue"));
+    expect(harness.continueClaudeThreadInNewSession).toHaveBeenCalledWith({ threadId: "thread-1" });
+    expect(harness.startTurn).not.toHaveBeenCalled();
+  });
+
+  it("relays a Claude session recovery refusal without starting a turn", async () => {
+    const navigation = buildNavigationSnapshot();
+    navigation.threads[0]!.source = "claude";
+    const harness = await createHarness({ navigation });
+    await bindThreadToBackend(harness, "claude");
+    harness.continueClaudeThreadInNewSession.mockRejectedValueOnce(new Error("Claude still has this conversation."));
+    await harness.controller.handleInboundEvent(buildCommandEvent("/continue"));
+    expect(harness.delivered.at(-1)).toMatchObject({
+      kind: "error", body: "Claude still has this conversation.",
+    });
+    expect(harness.startTurn).not.toHaveBeenCalled();
+  });
+
+  it("does not offer session recovery for an ordinary Claude failure", async () => {
+    const navigation = buildNavigationSnapshot();
+    navigation.threads[0]!.source = "claude";
+    const harness = await createHarness({ navigation });
+    await bindThreadToBackend(harness, "claude");
+    await harness.controller.handleBackendEvent({
+      backend: "claude",
+      notification: { method: "turn/failed", params: {
+        threadId: "thread-1", turnId: "failed-turn", turn: {
+          id: "failed-turn", status: "failed", error: { message: "Something else failed." },
+        },
+      } },
+    });
+    expect(harness.delivered).toContainEqual(expect.objectContaining({ kind: "error", title: "Turn failed", body: "Something else failed." }));
+    expect(harness.delivered.some((intent) => intent.kind === "confirmation" && intent.actions.length > 0)).toBe(false);
   });
 
   it("does not double-post the error notice for the same failed turn", async () => {
@@ -16829,6 +17086,68 @@ describe("MessagingController", () => {
     } finally { db.close(); }
   });
 
+  it.each(["before acceptance", "during notice", "after notice"] as const)("authorizes queued remote PDFs when owner start arrives %s", async (order) => {
+    const db = StateDb.open(":memory:");
+    const releaseNotice = createDeferred<void>();
+    const noticeEntered = createDeferred<void>();
+    let pending: Promise<void> | undefined;
+    let controller: MessagingController | undefined;
+    try {
+      const requests = new SqliteMessagingRequestStore(db.raw);
+      const navigation = buildNavigationSnapshot();
+      const target = buildFederatedThreadRef({ backend: "codex", instanceId: "pwr_pdf_outpost", threadId: "thread-1" });
+      navigation.threads[0]!.federation = { ref: target, instanceLabel: "Fixture owner", peerStatus: "connected" };
+      const pdfData = Buffer.from("%PDF-1.7\nfixture");
+      vi.mocked(inspectPdfDocument).mockResolvedValueOnce({ pageCount: 1,
+        firstPage: { width: 612, height: 792, renderWidth: 612, renderHeight: 792 } });
+      const started: AgentEvent = { backend: "codex", federationTarget: target.target, notification: {
+        method: "thread/turnQueue/updated", params: { threadId: "thread-1", queueEntryId: "pdf-entry", origin: "manual", status: "started", turnId: "pdf-turn" },
+      } };
+      let calls = 0;
+      const harness = await createHarness({ navigation, requestStore: requests, authorizeRetainedSource: () => true,
+        backendOverrides: { ownsTurnQueue: true }, supportsMessagingPdfTools: async () => true,
+        downloadAttachment: async ({ attachment }) => ({ data: pdfData, fileName: attachment.name, mimeType: attachment.mimeType, sizeBytes: pdfData.length }),
+        startTurn: async () => {
+          if (++calls === 1) return { backend: "codex", threadId: "thread-1", turnId: "turn-1" };
+          if (order === "before acceptance") await harness.controller.handleBackendEvent(started);
+          return { backend: "codex", threadId: "thread-1", turnId: "pdf-entry", queueEntryId: "pdf-entry", queueStatus: "queued" };
+        },
+        deliver: async (intent) => {
+          if (intent.kind === "confirmation" && intent.title === "Message queued" && intent.delivery?.mode !== "update") {
+            noticeEntered.resolve();
+            await releaseNotice.promise;
+          }
+          return { channel: "telegram", deliveredAt: 1_000, outcome: "presented", surface: { channel: "telegram", id: "notice" } };
+        },
+      });
+      controller = harness.controller;
+      const event = { ...buildTextEvent("queued remote PDF"), kind: "media" as const, disposition: "available" as const,
+        attachments: [{ id: "fixture-pdf", kind: "file" as const, name: "fixture.pdf", disposition: "available" as const, mimeType: "application/pdf", sizeBytes: pdfData.length }] };
+      await harness.store.upsertBinding({ id: "pdf-outpost-binding", backend: "codex", threadId: "thread-1", targetKind: "thread", federatedThread: target,
+        channel: event.channel, authorizedActorIds: ["user-1"], createdAt: 1000, updatedAt: 1000 });
+      await controller.handleInboundEvent(buildTextEvent("first"));
+      pending = controller.handleInboundEvent(event);
+      await noticeEntered.promise;
+      if (order === "after notice") { releaseNotice.resolve(); await pending; }
+      if (order !== "before acceptance") await controller.handleBackendEvent(started);
+      const source = harness.startTurn.mock.calls[1]![0].messageOrigin!.causalMessagingSource;
+      const context = { backend: "codex" as const, threadId: "thread-1", turnId: "pdf-turn", causalMessagingSource: source, requestingInstanceId: "pwr_pdf_outpost" };
+      // The owner has started: a provider notice cannot delay authorization.
+      expect(await controller.handlePwrAgentMessagingRequest({ operation: "inspect_messaging_pdfs", context, args: {} }))
+        .toMatchObject({ ok: true, data: { attachments: [expect.objectContaining({ name: "fixture.pdf" })] } });
+      releaseNotice.resolve(); await pending;
+      expect(await controller.handlePwrAgentMessagingRequest({ operation: "inspect_messaging_pdfs", context, args: {} })).toMatchObject({ ok: true });
+      for (const wrong of [{ requestingInstanceId: "wrong-owner" }, { turnId: "wrong-turn" },
+        { causalMessagingSource: { ...source!, requestId: "wrong-request" } }]) {
+        expect(await controller.handlePwrAgentMessagingRequest({ operation: "inspect_messaging_pdfs", context: { ...context, ...wrong }, args: {} }))
+          .toMatchObject({ ok: false, error: { code: "forbidden" } });
+      }
+    } finally {
+      releaseNotice.resolve(); await pending;
+      controller?.dispose(); db.close();
+    }
+  });
+
   it("leaves messaging PDFs as normal file input when PDF analysis is disabled", async () => {
     const pdfData = new TextEncoder().encode("%PDF-1.7\n/pass through\n");
     const supportsMessagingPdfTools = vi.fn(async () => true);
@@ -17029,6 +17348,296 @@ describe("MessagingController", () => {
     );
   });
 
+  it("budgets shared queue notice admission and owner-start retirement", async () => {
+    const previous = process.env[SQLITE_WRITE_METRICS_ENV];
+    process.env[SQLITE_WRITE_METRICS_ENV] = "1";
+    const { tempDir, dbPath } = createTempStateDb("pwragent-shared-queue-writes-");
+    tempDirs.push(tempDir);
+    const db = StateDb.open(dbPath);
+    let controller: MessagingController | undefined;
+    try {
+      let calls = 0;
+      const harness = await createHarness({ store: new SqliteMessagingStore(db),
+        backendOverrides: { ownsTurnQueue: true },
+        startTurn: async () => ++calls === 1
+          ? { backend: "codex", threadId: "thread-1", turnId: "turn-1" }
+          : { backend: "codex", threadId: "thread-1", turnId: "owner-entry", queueEntryId: "owner-entry", queueStatus: "queued" },
+      });
+      controller = harness.controller;
+      await bindThread(harness);
+      await controller.handleInboundEvent(buildTextEvent("first"));
+      const { writes } = await measureSqliteWrites(async () => {
+        await harness.controller.handleInboundEvent(buildTextEvent("follow-up"));
+        await harness.controller.handleBackendEvent({ backend: "codex", notification: {
+          method: "thread/turnQueue/updated", params: { threadId: "thread-1", queueEntryId: "owner-entry", origin: "messaging", status: "started", turnId: "turn-2" },
+        } });
+      });
+      expectSqliteWriteBudget({ scenario: "messaging-owner-queue-lifecycle",
+        note: "One queued reply through preparation activity, queue notice, and owner-start retirement: 3 commits, ~54 KB WAL; ~5.36 MB/day at 100 replies/day, no idle/timer writes.", writes });
+    } finally {
+      controller?.dispose();
+      await controller?.whenToolUpdatesSettled();
+      db.close();
+      if (previous === undefined) delete process.env[SQLITE_WRITE_METRICS_ENV];
+      else process.env[SQLITE_WRITE_METRICS_ENV] = previous;
+    }
+  });
+
+  it("budgets recovery after steering and fallback fail, through an accepted manual retry", async () => {
+    const previous = process.env[SQLITE_WRITE_METRICS_ENV];
+    process.env[SQLITE_WRITE_METRICS_ENV] = "1";
+    const { tempDir, dbPath } = createTempStateDb("pwragent-queue-recovery-writes-");
+    tempDirs.push(tempDir);
+    const db = StateDb.open(dbPath);
+    let controller: MessagingController | undefined;
+    try {
+      let calls = 0;
+      const harness = await createHarness({ store: new SqliteMessagingStore(db),
+        backendOverrides: {
+          ownsTurnQueue: true,
+          readQueuedTurn: async () => ({ queueEntryId: "owner-entry", contentHash: "hash", input: [{ type: "text", text: "owner input" }] }),
+          cancelQueuedTurn: async () => {
+            await harness.controller.handleBackendEvent({ backend: "codex", notification: {
+              method: "thread/turnQueue/updated", params: { threadId: "thread-1", queueEntryId: "owner-entry", origin: "messaging", status: "cancelled" },
+            } });
+            return { queueEntryId: "owner-entry", cancelled: true };
+          },
+        },
+        startTurn: async () => {
+          if (++calls === 1) return { backend: "codex", threadId: "thread-1", turnId: "turn-1" };
+          if (calls === 3) throw new Error("Owner disconnected");
+          const queueEntryId = calls === 2 ? "owner-entry" : "retry-entry";
+          return { backend: "codex", threadId: "thread-1", turnId: queueEntryId, queueEntryId, queueStatus: "queued" };
+        },
+      });
+      controller = harness.controller;
+      await bindThread(harness);
+      await controller.handleInboundEvent(buildTextEvent("first"));
+      await controller.handleInboundEvent(buildTextEvent("queued"));
+      harness.steerTurn.mockRejectedValue(new Error("Steer rejected"));
+      const { writes } = await measureSqliteWrites(async () => {
+        await harness.controller.handleInboundEvent(buildCallbackEvent({ actionId: "queued-turn:steer:owner-entry" }));
+        await harness.controller.whenQueuedTurnActionsSettled();
+        const notice = harness.delivered.filter((intent) => intent.kind === "confirmation" && intent.title === "Message queued").at(-1);
+        const retry = notice && "actions" in notice ? notice.actions?.find((action) => action.id.startsWith("queued-turn:retry:")) : undefined;
+        expect(retry).toBeDefined();
+        await harness.controller.handleInboundEvent(buildCallbackEvent({ actionId: retry!.id }));
+      });
+      expectSqliteWriteBudget({ scenario: "messaging-owner-queue-recovery",
+        note: "One failed steer and failed fallback retained for manual Retry, then accepted by the owner queue: 6 commits, ~91 KB WAL; ~0.91 MB/day at 10 recoveries/day, no idle/automatic retry writes.", writes });
+    } finally {
+      controller?.dispose(); await controller?.whenToolUpdatesSettled(); db.close();
+      if (previous === undefined) delete process.env[SQLITE_WRITE_METRICS_ENV];
+      else process.env[SQLITE_WRITE_METRICS_ENV] = previous;
+    }
+  });
+
+  it("admits busy-thread messaging input to the owner's FIFO in arrival order", async () => {
+    await fc.assert(fc.asyncProperty(fc.array(fc.constantFrom("follow up", "same message", "check status"), {
+      minLength: 1, maxLength: 4,
+    }), async (messages) => {
+      const started: string[] = [];
+      const owner = new ThreadTurnQueue({ startTurn: async (entry) => {
+        started.push(entry.input.map((part) => part.type === "text" ? part.text : "").join(""));
+        return { backend: entry.backend, threadId: entry.threadId, turnId: `turn-${started.length}` };
+      } });
+      const harness = await createHarness({
+        backendOverrides: { ownsTurnQueue: true },
+        startTurn: async (request) => {
+          const result = await owner.submit({ ...request, origin: "messaging" });
+          return { backend: request.backend, threadId: request.threadId,
+            turnId: result.status === "started" ? result.turnId : result.entry.id,
+            queueStatus: result.status, queueEntryId: result.entry.id };
+        },
+      });
+      try {
+        await bindThread(harness);
+        await harness.controller.handleInboundEvent(buildTextEvent("first"));
+        for (const text of messages) await harness.controller.handleInboundEvent(buildTextEvent(text));
+        // The owner is the oracle for every viewer's queue. No accepted
+        // follow-up may live only in a messaging controller's local FIFO.
+        expect(owner.getQueuedEntries({ backend: "codex", threadId: "thread-1" })
+          .map((entry) => entry.input)).toEqual(messages.map((text) => [{ type: "text", text }]));
+        expect(started).toEqual(["first"]);
+        for (let index = 0; index <= messages.length; index += 1) {
+          await owner.releaseThread({ backend: "codex", threadId: "thread-1",
+            turnId: `turn-${index + 1}`, status: "turn/completed" });
+        }
+        expect(started).toEqual(["first", ...messages]);
+        expect(harness.startTurn).toHaveBeenCalledTimes(messages.length + 1);
+      } finally { harness.controller.dispose(); }
+    }), { numRuns: 8 });
+  });
+
+  it.each(["cancel", "steer", "edited"] as const)("uses owner content and cancellation disposition for shared queue action %s", async (action) => {
+    const cancelQueuedTurn = vi.fn(async () => ({ queueEntryId: "owner-entry", cancelled: action !== "edited" }));
+    const readQueuedTurn = vi.fn(async () => ({ queueEntryId: "owner-entry", contentHash: "owner-hash",
+      input: [{ type: "text" as const, text: "edited in desktop" }] }));
+    let calls = 0;
+    const harness = await createHarness({
+      backendOverrides: { ownsTurnQueue: true, cancelQueuedTurn, readQueuedTurn },
+      startTurn: async () => ++calls === 1
+        ? { backend: "codex", threadId: "thread-1", turnId: "turn-1" }
+        : { backend: "codex", threadId: "thread-1", turnId: "owner-entry", queueEntryId: "owner-entry", queueStatus: "queued" },
+    });
+    await bindThread(harness);
+    await harness.controller.handleInboundEvent(buildTextEvent("first"));
+    await harness.controller.handleInboundEvent(buildTextEvent("original follow-up"));
+    await harness.controller.handleInboundEvent(buildCallbackEvent({
+      actionId: `queued-turn:${action === "cancel" ? "cancel" : "steer"}:owner-entry`,
+    }));
+    await harness.controller.whenQueuedTurnActionsSettled();
+    expect(cancelQueuedTurn).toHaveBeenCalledWith(expect.objectContaining({ queueEntryId: "owner-entry", expectedContentHash: "owner-hash" }));
+    if (action === "steer") expect(harness.steerTurn).toHaveBeenCalledWith(expect.objectContaining({ input: [{ type: "text", text: "edited in desktop" }] }));
+    else expect(harness.steerTurn).not.toHaveBeenCalled();
+    if (action === "edited") expect(harness.delivered.at(-1)).toMatchObject({ kind: "error", body: expect.stringContaining("changed or has already been admitted") });
+  });
+
+  it("preserves owner input until a retry is admitted after failed steering and fallback", async () => {
+    await fc.assert(fc.asyncProperty(fc.boolean(), fc.integer({ min: 0, max: 2 }), async (queueRetry, failedRetries) => {
+      let calls = 0;
+      const harness = await createHarness({
+        backendOverrides: {
+          ownsTurnQueue: true,
+          readQueuedTurn: async () => ({ queueEntryId: "owner-entry", contentHash: "owner-hash", input: [{ type: "text", text: "owner-edited input" }] }),
+          cancelQueuedTurn: async () => {
+            await harness.controller.handleBackendEvent({ backend: "codex", notification: {
+              method: "thread/turnQueue/updated", params: { threadId: "thread-1", queueEntryId: "owner-entry", origin: "messaging", status: "cancelled" },
+            } });
+            return { queueEntryId: "owner-entry", cancelled: true };
+          },
+        },
+        startTurn: async () => {
+          calls += 1;
+          if (calls === 1) return { backend: "codex", threadId: "thread-1", turnId: "turn-1" };
+          if (calls === 2) return { backend: "codex", threadId: "thread-1", turnId: "owner-entry", queueEntryId: "owner-entry", queueStatus: "queued" };
+          if (calls <= 3 + failedRetries) throw new Error("Owner disconnected");
+          return queueRetry
+            ? { backend: "codex", threadId: "thread-1", turnId: "retry-entry", queueEntryId: "retry-entry", queueStatus: "queued" }
+            : { backend: "codex", threadId: "thread-1", turnId: "turn-2" };
+        },
+      });
+      try {
+        await bindThread(harness);
+        await harness.controller.handleInboundEvent(buildTextEvent("first"));
+        await harness.controller.handleInboundEvent(buildTextEvent("original input"));
+        harness.steerTurn.mockRejectedValue(new Error("Steer rejected"));
+        await harness.controller.handleInboundEvent(buildCallbackEvent({ actionId: "queued-turn:steer:owner-entry" }));
+        await harness.controller.whenQueuedTurnActionsSettled();
+        const retryNotice = harness.delivered.filter((intent) => intent.kind === "confirmation" && intent.title === "Message queued").at(-1);
+        const retry = retryNotice && "actions" in retryNotice
+          ? retryNotice.actions?.find((action) => action.id.startsWith("queued-turn:retry:")) : undefined;
+        expect(retry).toBeDefined();
+        expect(retryNotice).toMatchObject({ body: expect.stringContaining("owner-edited input") });
+        const beforeIdle = calls;
+        await harness.controller.handleBackendEvent({ backend: "codex", notification: {
+          method: "thread/status/changed", params: { threadId: "thread-1", status: { type: "idle" } },
+        } });
+        expect(calls).toBe(beforeIdle);
+        for (let index = 0; index < failedRetries; index += 1) {
+          await harness.controller.handleInboundEvent(buildCallbackEvent({ actionId: retry!.id }));
+        }
+        await Promise.all([
+          harness.controller.handleInboundEvent(buildCallbackEvent({ actionId: retry!.id })),
+          harness.controller.handleInboundEvent(buildCallbackEvent({ actionId: retry!.id })),
+        ]);
+        expect(harness.startTurn.mock.calls.slice(2).map(([request]) => request.input))
+          .toEqual(Array.from({ length: failedRetries + 2 }, () => [{ type: "text", text: "owner-edited input" }]));
+        const acceptedCalls = calls;
+        await harness.controller.handleInboundEvent(buildCallbackEvent({ actionId: retry!.id }));
+        expect(calls).toBe(acceptedCalls);
+        expect(harness.delivered.at(-1)).toMatchObject({ body: "That queued message is no longer waiting." });
+      } finally { harness.controller.dispose(); }
+    }), { numRuns: 8, examples: [[false, 0], [true, 1]] });
+  });
+
+  it.each([false, true])("keeps owner acceptance authoritative when queue notice fails=%s", async (failNotice) => {
+    let calls = 0;
+    const delivered: MessagingSurfaceIntent[] = [];
+    const harness = await createHarness({
+      backendOverrides: { ownsTurnQueue: true },
+      deliver: async (intent) => {
+        delivered.push(intent);
+        if (failNotice && intent.kind === "confirmation" && intent.title === "Message queued") throw new Error("Fixture notice failure");
+        return { channel: "telegram", deliveredAt: 1_000, outcome: "presented" };
+      },
+      startTurn: async () => ++calls === 1
+        ? { backend: "codex", threadId: "thread-1", turnId: "turn-1" }
+        : { backend: "codex", threadId: "thread-1", turnId: "owner-entry", queueEntryId: "owner-entry", queueStatus: "queued" },
+    });
+    await bindThread(harness);
+    await harness.controller.handleInboundEvent(buildTextEvent("first"));
+    await harness.controller.handleInboundEvent(buildTextEvent("follow-up"));
+    expect(delivered.some((intent) => intent.kind === "error" && intent.title === "Turn could not start")).toBe(false);
+    await harness.controller.handleBackendEvent({ backend: "codex", notification: {
+      method: "thread/turnQueue/updated", params: { threadId: "thread-1", queueEntryId: "owner-entry", origin: "messaging", status: "started", turnId: "turn-2" },
+    } });
+    await harness.controller.handleInboundEvent(buildCallbackEvent({ actionId: "queued-turn:cancel:owner-entry" }));
+    expect(delivered.at(-1)).toMatchObject({ kind: "error", body: "That queued message is no longer waiting." });
+    expect(harness.startTurn).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([false, true])("retires shared queue notices when owner start overtakes acknowledgement=%s", async (early) => {
+    let calls = 0;
+    const event: AgentEvent = { backend: "codex", notification: {
+      method: "thread/turnQueue/updated", params: { threadId: "thread-1", queueEntryId: "owner-entry", origin: "messaging", status: "started", turnId: "turn-2" },
+    } };
+    const harness = await createHarness({
+      backendOverrides: { ownsTurnQueue: true },
+      startTurn: async () => {
+        if (++calls === 1) return { backend: "codex", threadId: "thread-1", turnId: "turn-1" };
+        if (early) await harness.controller.handleBackendEvent(event);
+        return { backend: "codex", threadId: "thread-1", turnId: "owner-entry", queueEntryId: "owner-entry", queueStatus: "queued" };
+      },
+    });
+    await bindThread(harness);
+    await harness.controller.handleInboundEvent(buildTextEvent("first"));
+    await harness.controller.handleInboundEvent(buildTextEvent("follow-up"));
+    if (!early) await harness.controller.handleBackendEvent(event);
+    expect(harness.delivered).toContainEqual(expect.objectContaining({ kind: "confirmation", body: "Queued message sent as the next turn." }));
+    expect(harness.startTurn).toHaveBeenCalledTimes(2);
+  });
+
+  it("delivers terminal and idle events independently of the next queued start acknowledgement", async () => {
+    // Oracle: the owner must finish delivering the ended turn before a new
+    // turn's ordered start can acknowledge. Awaiting that start from inside
+    // the event listener creates a cycle, even for a text-only final message.
+    await fc.assert(fc.asyncProperty(fc.boolean(), async (idleFirst) => {
+      const harness = await createHarness();
+      await bindThread(harness);
+      await harness.controller.handleInboundEvent(buildTextEvent("first"));
+      await harness.controller.handleInboundEvent(buildTextEvent("follow-up"));
+      let acknowledge!: () => void;
+      const acknowledgement = new Promise<void>((resolve) => { acknowledge = resolve; });
+      harness.startTurn.mockImplementationOnce(async (request) => {
+        await acknowledgement;
+        return { backend: request.backend, threadId: request.threadId, turnId: "turn-2" };
+      });
+      const terminal: AgentEvent = { backend: "codex", notification: {
+        method: "turn/completed", params: { threadId: "thread-1", turnId: "turn-1",
+          turn: { id: "turn-1", status: "completed", output: [] } },
+      } };
+      const idle: AgentEvent = { backend: "codex", notification: {
+        method: "thread/status/changed", params: { threadId: "thread-1", status: { type: "idle" } },
+      } };
+      let delivered = false;
+      const delivery = (async () => {
+        for (const event of idleFirst ? [idle, terminal] : [terminal, idle]) {
+          await harness.controller.handleBackendEvent(event);
+        }
+        delivered = true;
+      })();
+      try {
+        await vi.waitFor(() => expect(delivered).toBe(true));
+        await vi.waitFor(() => expect(harness.startTurn).toHaveBeenCalledTimes(2));
+      } finally {
+        acknowledge();
+        await delivery;
+        harness.controller.dispose();
+      }
+    }), { numRuns: 4 });
+  });
+
   it("queues follow-up text while a turn is active and starts it after completion", async () => {
     const harness = await createHarness();
     await bindThread(harness);
@@ -17068,7 +17677,7 @@ describe("MessagingController", () => {
       },
     } satisfies AgentEvent);
 
-    expect(harness.startTurn).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(harness.startTurn).toHaveBeenCalledTimes(2));
     expect(harness.startTurn).toHaveBeenLastCalledWith(
       expect.objectContaining({
         input: [
@@ -17199,7 +17808,7 @@ describe("MessagingController", () => {
       },
     } satisfies AgentEvent);
 
-    expect(harness.startTurn).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(harness.startTurn).toHaveBeenCalledTimes(2));
     expect(harness.startTurn).toHaveBeenLastCalledWith(
       expect.objectContaining({
         backend: "codex",
@@ -17252,7 +17861,7 @@ describe("MessagingController", () => {
       },
     } satisfies AgentEvent);
 
-    expect(harness.startTurn).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(harness.startTurn).toHaveBeenCalledTimes(2));
     expect(harness.delivered).toContainEqual(
       expect.objectContaining({
         kind: "error",
@@ -17340,6 +17949,7 @@ describe("MessagingController", () => {
       }),
     );
 
+    await harness.controller.whenQueuedTurnActionsSettled();
     expect(harness.steerTurn).toHaveBeenCalledWith({
       backend: "codex",
       threadId: "thread-1",
@@ -17441,7 +18051,7 @@ describe("MessagingController", () => {
       },
     } satisfies AgentEvent);
 
-    expect(harness.startTurn).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(harness.startTurn).toHaveBeenCalledTimes(2));
     expect(harness.startTurn).toHaveBeenLastCalledWith(
       expect.objectContaining({
         input: [
@@ -17522,6 +18132,7 @@ describe("MessagingController", () => {
       }),
     );
 
+    await harness.controller.whenQueuedTurnActionsSettled();
     expect(harness.steerTurn).toHaveBeenCalledWith({
       backend: "codex",
       threadId: "thread-1",
@@ -17576,6 +18187,181 @@ describe("MessagingController", () => {
     expect(harness.startTurn).toHaveBeenCalledTimes(1);
   });
 
+  it.each((["mcp", "command"] as const).flatMap((kind) =>
+    (["accept", "decline", "cancel"] as const).flatMap((decision) =>
+      [false, true].map((ownsTurnQueue) => ({ kind, decision, ownsTurnQueue }))),
+  ))("keeps messaging $kind $decision escalation and queued cancellation live while a steer awaits approval (owner FIFO: $ownsTurnQueue)", async ({ kind, decision, ownsTurnQueue }) => {
+    // Model: ingress is sequential, as in Telegram polling. A provider's
+    // pending steer must not own ingress needed to answer its escalation.
+    await fc.assert(fc.asyncProperty(fc.boolean(), async (cancelFirst) => {
+      const permissions = new Set<MessagingPermissionId>(["thread.resume", "message.reply", "thread.status.view"]);
+      const ownerStarted: { id: string; input: AppServerTurnInputItem[]; turnId: string }[] = [];
+      const owner = new ThreadTurnQueue({ startTurn: async (entry) => {
+        const turnId = `turn-${ownerStarted.length + 1}`;
+        ownerStarted.push({ id: entry.id, input: entry.input, turnId });
+        return { backend: entry.backend, threadId: entry.threadId, turnId };
+      } });
+      const harness = await createHarness({
+        ...(ownsTurnQueue ? {
+          backendOverrides: { ownsTurnQueue: true,
+            readQueuedTurn: async (request) => {
+              const entry = owner.getQueuedEntries(request).find((candidate) => candidate.id === request.queueEntryId);
+              if (!entry) throw new Error("No owner entry");
+              return { queueEntryId: entry.id, input: entry.input, contentHash: JSON.stringify(entry.input), messageOrigin: entry.messageOrigin };
+            },
+            cancelQueuedTurn: async (request) => {
+              const entry = owner.getAllQueuedEntries().find((candidate) => candidate.id === request.queueEntryId);
+              if (entry && JSON.stringify(entry.input) !== request.expectedContentHash) return { queueEntryId: request.queueEntryId, cancelled: false };
+              const result = owner.cancelEntryWithDisposition(request.queueEntryId);
+              if (result.disposition === "cancelled") await harness.controller.handleBackendEvent({ backend: "codex", notification: {
+                method: "thread/turnQueue/updated", params: { threadId: "thread-1", queueEntryId: request.queueEntryId, origin: "messaging", status: "cancelled" },
+              } });
+              return { queueEntryId: request.queueEntryId, cancelled: result.disposition === "cancelled" };
+            },
+          },
+          startTurn: async (request: StartTurnRequest) => {
+            const result = await owner.submit({ ...request, origin: "messaging" });
+            return { backend: request.backend, threadId: request.threadId,
+              turnId: result.status === "started" ? result.turnId : result.entry.id,
+              queueStatus: result.status, queueEntryId: result.entry.id };
+          },
+        } : {}),
+        rbacPolicy: {
+        isEnforcing: () => true,
+        resolve: () => ({ permissions, roleIds: ["fixture"], matchedSubjects: [], rejected: false }),
+      } });
+      await bindThread(harness);
+      await harness.controller.handleInboundEvent(buildTextEvent("start the task"));
+      const queue = async (text: string) => {
+        await harness.controller.handleInboundEvent(buildTextEvent(text));
+        const notice = harness.delivered.filter((intent) => intent.kind === "confirmation" && intent.title === "Message queued").at(-1)!;
+        if (notice.kind !== "confirmation") throw new Error("missing queued notice");
+        return notice.actions;
+      };
+      const first = await queue("also check the logs");
+      const second = await queue("cancel this queued message");
+      const third = await queue("keep this queued message");
+      const action = (actions: MessagingSurfaceAction[], kind: string) =>
+        buildCallbackEvent({ actionId: actions.find((candidate) => candidate.id.startsWith(`queued-turn:${kind}:`))!.id });
+      const shown = createDeferred<void>();
+      const response = createDeferred<void>();
+      harness.steerTurn.mockImplementation(async (request: SteerTurnRequest) => {
+        await harness.controller.handleBackendPendingRequest("codex", kind === "mcp" ? {
+          method: "mcpServer/elicitation/request", params: { threadId: "thread-1", turnId: "turn-1",
+            requestId: "steer-escalation", serverName: "fixture", mode: "form", _meta: null,
+            message: "Confirm the steering proposal?", requestedSchema: { type: "object", properties: {} } },
+        } : { method: "item/commandExecution/requestApproval", params: {
+          threadId: "thread-1", turnId: "turn-1", requestId: "steer-escalation", command: "fixture", prompt: "Allow fixture command?",
+        } });
+        shown.resolve();
+        await response.promise;
+        return { backend: "codex", threadId: request.threadId, turnId: request.expectedTurnId };
+      });
+      harness.submitServerRequest.mockImplementation(async () => { response.resolve(); });
+      let returned = false;
+      const click = harness.controller.handleInboundEvent(action(first, "steer")).then(() => { returned = true; });
+      try {
+        await shown.promise;
+        // One event-loop boundary observes whether ingress returned without
+        // resolving the backend gate; no timeout or retry can satisfy this.
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(returned).toBe(true);
+        expect(harness.submitServerRequest).not.toHaveBeenCalled();
+        const cancel = () => harness.controller.handleInboundEvent(action(second, "cancel"));
+        if (cancelFirst) await cancel();
+        await harness.controller.handleInboundEvent(action(first, "steer"));
+        expect(harness.steerTurn).toHaveBeenCalledTimes(1);
+        await harness.controller.handleInboundEvent(action(first, "cancel"));
+        expect(harness.delivered.at(-1)).toMatchObject({ title: "Queued message unavailable" });
+        const approval = await approvalCallback(harness, kind === "mcp" ? `approval:mcp:${decision}` : `approval:${decision}`);
+        await harness.controller.handleInboundEvent(approval);
+        expect(harness.submitServerRequest).not.toHaveBeenCalled();
+        permissions.add("approval.respond.escalation");
+        await harness.controller.handleInboundEvent(approval);
+        expect(harness.submitServerRequest).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+          requestId: "steer-escalation", response: expect.objectContaining(kind === "mcp" ? { action: decision } : { decision }),
+        }));
+        if (!cancelFirst) await cancel();
+        await harness.controller.whenQueuedTurnActionsSettled();
+        await harness.controller.handleBackendEvent({ backend: "codex", notification: {
+          method: "turn/completed", params: { threadId: "thread-1", turnId: "turn-1",
+            turn: { id: "turn-1", status: "completed", output: [] } },
+        } });
+        if (ownsTurnQueue) {
+          await owner.releaseThread({ backend: "codex", threadId: "thread-1", turnId: "turn-1", status: "turn/completed" });
+          expect(ownerStarted.map((entry) => entry.input)).toEqual([
+            [{ type: "text", text: "start the task" }], [{ type: "text", text: "keep this queued message" }],
+          ]);
+          const started = ownerStarted.at(-1)!;
+          await harness.controller.handleBackendEvent({ backend: "codex", notification: {
+            method: "thread/turnQueue/updated", params: { threadId: "thread-1", queueEntryId: started.id,
+              origin: "messaging", status: "started", turnId: started.turnId },
+          } });
+          expect(owner.getAllQueuedEntries()).toHaveLength(0);
+        } else {
+          await vi.waitFor(() => expect(harness.startTurn).toHaveBeenCalledTimes(2));
+          expect(harness.startTurn).toHaveBeenLastCalledWith(expect.objectContaining({
+            input: [{ type: "text", text: "keep this queued message" }],
+          }));
+        }
+        await harness.controller.handleInboundEvent(action(second, "cancel"));
+        await harness.controller.handleInboundEvent(action(third, "steer"));
+        expect(harness.steerTurn).toHaveBeenCalledTimes(1);
+      } finally {
+        response.resolve();
+        await click;
+      }
+    }), { numRuns: 6 });
+  });
+
+  it("releases the remaining queue when completion overtakes a steer acknowledgement", async () => {
+    await fc.assert(fc.asyncProperty(fc.boolean(), async (reject) => {
+      const harness = await createHarness();
+      await bindThread(harness);
+      await harness.controller.handleInboundEvent(buildTextEvent("start the task"));
+      const queued: MessagingSurfaceAction[][] = [];
+      for (const text of ["steer this message", "cancel this message", "keep this message"]) {
+        await harness.controller.handleInboundEvent(buildTextEvent(text));
+        const notice = harness.delivered.filter((intent) => intent.kind === "confirmation" && intent.title === "Message queued").at(-1)!;
+        if (notice.kind !== "confirmation") throw new Error("missing queue");
+        queued.push(notice.actions);
+      }
+      const callback = (index: number, kind: string) => buildCallbackEvent({
+        actionId: queued[index]!.find((candidate) => candidate.id.startsWith(`queued-turn:${kind}:`))!.id,
+      });
+      const entered = createDeferred<void>();
+      const acknowledgement = createDeferred<void>();
+      harness.steerTurn.mockImplementation(async (request: SteerTurnRequest) => {
+        entered.resolve();
+        await acknowledgement.promise;
+        if (reject) throw new Error("fixture rejected steer");
+        return { backend: "codex", threadId: request.threadId, turnId: request.expectedTurnId };
+      });
+      try {
+        await harness.controller.handleInboundEvent(callback(0, "steer"));
+        await entered.promise;
+        await harness.controller.handleInboundEvent(callback(0, "steer"));
+        await harness.controller.handleInboundEvent(callback(1, "cancel"));
+        harness.readThreadStatus.mockResolvedValue("idle");
+        await harness.controller.handleBackendEvent({ backend: "codex", notification: {
+          method: "turn/completed", params: { threadId: "thread-1", turnId: "turn-1",
+            turn: { id: "turn-1", status: "completed", output: [] } },
+        } });
+        expect(harness.startTurn).toHaveBeenCalledTimes(1);
+        expect(harness.steerTurn).toHaveBeenCalledTimes(1);
+        acknowledgement.resolve();
+        await harness.controller.whenQueuedTurnActionsSettled();
+        expect(harness.startTurn).toHaveBeenCalledTimes(2);
+        expect(harness.startTurn).toHaveBeenLastCalledWith(expect.objectContaining({
+          input: [{ type: "text", text: reject ? "steer this message" : "keep this message" }],
+        }));
+      } finally {
+        acknowledgement.resolve();
+        await harness.controller.whenQueuedTurnActionsSettled();
+      }
+    }), { numRuns: 6 });
+  });
+
   it("keeps queued follow-ups available when backend steering is rejected", async () => {
     const harness = await createHarness();
     await bindThread(harness);
@@ -17608,6 +18394,7 @@ describe("MessagingController", () => {
       }),
     );
 
+    await harness.controller.whenQueuedTurnActionsSettled();
     expect(harness.delivered.at(-1)).toMatchObject({
       kind: "error",
       title: "Steer failed",
@@ -17668,6 +18455,7 @@ describe("MessagingController", () => {
       }),
     );
 
+    await harness.controller.whenQueuedTurnActionsSettled();
     expect(harness.steerTurn).not.toHaveBeenCalled();
     expect(harness.delivered.at(-1)).toMatchObject({
       kind: "error",
@@ -19872,6 +20660,68 @@ describe("MessagingController", () => {
     ]);
   });
 
+  it("keeps delivered text unchanged under arbitrary backend event redeliveries", async () => {
+    const turn = fc.array(fc.record({
+      text: fc.string({ maxLength: 24 }),
+      // Retry any previously seen event here, including after turn/completed.
+      retries: fc.array(fc.nat({ max: 100 }), { maxLength: 4 }),
+    }), { minLength: 1, maxLength: 4 });
+
+    await fc.assert(fc.asyncProperty(turn, fc.array(fc.nat({ max: 100 }), { maxLength: 6 }),
+      async (items, terminalRetries) => {
+        const texts = items.map((item, index) => `Reply ${index}: ${item.text.trim()}.`);
+        const events: AgentEvent[] = [{
+          backend: "codex",
+          notification: { method: "turn/started", params: {
+            threadId: "thread-1", turn: { id: "turn-1", status: "inProgress" },
+          } },
+        }, ...texts.map((text, index): AgentEvent => ({
+          backend: "codex",
+          notification: { method: "item/completed", params: {
+            threadId: "thread-1", turnId: "turn-1",
+            item: { id: `item-${index}`, type: "agentMessage", phase: "final", text },
+          } },
+        })), {
+          backend: "codex",
+          notification: { method: "turn/completed", params: {
+            threadId: "thread-1", turnId: "turn-1",
+            turn: { id: "turn-1", status: "completed", output: texts.map((text) => ({ type: "text", text })) },
+          } },
+        }];
+
+        async function deliver(withRetries: boolean): Promise<string[]> {
+          const harness = await createHarness();
+          try {
+            await bindThread(harness);
+            harness.delivered.length = 0;
+            for (const [index, event] of events.entries()) {
+              await harness.controller.handleBackendEvent(event);
+              const retries = index === 0 ? []
+                : index === events.length - 1 ? terminalRetries : items[index - 1]!.retries;
+              if (withRetries) {
+                for (const retry of retries) {
+                  await harness.controller.handleBackendEvent(events[retry % (index + 1)]!);
+                }
+              }
+            }
+            return harness.delivered
+              .filter((intent): intent is Extract<MessagingSurfaceIntent, { kind: "message" }> =>
+                intent.kind === "message" && intent.role === "assistant")
+              .flatMap((intent) => intent.parts.flatMap((part) => "text" in part ? [part.text] : []));
+          } finally {
+            await settleHarnessWork();
+          }
+        }
+
+        const unique = await deliver(false);
+        expect(await deliver(true)).toEqual(unique);
+        // The differential oracle alone could agree on the same duplicate output.
+        // Each generated final item must also reach the recipient exactly once.
+        expect(unique).toEqual(texts);
+      },
+    ), { numRuns: 25 });
+  });
+
   it("posts one final response when turn completion repeats it with commentary", async () => {
     const harness = await createHarness();
     await bindThread(harness);
@@ -21589,6 +22439,185 @@ describe("MessagingController", () => {
     },
   );
 
+  it.skipIf(!process.env.PWRDISK_APPROVAL_TEST_BINARY)("round trips PwrDisk deletion through fake messaging", async () => {
+    // Opt-in cross-project smoke: real PwrDisk stdio + IPC, real MCP SDK and
+    // messaging controller. Only the native window and the human are fakes.
+    const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+    const { StdioClientTransport } = await import("@modelcontextprotocol/sdk/client/stdio.js");
+    const { ElicitRequestSchema } = await import("@modelcontextprotocol/sdk/types.js");
+    const { UpstreamElicitationRoutes } = await import("../mcp-connections/mcp-upstream-elicitation");
+    const { createServer } = await import("node:net");
+    const { createInterface } = await import("node:readline");
+    const { readFile, unlink } = await import("node:fs/promises");
+    for (const action of ["accept", "decline"] as const) {
+      const root = await mkdtemp(path.join(os.tmpdir(), "pwrdisk-messaging-smoke-"));
+      tempDirs.push(root);
+      const candidate = path.join(root, "selected-fixture.txt");
+      const neighbour = path.join(root, "unmarked-neighbour.txt");
+      await writeFile(candidate, "disposable selected fixture");
+      await writeFile(neighbour, "leave this fixture alone");
+      const socketPath = process.platform === "win32"
+        ? `\\\\.\\pipe\\pwrdisk-smoke-${path.basename(root)}` : path.join(root, "window.sock");
+      let writes = 0;
+      let operation: Record<string, unknown> | null = null;
+      const state = () => ({ result: "state", version: 10, app_version: "fixture", root, current: root,
+        screen: operation ? "done" : "explore", scanned: true, scanning: false,
+        marks: [{ path: candidate, bytes: 26, is_dir: false }], estimate: null,
+        space: null, removal: null, tree: null, insights: [], removal_operation: operation });
+      const sockets = new Set<import("node:net").Socket>();
+      const native = createServer((socket) => {
+        sockets.add(socket);
+        socket.on("close", () => sockets.delete(socket));
+        createInterface({ input: socket }).on("line", (line) => {
+          void (async () => {
+            const request = JSON.parse(line) as Record<string, unknown>;
+            let response: Record<string, unknown>;
+            if (request.op === "prepare_removal") {
+              response = { result: "removal_preview", preview_id: "fixture-preview", root,
+                mode: "permanent", paths: [candidate], bytes: 26,
+                estimate: { paths: [candidate], lower: 0, upper: null, on_volume: 0, partial: true, shared: 0 },
+                limit_percent: 5, volumes: [], expires_in_seconds: 300, cleanup: [],
+                confirmation: "PERMANENTLY DELETE", consent: "" };
+            } else if (request.op === "remove") {
+              expect(request).toMatchObject({ preview_id: "fixture-preview", mode: "permanent", paths: [candidate] });
+              expect(writes).toBe(0);
+              writes += 1;
+              await unlink(candidate);
+              operation = { preview_id: "fixture-preview", mode: "permanent", paths: [candidate], finished: true,
+                removed: 1, failed: 0, pending: 0 };
+              response = state();
+            } else if (request.op === "state" || request.op === "hello") {
+              response = state();
+            } else {
+              response = { result: "error", message: "Unsupported fixture request" };
+            }
+            socket.write(`${JSON.stringify(response)}\n`);
+          })().catch((error: unknown) => socket.destroy(error instanceof Error ? error : new Error(String(error))));
+        });
+      });
+      await new Promise<void>((resolve, reject) => { native.once("error", reject); native.listen(socketPath, resolve); });
+      const harness = await createHarness();
+      await bindThread(harness);
+      const shown = createDeferred<void>();
+      const answer = createDeferred<unknown>();
+      harness.submitServerRequest.mockImplementation(async (request: SubmitServerRequestRequest) => {
+        expect(request).toMatchObject({ backend: "codex", threadId: "thread-1", turnId: "turn-1", requestId: "native-form" });
+        answer.resolve(request.response);
+      });
+      const client = new Client({ name: "isolated-pwragent-smoke", version: "1" }, { capabilities: { elicitation: { form: {} } } });
+      const routes = new UpstreamElicitationRoutes();
+      const release = routes.track("fixture-grant", client, new AbortController().signal, async (params) => {
+        await harness.controller.handleBackendPendingRequest("codex", {
+          method: "mcpServer/elicitation/request", params: {
+            ...params, threadId: "thread-1", turnId: "turn-1", requestId: "native-form", serverName: "pwrdisk",
+            mode: "form", requestedSchema: "requestedSchema" in params ? params.requestedSchema : undefined, _meta: null,
+          },
+        });
+        shown.resolve();
+        return await answer.promise;
+      });
+      client.setRequestHandler(ElicitRequestSchema, async ({ params }, extra) => await routes.route({
+        token: "fixture-grant", client, request: params, source: { local: true }, signal: extra.signal,
+      }));
+      try {
+        await client.connect(new StdioClientTransport({ command: process.env.PWRDISK_APPROVAL_TEST_BINARY!, args: ["mcp"],
+          env: { PWRDISK_LINK: socketPath } }));
+        const preview = await client.callTool({ name: "pwrdisk_removal_preview", arguments: { mode: "permanent" } });
+        expect(preview.isError).not.toBe(true);
+        const arguments_ = { preview_id: "fixture-preview", mode: "permanent", paths: [candidate], confirmation: "PERMANENTLY DELETE" };
+        const removing = client.callTool({ name: "pwrdisk_remove", arguments: arguments_ });
+        await shown.promise;
+        const prompt = harness.delivered.filter((intent) => intent.kind === "approval").at(-1)!;
+        expect(prompt).toMatchObject({ title: "MCP Confirmation", body: expect.stringContaining("fixture-preview") });
+        expect(prompt.kind === "approval" && prompt.decisions.some((decision) => decision.id === "approval:mcp:accept")).toBe(true);
+        expect(prompt.kind === "approval" && prompt.body).toContain(candidate);
+        expect(await readFile(candidate, "utf8")).toBe("disposable selected fixture");
+        expect(writes).toBe(0);
+        if (action === "accept") {
+          await harness.controller.handleInboundEvent(buildTextEvent("yes"));
+          expect(writes).toBe(0);
+          expect(harness.submitServerRequest).not.toHaveBeenCalled();
+          const phrase = prompt.kind === "approval" ? prompt.decisions.find((decision) => decision.decision === "accept")?.fallbackText : undefined;
+          expect(phrase).toMatch(/^approve [a-f0-9]{12}$/);
+          await harness.controller.handleInboundEvent(buildTextEvent(phrase!));
+        } else {
+          await harness.controller.handleInboundEvent(await approvalCallback(harness, `approval:mcp:${action}`));
+        }
+        const result = await removing;
+        expect(result.isError === true, JSON.stringify(result)).toBe(action === "decline");
+        const retry = await client.callTool({ name: "pwrdisk_remove", arguments: arguments_ });
+        expect(retry.isError === true).toBe(action === "decline");
+        expect(harness.submitServerRequest).toHaveBeenCalledTimes(1);
+        expect(writes).toBe(action === "accept" ? 1 : 0);
+        if (action === "accept") await expect(readFile(candidate)).rejects.toThrow();
+        else expect(await readFile(candidate, "utf8")).toBe("disposable selected fixture");
+        expect(await readFile(neighbour, "utf8")).toBe("leave this fixture alone");
+      } finally {
+        release();
+        await client.close();
+        for (const socket of sockets) socket.destroy();
+        await new Promise<void>((resolve) => native.close(() => resolve()));
+      }
+    }
+  }, 30_000);
+
+  it("binds MCP confirmation buttons to the proposal the person saw", async () => {
+    // Model: only the latest card's own actor/channel/surface can answer it.
+    // Replacing a pending proposal must never retarget an old Allow button.
+    await fc.assert(fc.asyncProperty(fc.integer({ min: 2, max: 4 }), async (count) => {
+      let now = 1000;
+      const harness = await createHarness({ now: () => now });
+      await bindThread(harness);
+      const prompts: MessagingSurfaceIntent[] = [];
+      for (let index = 0; index < count; index += 1) {
+        now += 1;
+        await harness.controller.handleBackendPendingRequest("codex", {
+          method: "mcpServer/elicitation/request",
+          params: { threadId: "thread-1", turnId: "turn-1", requestId: `remove-${index}`,
+            serverName: "pwrdisk", mode: "form", _meta: null,
+            message: `Request: fixture-${index}. Permanently delete /fixture/${index}. Cannot be undone.`,
+            requestedSchema: { type: "object", properties: {} } },
+        });
+        prompts.push(harness.delivered.filter((intent) => intent.kind === "approval").at(-1)!);
+      }
+      const callback = (index: number) => buildCallbackEvent({
+        actionId: "approval:mcp:accept",
+        sourceSurface: { channel: "telegram", id: `surface:${prompts[index]!.id}` },
+      });
+      for (let index = 0; index < count - 1; index += 1) {
+        await harness.controller.handleInboundEvent(callback(index));
+      }
+      expect(harness.submitServerRequest).not.toHaveBeenCalled();
+      // Even a provider that reuses one message surface must not retarget
+      // a durable handle belonging to the earlier card.
+      await harness.store.upsertCallbackHandle({
+        id: "old-card", handle: "old-card-handle", actionId: "approval:mcp:accept",
+        allowedActorIds: ["user-1"], channel: callback(count - 1).channel,
+        createdAt: 1000, updatedAt: 1000, expiresAt: 60_000, pendingIntentId: prompts[0]!.id,
+      });
+      const recycled = callback(count - 1);
+      recycled.interaction.id = "old-card-handle";
+      await harness.controller.handleInboundEvent(recycled);
+      await harness.controller.handleInboundEvent(buildCallbackEvent({ actionId: "approval:mcp:accept" }));
+      expect(harness.submitServerRequest).not.toHaveBeenCalled();
+      const wrongActor = callback(count - 1);
+      wrongActor.actor = { platformUserId: "someone-else" };
+      await harness.controller.handleInboundEvent(wrongActor);
+      expect(harness.submitServerRequest).not.toHaveBeenCalled();
+      const wrongChannel = callback(count - 1);
+      wrongChannel.channel = { channel: "telegram", conversation: { id: "other-chat", kind: "dm" } };
+      await harness.controller.handleInboundEvent(wrongChannel);
+      expect(harness.submitServerRequest).not.toHaveBeenCalled();
+      await harness.controller.handleInboundEvent(callback(count - 1));
+      expect(harness.submitServerRequest).toHaveBeenCalledExactlyOnceWith({
+        backend: "codex", threadId: "thread-1", turnId: "turn-1", requestId: `remove-${count - 1}`,
+        response: { action: "accept", content: {}, _meta: null },
+      });
+      await harness.controller.handleInboundEvent(callback(count - 1));
+      expect(harness.submitServerRequest).toHaveBeenCalledTimes(1);
+    }), { numRuns: 8 });
+  });
+
   it("presents and declines MCP link requests even when Working Updates is None", async () => {
     const harness = await createHarness({ toolUpdateDefaultMode: "show_none" });
     await bindThread(harness);
@@ -21617,7 +22646,7 @@ describe("MessagingController", () => {
       .toEqual(["approval:mcp:decline", "approval:mcp:cancel"]);
 
     await harness.controller.handleInboundEvent(
-      buildCallbackEvent({ actionId: "approval:mcp:decline" }),
+      await approvalCallback(harness, "approval:mcp:decline"),
     );
 
     expect(harness.submitServerRequest).toHaveBeenCalledWith({
@@ -22693,7 +23722,7 @@ describe("MessagingController", () => {
     });
 
     await harness.controller.handleInboundEvent(
-      buildCallbackEvent({ actionId: "approval:accept" }),
+      await approvalCallback(harness, "approval:accept"),
     );
 
     expect(harness.submitServerRequest).toHaveBeenCalledWith({
@@ -22724,7 +23753,7 @@ describe("MessagingController", () => {
     harness.delivered.length = 0;
 
     await harness.controller.handleInboundEvent(
-      buildCallbackEvent({ actionId: "approval:accept" }),
+      await approvalCallback(harness, "approval:accept"),
     );
 
     expect(harness.delivered).toEqual([
@@ -22760,7 +23789,7 @@ describe("MessagingController", () => {
     harness.readThreadStatus.mockResolvedValue("idle");
 
     await harness.controller.handleInboundEvent(
-      buildCallbackEvent({ actionId: "approval:accept" }),
+      await approvalCallback(harness, "approval:accept"),
     );
 
     expect(harness.submitServerRequest).not.toHaveBeenCalled();
@@ -22802,7 +23831,7 @@ describe("MessagingController", () => {
     const approvalIntent = harness.delivered.find((intent) => intent.kind === "approval");
 
     await harness.controller.handleInboundEvent(
-      buildCallbackEvent({ actionId: "approval:accept" }),
+      await approvalCallback(harness, "approval:accept"),
     );
 
     expect(harness.submitServerRequest).toHaveBeenCalledWith({
@@ -22862,7 +23891,7 @@ describe("MessagingController", () => {
     });
 
     await harness.controller.handleInboundEvent(
-      buildCallbackEvent({ actionId: "approval:accept_with_execpolicy_amendment:1" }),
+      await approvalCallback(harness, "approval:accept_with_execpolicy_amendment:1"),
     );
 
     expect(harness.submitServerRequest).toHaveBeenCalledWith({
@@ -22910,7 +23939,7 @@ describe("MessagingController", () => {
     });
 
     await harness.controller.handleInboundEvent(
-      buildCallbackEvent({ actionId: "approval:accept_with_execpolicy_amendment:1" }),
+      await approvalCallback(harness, "approval:accept_with_execpolicy_amendment:1"),
     );
 
     expect(harness.submitServerRequest).toHaveBeenCalledWith({
@@ -27917,6 +28946,7 @@ function setHandoffDetailFixture(
 async function createHarness<
   Store extends MessagingControllerOptions["store"] = MessagingStore,
 >(options?: {
+  backendOverrides?: Partial<MessagingBackendBridge>;
   requestStore?: MessagingControllerOptions["requestStore"];
   authorizeRetainedSource?: MessagingAdapter["authorizeRetainedSource"];
   deliveryBudget?: MessagingDeliveryBudget;
@@ -28018,6 +29048,7 @@ async function createHarness<
 }): Promise<{
   controller: MessagingController;
   compactThread: ReturnType<typeof vi.fn>;
+  continueClaudeThreadInNewSession: ReturnType<typeof vi.fn>;
   setThreadLock: ReturnType<typeof vi.fn>;
   cancelThreadExecutionModeQueue: ReturnType<typeof vi.fn>;
   delivered: MessagingSurfaceIntent[];
@@ -28327,6 +29358,9 @@ async function createHarness<
     turnId: "compact-turn-1",
     itemId: "compact-item-1",
   }));
+  const continueClaudeThreadInNewSession = vi.fn(async (request: { threadId: string }) => ({
+    threadId: request.threadId,
+  }));
   const setThreadLock = vi.fn(async (request: { backend?: AppServerBackendKind; threadId: string }) => ({
     backend: request.backend ?? "codex",
     threadId: request.threadId,
@@ -28529,6 +29563,7 @@ async function createHarness<
   const backend: MessagingBackendBridge = {
     cancelScheduledThreadAction,
     compactThread,
+    continueClaudeThreadInNewSession,
     setThreadLock,
     cancelThreadExecutionModeQueue,
     ensureDirectoryLaunchpad,
@@ -28575,6 +29610,7 @@ async function createHarness<
     submitServerRequest,
     updateDirectoryLaunchpad,
     updateScheduledThreadAction,
+    ...options?.backendOverrides,
   };
 
   const onBindingChanged = vi.fn();
@@ -28622,6 +29658,7 @@ async function createHarness<
   return {
     controller,
     compactThread,
+    continueClaudeThreadInNewSession,
     setThreadLock,
     cancelThreadExecutionModeQueue,
     delivered,
@@ -29310,6 +30347,17 @@ function buildToolCompletedEvent(id: string, command: string): AgentEvent {
       },
     },
   } satisfies AgentEvent;
+}
+
+async function approvalCallback(
+  harness: Awaited<ReturnType<typeof createHarness>>,
+  actionId: string,
+): Promise<MessagingInboundCallbackEvent> {
+  const event = buildCallbackEvent({ actionId });
+  const pending = await harness.store.findActivePendingIntentForChannel({
+    actorId: event.actor.platformUserId, channel: event.channel, now: 1000,
+  });
+  return { ...event, sourceSurface: pending?.surface };
 }
 
 function buildCallbackEvent(params: {

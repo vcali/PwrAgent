@@ -1,3 +1,4 @@
+import { SqliteTokenMiserStorage } from "../storage/token-miser-storage-sqlite";
 import { bundledGitEnvironment } from "../bundled-git";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
@@ -337,7 +338,7 @@ describe("settings ipc", () => {
     stateDbs.push(stateDb);
     const service = new DesktopSettingsService({
       configPath: path.join(tempRoot, "config.toml"),
-      tokenMiserStore: new TokenMiserStore(path.join(tempRoot, "token-miser"), { stateDb }),
+      tokenMiserStore: new TokenMiserStore(path.join(tempRoot, "token-miser"), { storage: new SqliteTokenMiserStorage(stateDb) }),
       env: {},
       secretStore,
       now: () => 20,
@@ -368,6 +369,7 @@ describe("settings ipc", () => {
         configRevision: "config-revision",
         onboarding: { completed: true },
         htmlPreviewRunScripts: true,
+        visualizeDrawInChat: true,
       },
     });
     expect(readSettings).not.toHaveBeenCalled();
@@ -478,7 +480,7 @@ describe("settings ipc", () => {
     stateDbs.push(stateDb);
     const service = new DesktopSettingsService({
       configPath: path.join(tempRoot, "config.toml"),
-      tokenMiserStore: new TokenMiserStore(path.join(tempRoot, "token-miser"), { stateDb }),
+      tokenMiserStore: new TokenMiserStore(path.join(tempRoot, "token-miser"), { storage: new SqliteTokenMiserStorage(stateDb) }),
       env: {},
       secretStore: new MemoryDesktopSecretStore(),
       now: () => 20,
@@ -1274,7 +1276,7 @@ describe("settings ipc", () => {
 
   it.each(["native", "windows"])("recovers a rejected profile and refreshes its backend with %s paths", async (pathStyle) => {
     const { codexAuthState } = await import("../codex-auth-state");
-    const { CodexAppServerClient } = await import("../codex-app-server/client");
+    const { CodexAppServerClient } = await import("../codex-app-server/desktop-client");
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pwragent-auth-recovery-"));
     tempRoots.push(tempRoot);
     const root = pathStyle === "windows" ? String.raw`C:\Users\fixture\.codex` : tempRoot;
@@ -1795,7 +1797,7 @@ describe("settings ipc", () => {
     tempRoots.push(tempRoot);
     vi.stubEnv("PWRAGENT_HOME", tempRoot);
     const { initializeAppState, disposeAppState, getAppStateDb } = await import("../state/app-state");
-    const { AcpAgentStore } = await import("../acp/acp-agent-store");
+    const { AcpAgentStore } = await import("../storage/acp-agent-store");
     const { registerSettingsIpcHandlers } = await import("../ipc/settings");
     const { ACP_AGENTS_LIST_CHANNEL } = await import("../../shared/ipc");
     const service = new DesktopSettingsService({
@@ -1835,7 +1837,7 @@ describe("settings ipc", () => {
     const { initializeAppState, disposeAppState, getAppStateDb } = await import(
       "../state/app-state"
     );
-    const { AcpAgentStore } = await import("../acp/acp-agent-store");
+    const { AcpAgentStore } = await import("../storage/acp-agent-store");
     const { registerSettingsIpcHandlers } = await import("../ipc/settings");
     const { ACP_AGENTS_LIST_CHANNEL } = await import("../../shared/ipc");
     const service = new DesktopSettingsService({
@@ -1938,7 +1940,7 @@ describe("settings ipc", () => {
     const { initializeAppState, disposeAppState, getAppStateDb } = await import(
       "../state/app-state"
     );
-    const { AcpAgentStore } = await import("../acp/acp-agent-store");
+    const { AcpAgentStore } = await import("../storage/acp-agent-store");
     const { registerSettingsIpcHandlers } = await import("../ipc/settings");
     const { ACP_AGENTS_LIST_CHANNEL } = await import("../../shared/ipc");
     // The pin has to be a real configured override, because that is the cause
@@ -2056,7 +2058,7 @@ describe("settings ipc", () => {
     const { initializeAppState, disposeAppState, getAppStateDb } = await import(
       "../state/app-state"
     );
-    const { AcpAgentStore } = await import("../acp/acp-agent-store");
+    const { AcpAgentStore } = await import("../storage/acp-agent-store");
     const { registerSettingsIpcHandlers } = await import("../ipc/settings");
     const { ACP_AGENTS_LIST_CHANNEL } = await import("../../shared/ipc");
     const service = new DesktopSettingsService({
@@ -2159,7 +2161,7 @@ describe("settings ipc", () => {
     const { initializeAppState, disposeAppState, getAppStateDb } = await import(
       "../state/app-state"
     );
-    const { AcpAgentStore } = await import("../acp/acp-agent-store");
+    const { AcpAgentStore } = await import("../storage/acp-agent-store");
     const { registerSettingsIpcHandlers } = await import("../ipc/settings");
     const { ACP_AGENTS_LIST_CHANNEL } = await import("../../shared/ipc");
     const service = new DesktopSettingsService({
@@ -2421,7 +2423,7 @@ describe("settings ipc", () => {
     const { initializeAppState, disposeAppState, getAppStateDb } = await import(
       "../state/app-state"
     );
-    const { AcpAgentStore } = await import("../acp/acp-agent-store");
+    const { AcpAgentStore } = await import("../storage/acp-agent-store");
     const { registerSettingsIpcHandlers } = await import("../ipc/settings");
     const { ACP_AGENTS_LIST_CHANNEL } = await import("../../shared/ipc");
     const service = new DesktopSettingsService({
@@ -2832,7 +2834,7 @@ describe("settings ipc", () => {
     const { initializeAppState, disposeAppState, getAppStateDb } = await import(
       "../state/app-state"
     );
-    const { AcpAgentStore } = await import("../acp/acp-agent-store");
+    const { AcpAgentStore } = await import("../storage/acp-agent-store");
     const { registerSettingsIpcHandlers } = await import("../ipc/settings");
     const {
       PROVIDER_CATALOG_REFRESH_CANCEL_CHANNEL,
@@ -2927,7 +2929,7 @@ describe("settings ipc", () => {
     const { initializeAppState, disposeAppState, getAppStateDb } = await import(
       "../state/app-state"
     );
-    const { AcpAgentStore } = await import("../acp/acp-agent-store");
+    const { AcpAgentStore } = await import("../storage/acp-agent-store");
     const { registerSettingsIpcHandlers } = await import("../ipc/settings");
     const { ACP_AGENT_UPDATE_ACKNOWLEDGE_CHANNEL } = await import(
       "../../shared/ipc"

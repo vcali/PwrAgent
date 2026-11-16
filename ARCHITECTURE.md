@@ -126,35 +126,100 @@ does not spend the user allowance.
 
 ### Archived worktree removal admission
 
-Single-thread discovery first reads complete active/archived identities and
-overlays across Codex, Claude and ACP without Git enrichment. That evidence can
-be shared within one queue batch at the same workspace revision. Each job then
-discovers its target's candidate worktrees and enriches only overlapping cwds,
-including aliases, ancestors and descendants of every candidate root. These
-scoped observations are job-local; they never certify another job's roots.
-Broad repair still discovers candidates across all archived workspaces.
+Each cleanup queue batch builds one fleet index
+(`apps/desktop/src/main/app-server/archive-cleanup-fleet-index.ts`) from one
+complete read of active and archived identities and overlays across Codex,
+Claude and ACP, without Git enrichment. Within the batch, every writer and
+notification that already fences removal marks the identity it changed, and
+only that identity is read again: Codex `thread/read`, the ACP session, the
+Claude store and its overlay. A change that names no identity, or more changed
+identities than a quarter of the fleet, requests another complete read. Marks
+carry epochs, so a read that began before a newer change cannot settle it.
 
-Every removal and empty-container repair obtains a fresh complete
-membership/overlay inventory across Codex, Claude and ACP. Admission requests at most 100 Codex metadata rows per page and reads
-overlays in 25-row slices. It resolves cwd aliases through the filesystem and
-limits Git enrichment to workspaces that overlap the checkout or its container.
-Unrelated identities still contribute their current linked and retained
-worktrees and external ownership markers. Missing suffixes resolve through their
-nearest existing ancestor; ambiguous filesystem errors fail admission.
+The index maps canonical paths to identities. Discovery and admission for a
+checkout see only identities whose workspace is the checkout, inside it or
+above it, plus every identity whose workspace or external marker cannot be
+resolved, and only the paths of each that relate. Within a batch, preliminary
+discovery for one checkout is shared until a row it covers changes or a row is
+written near it. Otherwise scoped Git observations stay job-local. Broad repair
+discovers candidates across all archived workspaces with one complete,
+uncached read, then processes that candidate list through queued removals.
+Adapters without paged archive discovery keep their aggregate read contract.
+The fleet index is the only inventory shared within a batch.
 
-Only one physical cleanup runs at a time. Lifecycle intent and settlement,
-workspace observations and provider notifications fence removal through a
-revision checked again at destructive dispatch. In-flight lifecycle mutations
-also block admission. These checks add no persistent state or SQLite writes.
-The scan-local filesystem observations never authorize a later removal. The
-scaling and ownership-race budgets live in `archive-cleanup-provider.test.ts`,
-`archive-cleanup-pipeline.test.ts` and `archive-cleanup-budgets.json`. Generated
-single-archive isolation, owner/reference models and real-Git snapshot assertions
-at the discovery/admission boundary live in
-`archive-cleanup-discovery.property.test.ts`.
+Removal admission never uses preliminary evidence. Before each removal it
+reads the Codex rows changed since the index's watermark, newest `updated_at`
+first, five rows a page for at most twenty pages. It rereads the overlay of
+every related identity. It compares two change tokens for writers outside this
+process: SQLite `PRAGMA data_version` for the overlay store, and the Claude
+session directory's inode and timestamps. It reads the complete fleet again
+when a token moved, when the provider cannot order by `updated_at`, when the
+changed rows exceed the pages, or when a path-scoped workspace write touched
+the checkout. Archived siblings that share the checkout are resolved here,
+while it exists; after removal a symlink to it dangles. The reservation, the
+lifecycle fences and the assertions before `git worktree remove` are unchanged.
+
+What the reservation serializes, and what it cannot:
+
+- PwrAgent's own writers (`withArchiveWorkspaceWrite`,
+  `withThreadWorkspaceMutation`, `withThreadLifecycleMutation`) register before
+  their first await. A reserved removal refuses an intersecting controlled
+  write; an observed change revokes the admission, and the final assertion
+  keeps the checkout.
+- A provider notification revokes an admission for its identity, but one that
+  arrives after the final assertion cannot stop `git worktree remove`.
+- A Codex thread another client starts in, or moves into, the checkout without
+  notifying this process is seen only if it advanced `updated_at` before the
+  admission's recency read. External `thread/unarchive` also advances it:
+  protocol-only captures on 2026-11-05 with Codex 0.160.0 and 0.163.0 confirmed
+  visibility from another App Server's `thread/list` with
+  `sortKey: "updated_at"` and `useStateDbOnly: true`, both before and after
+  restarting the restoring client. `thread/resume` by ID or archived path and
+  `thread/fork` reject archived threads instead of reactivating them. Another
+  process's overlay or Claude-session write is seen only if it committed
+  before the token comparison.
+- Not seen within a batch: a symlink retargeted after the batch's complete
+  read, and direct filesystem or Git use of the checkout by something that is not a
+  thread. The archive service still rechecks Git's lock immediately before
+  removal. An unreported provider removal keeps the checkout protected until
+  the next batch reads the fleet.
+
+Archive snapshot preparation and the final lock recheck resolve only the
+target's Git admin directory. The checkout's `.git` file, the admin entry's
+`gitdir` backlink and `commondir` must agree with the supplied repository;
+the common directory itself is refused as a primary checkout. Neither check
+lists sibling worktrees. The final check stays inside terminal teardown and
+before Windows link cleanup. `worktree-archive-git.property.test.ts` measures
+the real Git boundary while archiving 201 checkouts and uses Git as the
+registration, branch and snapshot oracle across layouts and late mutations.
+
+Only one physical cleanup runs at a time. A bulk archive beyond the queue's 256
+slots waits as an intent and is admitted as slots free; quit checkpoints it.
+Waiting references are indexed by blocker, checkout and supplied path, so a
+release or a freed slot touches only its rows. The checkpoint stores one SQLite
+row per intent and writes only rows that changed. A reference boundary writes
+only when references were added, since recovery rereads every recovered row.
+Quit always writes. These checks add no timer and no idle SQLite write. Exact
+read and write budgets for archive-all of 1,000, 50 of 1,500, multiple
+worktrees per thread, shared canonical checkouts and 300 released checkouts live
+in `archive-cleanup-scaling.test.ts` and `archive-cleanup-scaling-budgets.json`.
+The generated ownership, reference, restart and snapshot model lives in
+`archive-cleanup-fleet.property.test.ts`; the index's oracle in
+`archive-cleanup-fleet-index.property.test.ts`; adversarial interleavings in
+`archive-cleanup-fleet.test.ts`. Earlier provider, pipeline and discovery suites
+(`archive-cleanup-provider.test.ts`, `archive-cleanup-pipeline.test.ts`,
+`archive-cleanup-discovery.property.test.ts`) still apply.
 
 ### Display reads and federation
 
+- Native navigation pages, selected detail, queue projections and launchpad
+  configuration use the same registered `backend.*` handlers and capability
+  table as remote viewers. The in-process transport gives the local operator
+  every capability without starting federation or acquiring its profile lease.
+  IPC still owns window consumer cancellation and Attention view lifetimes.
+  Only transport-owned local context admits viewer inventory; a remote request
+  cannot read this machine's viewer inventory by claiming that context in its
+  payload. Both paths retain the navigation pool's response byte budgets.
 - Desktop transcripts use `readThread` with `display.resource = "transcript"`.
   The owning main process prepares completed-turn usage activities and compact
   pricing totals. It sends each transcript message once in `replay.entries`;
@@ -198,6 +263,252 @@ at the discovery/admission boundary live in
   states.
 - Explicit names prevent generated titles from replacing operator intent.
 
+Thread naming lifecycle lives in `owner-core/thread-naming-lifecycle.ts`.
+It serializes renames by backend and thread id, checks conditional renames
+against the current provider name, and owns placeholder eligibility and active
+title attempts. A successful explicit rename retains the owner's intent even
+when its text matches the first prompt. Generated titles recheck eligibility
+inside that same queue. Desktop supplies provider effects, Agent metadata
+storage, cache invalidation and event delivery through host ports; the existing
+provider storage sites and notification ordering stay with those effects.
+
+Helper-title admission and completion live in
+`owner-core/thread-title-lifecycle.ts`. It consumes prepared turn input from
+lifecycle confirmation, admits one helper attempt per backend/thread identity,
+and coordinates helper results through the naming lifecycle. Desktop supplies
+helper execution, model resolution, diagnostics and the existing sub-agent and
+usage persistence effects. Completion waits for all admitted work, including
+work admitted by a preceding title event.
+
+Outpost now supplies the same title lifecycle with its existing Codex client's
+structured title helper. The accepted first-turn event retains the immediate
+prompt fallback and admits one helper attempt; duplicate observations do not
+run it again. The naming lifecycle protects explicit renames while a helper is
+pending. The client selects an offered helper model, uses an ephemeral scratch
+thread with hooks, notifications, project instructions and MCP tools disabled,
+and cleans it up without adding it to job or navigation inventories. Outpost's
+host policy explicitly sets approval `never` and read-only sandboxing on both
+primary and legacy helper creation and on its turn. Shutdown settles admitted
+title work before closing owner storage. Unsupported providers gain no execution.
+
+Outpost's real job turn path also uses shared turn-start admission after native
+thread preparation, rechecking a handoff lock before inference. Its durable job
+acceptance, fingerprint and confirmed thread/turn outcomes remain host effects;
+the lifecycle adds no retry identity or replay after restart.
+
+Both Outpost native creation paths now use `ThreadCreationLifecycle`. The
+federation host records positive native membership before attempting canonical
+metadata, so a failed host finalizer retains the provider identity and cannot
+hide acceptance. Actual job turns use `ThreadTurnStartLifecycle.submitCodex`
+and `finalizeCodex`; durable job confirmation precedes independent title/event
+finalization. Observer and diagnostic failures cannot undo a committed job or
+replace a provider outcome. A refused confirmed-turn write records the known
+thread/turn identity as unknown through the existing terminal boundary, without
+resending provider input. A terminal arriving during finalization retires the
+job once. Hosts omit unsupported effect ports; desktop retains its complete
+typed host contracts and existing construction. No extra tools or reach result.
+
+Steer-request admission lives in `owner-core/thread-steering-lifecycle.ts`.
+It qualifies request ids by backend, thread and expected turn, fences changed
+input/origin/delivery, and shares completion across concurrent retries. Provider
+rejection permits another submission; an accepted provider result survives a
+host completion failure so retry repeats only that completion. Provider terminal
+events retire that turn's admissions. Desktop supplies provider execution and
+causal-origin merging/persistence through host ports, retaining their existing
+locks, storage sites and event order. The core does not infer active turns.
+
+Outpost uses this same admission and submission path for federation steering
+and active-turn steering. Its host resolves the latest active job, rechecks
+handoff locks before native submission, and retains authenticated causal origin
+only after provider acceptance. Retention reads the captured job again, preserving
+concurrent terminal outcomes and other accepted origins. Failed retention retries
+only that effect. Legacy peers without a request id retain independent sends.
+Runtime interruption uses the shared interruption coordinator while keeping its
+durable interrupting/RPC/restoration boundaries; it does not retire steering
+admission until the provider terminal. Sparse ports omit unsupported provider,
+review, attachment and restart effects; desktop retains its complete contracts.
+
+Interruption target coordination lives in
+`owner-core/thread-interruption-lifecycle.ts`. It resolves the reviewer that
+owns a visible parent turn before dispatching to a provider, including reviews
+of Claude parents, and applies the host's native-review interrupt alias. Review
+interrupts return the parent's identity and retain ownership until the provider
+terminal event. Desktop supplies MCP cancellation, provider execution, ACP
+prompt locking, runtime selection, logging and active-mode retirement through
+host ports. Active-turn identity maps and persistence remain host-owned.
+
+The production turn queue lives in `owner-core/thread-turn-queue.ts`.
+Desktop's `BackendRegistry` constructs that class directly with its existing
+start, steer, occupancy, restart-gate and lifecycle callbacks. The shared queue
+owns FIFO admission, independent hold causes and revisions, paused entries,
+grouped messages, early/duplicate terminals and dispatch suspension. Desktop
+still owns provider/resource construction, durable project holds and restart
+continuations, title generation, correspondence and event delivery. Closing
+the queue cancels its pending drains at the same registry shutdown boundary.
+The generated queue model runs against this shared implementation; desktop's
+restart-gate model and actual registry construction/projection oracle exercise
+its host wiring. Outpost's executable Runtime also constructs that class
+directly. Continued-thread jobs commit acceptance before entering its FIFO;
+the host supplies the existing turn lifecycle, one daemon-global provider
+slot, handoff/intake gates and typed queue events/projections. Prompts stay in
+memory. Cancellation settles the job before dispatch, and shutdown or recovery
+settles unfinished queued jobs as unknown without restoring or replaying input.
+New-thread jobs still require an idle host. Confirmed provider acceptance cannot
+return to a retryable FIFO after a host confirmation failure.
+The queue also retains that acceptance when its started lifecycle publication
+rejects. Buffered native terminals still settle ownership and install failure
+holds; observer failures cannot restore accepted start or steering input.
+Ordinary authenticated agent messages without requested settings or explicit
+`new_turn` delivery use the same queue's individual `submitSteer` admission on
+Outpost. Each accepted job retains its own input and delivery fingerprint;
+accepted messages are never concatenated. At the FIFO head it joins the current
+native turn, or starts a new turn when idle. The existing steering lifecycle
+receives that job's exact request identity and captured native target. A durable
+starting claim precedes inference; the daemon-global dispatch slot stays held
+through acknowledgement and origin finalization. The original active job keeps
+control ownership. Provider terminals settle the accepted interjections against
+that same turn; uncertainty, shutdown and recovery never restore their input.
+CLI interruption also requires that original active job; an interjection's
+confirmed target does not grant it native control. Shutdown drains restored
+entries again after admitted dispatch settles, including a refused claim.
+Explicit new turns, requested settings and durable turn receipts retain ordinary
+turn admission. Delivery metadata uses the existing job payload, without a schema
+change, and is part of each fresh immutable fingerprint.
+Explicit Retry also admits held, unclaimed individual guidance into a confirmed
+running native turn when that same
+steering path is eligible. It rechecks live owner/project/handoff gates and
+immutable acceptance before claiming the captured target; occupied dispatch,
+uncertainty and shutdown still refuse it. Shared release preserves review
+holds behind a dispatch gate and cannot start work after queue close. The
+original job retains native control; accepted or uncertain guidance never
+returns to the waiting FIFO.
+The composer permits owner-backed Retry during a live turn and retains the
+waiting row unless the owner reports acceptance. Scheduled Retry still waits
+for the active turn to finish.
+Outpost's registered pause/resume and ordering methods delegate to the same
+queue operations desktop uses. Pause revisions and independent review holds
+remain in that engine; typed state/order events invalidate the owner projection.
+Local CLI controls use those same runtime methods. The changes stay in memory,
+make no SQLite commits and cannot change accepted input or its fingerprint.
+Desktop pause publication rereads the shared FIFO after the mutation settles.
+A cancelled row emits no later pause update; a replaced row publishes its current
+hold and pause revision. The response still acknowledges the original mutation.
+Cleanup of a sent project wake-up's durable hold follows the completed pause,
+even if a concurrent Resume is already live. Once paused, that ordinary waiting
+message cannot return as a project hold after restart.
+Outpost also serves the existing queued-input read through the shared
+`thread_detail` capability. It returns a detached input/origin snapshot and its
+content hash, including for editing. The existing viewer Edit flow cancels that
+hash before restoring a viewer-local draft; changed input gets a new acceptance
+identity. Reading never reserves or releases the FIFO and adds no persistence.
+
+Desktop sender replacement also cancels the waiting identity before fresh
+admission through that queue. Serialized controls recheck the live sender and
+position; grouped contributions from other senders, independent holds and pause
+revisions stay intact. An untouched grouped contribution retains its sender's
+replacement handle until that contribution leaves or is replaced; retired queue
+identities still refuse reads and controls. The sender retains its cancelled
+correspondence input and initializes the replacement receipt before recipient
+admission, so early lifecycle outcomes survive the response. A durable new-turn
+receipt remains attached to its cancelled original identity, and cannot replay
+or retarget changed input.
+
+Desktop and Outpost construct the same `DurableTurnRequestService` from
+owner-core for durable turn admission. The profile binding supplies the existing
+FULL/immediate inbox storage port. Authenticated issuer/device namespaces and
+owner-bound payload hashes precede dispatch. Outpost assigns one safe immutable
+identity to the receipt, durable job, live queue and events, then calls its
+existing turn path. Both the durable feature grant and `turn_control` are
+required; nested messaging origins retain their additional grant and origin
+authentication. Proven queue boundaries reconcile receipts. Shutdown or a
+missing live queue yields uncertainty without restoring input or reclaiming a
+dispatch claim. Changing accepted input requires cancellation and a new UUID.
+
+Outpost also registers the existing durable steering methods on that same inbox.
+Both `turn_control` and `durable_steer_requests_v1` are required. Its host port
+calls the existing active-turn control method, using the receipt identity as the
+steer request id and the caller's expected native turn as the target. The receipt
+acknowledges acceptance of the interjection, independently of eventual turn output;
+it creates no job or FIFO entry and cannot displace waiting input. Issuer/device
+and start/steer namespaces remain separate. Native or result-persistence uncertainty
+retains the durable claim across retries and restart without sending again.
+
+Steer submission lives in `owner-core/thread-steer-submission-lifecycle.ts`.
+It owns delivery refusal, restart-gate queue admission, native-review admission,
+provider selection and response/effect sequencing. The existing steering
+lifecycle records provider acceptance before Claude origin persistence or Codex
+attachment retention. Failed host effects remain pending on that acceptance;
+retries share their completion and never resend the accepted provider input.
+Successful retention is not repeated if later causal-origin completion fails.
+Desktop supplies attachment preparation, provider calls, ACP prompt locking,
+pending-message context and persistence at their existing lifecycle sites.
+
+Turn-start admission and optimistic Codex preparation live in
+`owner-core/thread-turn-start-lifecycle.ts`. Pending starts are counted by
+backend/thread before lifecycle mutation admission, so handoff, archive and
+live-event checks see starts that are still waiting. The lifecycle checks the
+current lock after admission, wakes the workspace, and releases each count
+when that start settles. Codex preparation owns the synthetic start identity
+and ordered input/context/title admission. Context staging finishes before
+the optimistic start, so a rejection announces no turn and needs no synthetic
+terminal persistence. Later announcement failures clean up the staged context;
+reservation retirement still runs if terminal delivery fails. Desktop retains provider active-turn maps,
+model/runtime/MCP/input preparation, workspace effects, notifications and
+persistence through host ports. The shared lifecycle also coordinates Codex
+submission failure retirement, optional recovery, and backend-qualified response
+identity resolution from provider events. Retirement and retry disposal run even
+if failure notification rejects. Synthetic start/failure share an observation
+sequence, so a newer provider status retains authority through failure and
+navigation projection. Accepted Codex finalization also lives in this lifecycle:
+it binds origin/context/attachments and retry identity, hands over provider
+ownership, selects model/execution persistence, and schedules replay and titles
+in their established order. A rejected host effect is reported by stage and
+does not reject the accepted provider response or prevent independent later
+effects. Origin disposal and handover still run, with terminal ownership read
+after origin persistence yields. This adds no request identity or retry state.
+Provider calls, repair execution/registry, logging, attachment handling and all
+persistence remain host effects at their existing lifecycle sites.
+
+ACP turn starts use the same lifecycle for reservation, preparation, context
+staging and submission. Once the provider accepts, origin binding, managed-review
+context consumption, PDF/title/context coordination, origin persistence and
+attachment retention run in their established order. Independent host failures
+are reported without rejecting that accepted identity. Context/origin disposal
+and reservation release are attempted independently on both acceptance and
+rejection. The host retains ACP prompt locks, provider active-turn ownership,
+runtime/model/environment setup and every existing storage site. This adds no
+request identity, retry state or persistence.
+
+Claude turn starts use the lifecycle for preparation-to-session grant ownership,
+accepted origin binding/persistence and origin disposal. Before provider invocation,
+failed preparation releases its MCP grants. Claude's existing session-close contract
+consumes release on every invocation, including refusal while a session is live;
+only that callback then revokes grants, once. Later origin or cleanup failures are
+reported without replacing the provider outcome. Desktop retains Claude execution,
+runtime/model/environment/MCP/input setup, active sessions and every storage site.
+
+Thread creation acceptance and finalization live in
+`owner-core/thread-creation-lifecycle.ts`. It selects the provider, limits
+connection revocation and workspace rollback to rejected creation, and hands
+accepted identities to binding, pending navigation, metadata, visibility and
+notification ports in the established order. Independent finalization failures
+are reported without rejecting a thread its provider already created. Parent
+notification follows a successful relationship write; visibility uses that saved
+relationship even if its notification fails. Codex owns its start event. Desktop
+retains workspace/environment/model/MCP preparation, provider execution, pending
+summary construction and all existing storage sites. No request identity or
+retry state is introduced.
+
+Creation preparation uses that lifecycle's invocation-local resource scope.
+It owns the prepared workspace rollback and acquired connection grants until
+provider creation takes ownership. A preparation refusal drains every admitted
+branch, including work admitted before a synchronous host failure, then revokes
+all acquired grants before rolling back the workspace once. Cleanup and reporting
+failures do not replace the preparation refusal. Provider rejection uses the
+existing creation cleanup; accepted threads retain their resources. Runtime,
+environment, model and MCP construction remain desktop host effects. This
+coordination adds no persistence.
+
 ### Transcript invariants
 
 - Transcript order is canonical before grouping, collapsing, hydration, or
@@ -227,10 +538,193 @@ below are layered separately so you can read each layer on its own.
 
 ### Desktop state (sqlite WAL)
 
+Local provider ownership is admitted independently of federation/messaging
+service enablement. The production BackendRegistry receives the owner-core
+`ThreadOwnerAdmission` port, whose PID-owned `thread_owner` claim retains the
+existing profile-federation lease through provider shutdown. Service disable
+cannot release that claim. Codex transport connection, Claude session queries,
+ACP pooled/ephemeral startup and registry thread/turn/helper admissions share
+the port. Passive readers remain unclaimed. The Outpost's existing acquisition
+of the same lease excludes these desktop owners without a database lock file.
+
 The desktop main process owns a single sqlite database holding messaging
 bindings, the thread overlay (per-thread UI state), and
 `safeStorage`-encrypted secret blobs. Multiple PwrAgent instances may share
 the same profile DB safely thanks to sqlite WAL mode.
+
+`packages/sqlite-storage` owns the profile database opener, schema and migrations,
+including the sub-agent and usage-activity table helpers and write instrumentation.
+The package also owns `AppRuntimeInstanceStore`, implementing owner-core runtime
+lease ports with injected host liveness and the existing PID-owned lease
+transactions. Desktop constructs it through a private `main/storage` binding at
+the existing app-state lifecycle site. Both hosts use this same storage without moving runtime identity observation
+into the database. The real Outpost daemon opens the profile through its
+`federation-core.ts` binding and takes both federation and messaging leases
+before job recovery, provider startup or listener creation. It drains services
+before releasing them. Desktop supplies its existing defaults to the same
+owner-core runtime lease manager. Both use the existing profile marker format
+and file heartbeat; no SQLite heartbeat is introduced. The Outpost bundle
+externalizes its own pinned native SQLite dependency, and its application code
+receives shutdown and handle-free owner storage ports. Desktop's runtime gates observe the same lease
+rows; configured enablement remains separate from effective runtime ownership.
+Outpost's production jobs and thread registry now use that same database. The
+shared v81 migration adds owner-job acceptance/outcome metadata; existing thread
+overlays remain the canonical metadata registry. Its first start validates host
+identity, backs up legacy jobs and threads, imports both in one FULL-durability
+transaction, then retires matching JSON files. A committed manifest makes partial
+retirement restartable without reimport or replay. Active jobs become unknown.
+Private identity, projects, tools and intake ledgers stay host-owned. Outpost
+reads retained provider inventory independently of canonical metadata; SQLite
+contains no provider transcript or prompt text.
+Before opening its listeners, Outpost now completes active and archived Codex
+protocol discovery. Navigation refreshes that inventory without writing unchanged
+snapshots; provider mutations fence older in-flight discoveries. Fresh provider
+archive membership outranks an unstamped retained flag, while newer canonical
+archive/restore timestamps still fence older retained inventory.
+Complete discovery also atomically records retirement of previously confirmed
+native Codex identities with its inventory replacement. Retained metadata cannot
+resurrect those members after restart. Native creation retains confirmation in
+its existing commit and fences older discoveries. Unconfirmed imported owners
+and durable accepted-job identities remain independently retained; job request,
+fingerprint, thread and turn identities and restart without replay are preserved.
+Incomplete or failed walks publish no retirement, and late events do not recreate
+retired members. No schema change or SQLite timer is introduced.
+Desktop and Outpost retain readable owner identities separately from that native
+inventory. The shared retention storage port derives pending legacy identities
+from the committed import manifest and byte-verified PwrAgent backup, and accepted
+identities from durable jobs; arbitrary overlays provide neither proof. Both
+hosts read live canonical titles, pins, parents, seen watermarks and settings.
+These projections never enter provider inventories or start provider work.
+Retained-only identities follow the same durable archive/restore observations,
+including a zero archive-retention timestamp, as the current owning registry.
+Desktop confirms a pending import on positive native evidence, even for an
+unnamed fallback, through one atomic metadata boundary. A later retirement cannot
+be overwritten by a late confirmation. Repeated observations and passive reads
+make no commits. Native forks use the same confirmed-creation boundary as starts.
+Both hosts project canonical title provenance against the last acknowledged
+native name. Imported names without that acknowledgement stay visible; Outpost
+publishes them through the shared naming lifecycle before discovery completes.
+An acknowledged Outpost rename reaches Codex before owner success. Desktop's
+name-event pipeline retains the same title/provenance fact; a later differing
+native name wins over its old acknowledgement. No transcript is stored.
+Retained profile reads qualify every identity by backend, including Claude and
+ACP. Outpost reads actual active and archived ACP session metadata through the
+shared storage port, including uninstalled agents, with the same pure summary
+projection desktop uses. Hidden helpers stay private. Other provider execution
+and transcripts remain unavailable on Outpost; discovery does not start them.
+The actual ACP session store owns membership on both hosts. Desktop startup
+hydration and provider-refresh publication replace retained ACP rows with local
+session records, including backends without an installed agent. Outpost point,
+list, navigation and archive reads cannot recover a deleted or hidden session
+from retained inventories or overlays. Native session titles/provenance,
+workspace, times and execution mode stay authoritative. Native archive state
+applies in the absence of durable owner archive/restore observations; passive
+stored sessions cannot supersede those observations. Overlays still supply
+live pins, parents, seen watermarks and model settings. This projection
+adds no SQLite writes and leaves Codex pending-owner/job identity rules intact.
+Desktop native name events update already published non-Codex inventory rows
+without changing membership freshness. Existing owner observation sequences
+fence late lists, and startup hydration projects canonical Codex titles through
+compact overlay batches before publishing retained rows.
+Claude profile discovery now reads PwrAgent's actual `state/claude/*.json`
+metadata through a shared reader used by the desktop session store and a
+handle-free Outpost binding. Active and archived records need no retained
+inventory. Native metadata owns Claude names/provenance, archive membership and
+execution mode; shared overlays retain pins, parents, seen watermarks and model
+overrides. Completed discovery supersedes older retained rows and excludes
+deleted or ephemeral records. An absent metadata directory confirms an empty
+Claude inventory. Histories, SDK identities and provider session files never enter the
+Outpost read projection; only the SDK reads provider sessions. Discovery starts
+no provider and adds no SQLite writes.
+Shared `ThreadTodoStore` and `SqliteThreadReviewStorage` implement owner-core
+ports through private desktop bindings at the existing runtime construction
+sites. The model-settings-recents helper is shared by to-do dispatch and the
+desktop recents service. Their SQL, immediate transactions and write counts
+remain unchanged.
+Shared `SqliteOverlayStore` implements the owner metadata registry and the
+existing PR and remote-target storage ports, with its dependency, pin-order,
+change-version and in-memory output closure. Desktop constructs it through a
+private storage binding at the original app-state site; the application-facing
+`desktop-overlay-store` adapter exposes its public API without its database or
+caches. State compatibility exports resolve to the same implementation.
+Shared `ThreadSearchStore` and `ProviderThreadSnapshotStore` own persisted search
+projections and provider inventory, including FTS query construction and legacy
+inventory scrubbing. Their private desktop bindings retain both runtime factory
+sites and return owner-core ports; no database handle reaches application code.
+Search refresh/prune transactions, retained usage titles and write counts stay
+unchanged.
+Shared `AutomationStore` owns persisted automation definitions, runs and
+artifacts with existing pruning and reconciliation transactions. Its private
+desktop binding injects the two existing warning sites and preserves app-state
+construction. The pure transcript merge policy lives in owner-core and is
+shared with desktop artifact rebuilding. No SQL or write count changes.
+Shared `ScheduledThreadActionStore` retains its file/memory payload closure,
+profile-adjacent immutable files, legacy payload migration, claims/recovery and
+bounded projection cursors. Its private desktop bindings preserve app-state
+construction and the owner-core storage port. SQL and transactions are unchanged.
+Shared `SqliteDurableTurnRequestStore` implements the owner-core durable inbox
+port through its private desktop binding and the original federation factory.
+Synchronous FULL/immediate receipt and claim commits precede dispatch, then the
+connection's original durability mode is restored. SQL and lifecycle sites stay
+unchanged; the owner service never receives a database handle.
+Shared `AcpSessionStore` and `AcpAvailableCommandsStore` implement owner-core
+ACP metadata and command ports. Their private desktop bindings preserve the
+explicit runtime factories and app-state construction sites. Legacy history
+stripping, archive keyset pages, command filtering and SQL stay unchanged.
+Shared `MessagingPairingStore` and `MessagingActivityLog` implement owner-core
+pairing and activity ports through private desktop bindings. Their explicitly
+typed factories retain app-state construction at the original lifecycle sites.
+Profile-secret/HMAC identity, timing-safe comparison, expiry/approval transitions,
+activity payloads/freshness, list/retention bounds and all SQL remain unchanged.
+This storage boundary grants no messaging or federation access.
+Shared `OperatorRequestStore` implements owner-local question and seen storage.
+Its private concrete desktop binding and separate application factory preserve
+service construction at the original lifecycle site. Pending question text is
+retained only while open; closed rows keep identity and times. First-record and
+first-seen identity, batched writes and open question/to-do/review seen retention
+preserve every SQL statement and transaction. Live server requests remain owned
+by the registry, rather than reconstructed from storage.
+Shared generic `SqliteTokenMiserStorage` implements owner-core accounting ports
+through a private desktop binding. The existing runtime factory still constructs
+the host service at its original lifecycle site. Object/observation identities,
+ordering, conditional updates, archive generations and immediate transactions
+are unchanged. Safe content projection, legacy filesystem migration/cleanup,
+original-output caches and buffered replay accounting remain with the service.
+Shared generic `AcpAgentStore` implements the existing ACP agent port with only
+scalar index constraints. Launch descriptors, capabilities and registry policy
+stay host-owned. Its private desktop specialization retains the explicit factory
+and both service/backend construction sites. Cache replacement, NOCASE ordering,
+backend identity, JSON guards and every SQL statement/write count are unchanged.
+Shared generic `SqliteMessagingRequestStore` owns immutable request provenance,
+monotone latest-human pointers and idempotent attachment outcomes. Its private
+desktop specialization injects host admission and routing privacy at the original
+explicit factory. The storage package receives scalar identity fields and an
+opaque bounded event, without importing messaging-interface. Profile-file
+authority, hash/JSON semantics, SQL, transactions and write counts are unchanged.
+Shared generic `SqliteMessagingStore` implements the existing owner-core messaging
+port with scalar persistence constraints and injected host policy. The private
+desktop specialization keeps original app-state construction and accessor lifetime.
+Conversation/default-Agent policy, migrations, merges, matching, credential
+scrubbing and snapshot versioning remain host-owned without database access.
+The in-memory implementation shares only the pure questionnaire predicate.
+Every SQL statement and transaction site is preserved.
+Shared `FederationStore` implements the complete handle-free federation storage
+port in shared, alongside its enrollment/audit records. Federation retains its
+narrow transport contract and compatibility exports, keeping both sibling layers
+independent. The private desktop binding retains the original explicit factory
+and peer trust, profile HMACs, expiry, audit collapse and SQL/write behavior.
+Shared `ThreadSandboxStore` implements the existing owner-core thread-resource
+port. Its private desktop binding serves both the guarded event-time gateway
+observer and the original per-call cleanup factory. First-creator ownership,
+native unqualified grants, pending cleanup and stale outcomes retain the same
+SQL and write counts. Viewer-local composer drafts remain a desktop application
+concern and never enter owner projections.
+Desktop's `main/storage/state-db.ts` binds the database implementation; state-internal
+compatibility exports resolve to the same class and schema definitions. Only
+state internals and storage adapters may import this package or its desktop
+binding. Owner/application code continues to use storage ports. The package has
+no host imports; each host supplies `better-sqlite3` for its own runtime through
+the package's peer dependency. There is no shared native binary.
 
 ```mermaid
 graph TB
@@ -358,6 +852,7 @@ graph TB
     DesktopApp["apps/desktop"]
     Outpost["packages/pwragent · src/federation-core.ts"]
     OwnerCore["packages/owner-core"]
+    SqliteStorage["packages/sqlite-storage"]
     Federation["packages/federation"]
     AgentTools["packages/agent-tools"]
     MsgProviders["packages/messaging/providers/*"]
@@ -370,13 +865,17 @@ graph TB
     DesktopApp --> Federation
     DesktopApp --> AgentTools
     DesktopApp --> OwnerCore
+    DesktopApp --> SqliteStorage
     DesktopApp --> CodexProto["@pwrdrvr/codex-app-server-protocol"]
     Outpost --> Federation
     Outpost --> AgentTools
     Outpost --> Shared
     Outpost --> MsgInterface
-    Outpost -.-> OwnerCore
+    Outpost --> OwnerCore
+    Outpost --> SqliteStorage
     OwnerCore --> Shared
+    SqliteStorage --> Shared
+    SqliteStorage --> OwnerCore
     Federation --> Shared
     AgentTools --> Shared
     MsgProviders --> MsgInterface
@@ -402,6 +901,13 @@ reusable libraries and owner-core through its bundle entry; its JavaScript
 consumes the bundle.
 Every package under `packages/` is forbidden from importing `apps/`.
 
+Only Outpost's `federation-core.ts` binding imports the shared SQLite package;
+its runtime and daemon code cannot import raw storage or the native driver.
+
+SQLite storage is below the hosts and may depend only on shared contracts and
+owner-core ports. Desktop application modules cannot import it or the raw
+database binding; their storage adapters and state internals own that access.
+
 ## Workspace map
 
 | Path | What's there |
@@ -411,6 +917,7 @@ Every package under `packages/` is forbidden from importing `apps/`.
 | `packages/federation` | Owner contract, federation transport, enrollment, routing and RPC |
 | `packages/agent-tools` | Agent tool definitions, routing and messaging tool contracts |
 | `packages/owner-core` | Shared navigation projection, Attention ordering, and thread-title policy (`@pwragent/owner-core`) |
+| `packages/sqlite-storage` | Portable profile SQLite opening, schema, migrations, table helpers and write accounting |
 | `packages/pwragent` | Headless Outpost daemon and CLI, with reusable libraries bundled through `src/federation-core.ts` |
 | `packages/messaging/interface` | Generic messaging types, capability profile, layout helpers |
 | `packages/messaging/providers/telegram` | Telegram adapter (`grammy`) |

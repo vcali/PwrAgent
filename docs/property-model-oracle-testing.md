@@ -159,7 +159,7 @@ against the pre-fix code:
 - **Narrow, don't weaken.** A counterexample may be a case the code handles
   on purpose. If so, restrict the generator or add `fc.pre(...)`, with a
   comment saying why. Don't loosen the assertion until it passes.
-- **Budget the runs.** The test timeout is 5 s on Linux and macOS and 30 s on
+- **Budget the runs.** The default test timeout is 5 s on Linux and macOS and 30 s on
   Windows. CI runs unit tests on all three, and Windows desktop-main run time
   can vary by more than 2× between runs.
   - Pure properties: keep the default `numRuns` (100), and a file under
@@ -187,13 +187,20 @@ PwrAgent's update feature was ported from PwrGit (see
 and `auto-updater-supersede.test.ts` covers a downloaded update that a newer
 release replaces.
 
-PwrGit is adding properties for `selectChannelReleases` and an `fc.commands`
-model of its held update. When they land, port them here and keep the two
-sets in step. The rules are the same in every Pwr app:
+[PwrGit#554](https://github.com/pwrdrvr/PwrGit/pull/554) added properties for
+`selectChannelReleases` and an `fc.commands` model of its held update. The
+port is in `apps/desktop/src/main/__tests__/auto-updater.property.test.ts`,
+with PwrAgent's event-driven completion and cancellation flow. PwrGit's
+request-budget invariant (I5) is in
+`apps/desktop/src/main/__tests__/auto-updater.request-budget.property.test.ts`,
+against the real on-disk release cache. Keep the two sets in step. The rules
+are the same in every Pwr app:
 
 - No channel offers less than Stable's latest release.
 - The result doesn't depend on GitHub's list order.
 - A Restart offer always names an update that is still on disk.
+- Automatic release-list requests keep their budget across restarts, and no
+  request goes out before a rate limit resets.
 
 ## Dependency and licensing
 

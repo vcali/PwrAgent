@@ -991,6 +991,11 @@ function SettingsSectionBody(props: {
             general: { attentionPromoteOnTurnEnd },
           });
         }}
+        onAutoFixReviewsChange={async (autoFixReviews: boolean) => {
+          await props.settings.writeConfig({
+            general: { autoFixReviews },
+          });
+        }}
         onPinnedThreadsOnTopChange={async (pinnedThreadsOnTop: boolean) => {
           await props.settings.writeConfig({
             general: { pinnedThreadsOnTop },
@@ -1002,6 +1007,11 @@ function SettingsSectionBody(props: {
         onHtmlPreviewRunScriptsChange={async (htmlPreviewRunScripts) => {
           await props.settings.writeConfig({
             general: { htmlPreviewRunScripts },
+          });
+        }}
+        onVisualizeDrawInChatChange={async (visualizeDrawInChat) => {
+          await props.settings.writeConfig({
+            general: { visualizeDrawInChat },
           });
         }}
         onPdfAnalysisEnabledChange={async (pdfAnalysisEnabled) => {
@@ -1588,6 +1598,8 @@ function SettingsSectionBody(props: {
             worktrees: { storage },
           });
         }}
+        onWriteConfig={props.settings.writeConfig}
+        desktopApi={props.desktopApi}
       />
     );
   }

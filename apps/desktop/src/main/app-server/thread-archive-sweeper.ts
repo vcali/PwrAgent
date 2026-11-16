@@ -1,89 +1,87 @@
-import { stat } from "node:fs/promises";
-import type { AppServerThreadSummary, ThreadOverlayState } from "@pwragent/shared";
+import type { AppServerBackendKind, AppServerThreadSummary, ThreadOverlayState } from "@pwragent/shared";
 import {
   DEFAULT_THREAD_ARCHIVE_POLICY,
+  type DesktopCheckoutHibernationPolicy,
+  THREAD_ARCHIVE_SWEEP_FAILURE_LIMIT,
   type DesktopThreadArchivePolicy,
+  type DesktopThreadArchiveSweepFailure,
   type DesktopThreadArchiveSweepStatus,
   buildThreadIdentityKey,
   isCodexChatsDirectory,
+  toolWorktreeRootOwner,
+  type ThreadPullRequestWatchSummary,
 } from "@pwragent/shared";
-import { runGitCommand } from "./git-executable";
 import { withCodexRequestActivity } from "../codex-app-server/request-activity";
+import path from "node:path";
 
-export const THREAD_AUTO_ARCHIVE_AGE_MS = 7 * 24 * 60 * 60_000;
 export const THREAD_ARCHIVE_SWEEP_INTERVAL_MS = 60 * 60_000;
 export const THREAD_ARCHIVE_SWEEP_START_DELAY_MS = 60_000;
 
 export type ThreadArchiveCandidate = {
   thread: AppServerThreadSummary;
   overlay?: ThreadOverlayState;
+  /** This read verified the attached linked checkout inside a canonical
+   * PwrAgent root or against its explicit operator registration receipt.
+   * Recomputed on the final ownership recheck. */
+  managedWorktreePath?: string;
   /** A sub-agent card on the thread is still pending, running or blocked. */
   activeSubAgent?: boolean;
   /** A PR watch (watching or dispatching) will wake the thread. */
   activePrWatch?: boolean;
+  /** The already-read watches, so maintenance can identify the protecting PR. */
+  activePrWatches?: ThreadPullRequestWatchSummary[];
+  /** A Continue After wait holds this thread's merge. */
+  mergeHeld?: boolean;
+  /** Its overlay or sub-agent state could not be read; fail closed. */
+  unreadable?: boolean;
 };
 
 /** Card statuses that keep housekeeping away from a thread. */
 export const ARCHIVE_ACTIVE_SUB_AGENT_STATUSES: readonly string[] = ["running", "pending", "cancelling", "blocked"];
 
+/** The hourly sweep never archives a thread: archiving is the operator's
+ * call (a thread, a selection, or Thread maintenance). It cleans up after
+ * archives the operator made and hibernates idle checkouts. */
 type SweeperDeps = {
-  getPolicy?: () => DesktopThreadArchivePolicy;
-  resolveProject?: (candidate: ThreadArchiveCandidate) => Promise<string | undefined>;
   /** Resolves to the number of expired families deleted. A cleanup that
    * logs its own per-thread failures reports each through onFailure. */
-  cleanupRetention?: (onFailure: (error: unknown) => void) => Promise<number | void>;
+  cleanupRetention?: (onFailure: (error: unknown, details?: SweepFailureDetails) => void) => Promise<number | void>;
   cleanupWorktrees?: (options: {
     manual: boolean;
     onProgress: (status: NonNullable<DesktopThreadArchiveSweepStatus["worktrees"]>) => void;
-    onFailure: (error: unknown) => void;
+    onFailure: (error: unknown, details?: SweepFailureDetails) => void;
   }) => Promise<void>;
   listCandidates: () => Promise<ThreadArchiveCandidate[]>;
-  refreshCandidate: (candidate: ThreadArchiveCandidate) => Promise<ThreadArchiveCandidate>;
-  isBusy: (candidate: ThreadArchiveCandidate) => boolean;
-  canArchive: (candidates: ThreadArchiveCandidate[]) => Promise<boolean>;
-  /** Resolves false when the archive was cancelled at the mutation boundary. */
-  archive: (candidate: ThreadArchiveCandidate, family: ThreadArchiveCandidate[]) => Promise<unknown>;
-  workspaceIsSafe?: (cwd: string, signal: AbortSignal) => Promise<boolean>;
   onError: (error: unknown, threadId?: string) => void;
   onStatus?: (status: DesktopThreadArchiveSweepStatus) => void;
+  /** Idle checkout hibernation, the sweep's last phase. Absent: no phase. */
+  hibernation?: CheckoutHibernationSweepDeps;
 };
 
-type SweepTally = Pick<DesktopThreadArchiveSweepStatus, "archived" | "deleted" | "failed" | "error">;
+export type CheckoutHibernationSweepDeps = {
+  getPolicy: () => DesktopCheckoutHibernationPolicy;
+  /** Why this candidate's checkout stays, from thread state alone, or
+   * undefined. Undefined target: the thread has no checkout to hibernate,
+   * and is not counted. */
+  keepReason: (candidate: ThreadArchiveCandidate, candidates: readonly ThreadArchiveCandidate[],
+    policy: DesktopCheckoutHibernationPolicy, now: number) => { target?: string; keep?: string };
+  /** Why the checkout itself must stay, from Git, or undefined. */
+  inspectWorkspace: (worktreePath: string, policy: DesktopCheckoutHibernationPolicy, signal: AbortSignal) => Promise<string | undefined>;
+  /** True when hibernated, false when cancelled, or the reason it was kept. */
+  hibernate: (candidate: ThreadArchiveCandidate, policy: DesktopCheckoutHibernationPolicy) => Promise<boolean | string>;
+};
 
-/** Reads live Git state, including ignored files, untracked files and dirty submodules. A
- * detached tip is safe only when a local or remote branch retains it. No fetch
- * is needed: committed work on an unpushed local branch is eligible too. */
-export async function workspaceIsSafeForAutoArchive(
-  cwd: string,
-  signal: AbortSignal,
-): Promise<boolean> {
-  try {
-    await stat(cwd);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
-    throw error;
-  }
-  const options = { signal, timeout: 10_000 };
-  let status: { stdout: string };
-  try {
-    status = await runGitCommand(cwd, [
-      "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching", "--ignore-submodules=none",
-    ], options);
-  } catch (error) {
-    // Archive removes only registered Git worktrees, so a directory with no
-    // repository at or above it (a scratch project) is left in place. A broken
-    // worktree link reports a different message and still fails closed.
-    if (isOutsideAnyGitRepository(error)) return true;
-    throw error;
-  }
-  if (status.stdout.trim()) return false;
-  const retained = await runGitCommand(cwd, [
-    "rev-list", "--count", "HEAD", "--not", "--branches", "--remotes",
-  ], options);
-  return retained.stdout.trim() === "0";
-}
+type SweepTally = Pick<DesktopThreadArchiveSweepStatus, "deleted" | "failed" | "error" | "failures" | "hibernation">;
+type SweepFailureDetails = { path?: string; threadId?: string };
+type SweepPhase = DesktopThreadArchiveSweepFailure["phase"];
 
-function isOutsideAnyGitRepository(error: unknown): boolean {
+/** Keep reasons Thread Maintenance and hibernation report for a checkout that must stay. */
+export const WORKSPACE_KEEP_REASONS = {
+  changes: "Uncommitted changes",
+  unretained: "Commits on no branch",
+} as const;
+
+export function isOutsideAnyGitRepository(error: unknown): boolean {
   const stderr = (error as { stderr?: unknown })?.stderr;
   const text = `${error instanceof Error ? error.message : String(error)}\n${typeof stderr === "string" ? stderr : ""}`;
   return text.includes("not a git repository (or any of the parent directories)");
@@ -94,14 +92,46 @@ export function archiveCandidateLastActivity({ thread, overlay }: ThreadArchiveC
     ...(overlay?.worktreeSnapshots ?? []).map((snapshot) => snapshot.restoredAt ?? 0));
 }
 
-export function archiveCandidateProtectionReason({ thread, overlay, activeSubAgent, activePrWatch }: ThreadArchiveCandidate): string | undefined {
-  if (thread.isPinned || overlay?.pinnedRank !== undefined) return "Pinned thread";
+export const CLAUDE_CHECKOUT_KEEP_REASON = "Checkout ownership not registered";
+
+/** A worktree under PwrAgent's own root (`~/.pwragent/…/worktrees/<id>/<name>`). */
+export function isPwrAgentWorktreePath(value: string | undefined): boolean {
+  return toolWorktreeRootOwner(value) === "pwragent";
+}
+
+/** The Claude thread works in a PwrAgent worktree, and no directory it uses
+ * is marked as someone else's checkout. */
+export function isPwrAgentClaudeCheckout({ thread, overlay, managedWorktreePath }: Pick<ThreadArchiveCandidate, "thread" | "overlay" | "managedWorktreePath">): boolean {
+  const directories = [...thread.linkedDirectories, ...overlay?.extraLinkedDirectories ?? []];
+  return isPwrAgentWorktreePath(thread.projectKey)
+    && directories.every((directory) => (directory.worktreeOwnership !== "external"
+      || (managedWorktreePath && directory.worktreePath && path.resolve(directory.worktreePath) === path.resolve(managedWorktreePath)))
+      && (!directory.worktreePath || isPwrAgentWorktreePath(directory.worktreePath)));
+}
+
+/** `allowPinned` is for checkout hibernation, which keeps the thread listed. */
+export function archiveCandidateProtectionReason(
+  { thread, overlay, managedWorktreePath, activeSubAgent, activePrWatch, mergeHeld, unreadable }: ThreadArchiveCandidate,
+  options: { allowPinned?: boolean; allowOwnedClaudeWorktree?: boolean } = {},
+): string | undefined {
+  if (unreadable) return "Thread state unreadable";
+  if (!options.allowPinned && (thread.isPinned || overlay?.pinnedRank !== undefined)) return "Pinned thread";
   if (overlay?.agent) return "Agent thread";
+  if (mergeHeld) return "Merge held";
   if (overlay?.queuedAgentChange || overlay?.prAutoDispatchPending) return "Pending work";
   // The agent asked to be woken by its PR; archiving would strand the wake.
   if (activePrWatch) return "Watching a PR";
   if (overlay?.scheduledStart?.state === "scheduled") return "Scheduled work";
   if ((overlay?.codexEnvironmentRuntime ?? thread.codexEnvironmentRuntime)?.executionTarget === "remote") return "Remote execution";
+  // Claude threads are cleaned up only in a worktree PwrAgent created. A
+  // Claude session can also run in a checkout the operator or Claude Code made.
+  if (thread.source === "claude" && !isPwrAgentClaudeCheckout({ thread, overlay, managedWorktreePath })
+    && !(options.allowOwnedClaudeWorktree
+      && thread.linkedDirectories.some((directory) => directory.kind === "worktree" && directory.worktreePath)
+      && [...thread.linkedDirectories, ...overlay?.extraLinkedDirectories ?? []].every((directory) => directory.worktreeOwnership !== "external"
+        || (managedWorktreePath && directory.worktreePath && path.resolve(directory.worktreePath) === path.resolve(managedWorktreePath))))) {
+    return CLAUDE_CHECKOUT_KEEP_REASON;
+  }
   // The Codex app owns its chat folders' threads; housekeeping leaves them alone.
   if ([...thread.linkedDirectories, ...overlay?.extraLinkedDirectories ?? []].some(isCodexChatsDirectory)) return "Codex chat folder";
   if (activeSubAgent) return "Active subagent";
@@ -115,16 +145,140 @@ export function isProtectedArchiveCandidate(candidate: ThreadArchiveCandidate): 
   return archiveCandidateProtectionReason(candidate) !== undefined;
 }
 
-export function isStaleArchiveCandidate(
+/** Why the policy keeps a candidate, or undefined when it is stale. */
+export function archiveCandidateKeepReason(
   candidate: ThreadArchiveCandidate,
   now: number,
   policy: DesktopThreadArchivePolicy = { ...DEFAULT_THREAD_ARCHIVE_POLICY, mode: "age" },
-): boolean {
+): string | undefined {
   const { thread, overlay } = candidate;
-  if (!policy.enabled || thread.archivedAt !== undefined || overlay?.archiveTombstonedAt !== undefined
-    || isProtectedArchiveCandidate(candidate)) return false;
-  if (!Number.isFinite(thread.updatedAt) || (thread.updatedAt ?? 0) <= 0) return false;
-  return policy.mode === "count" || now - archiveCandidateLastActivity(candidate) >= policy.inactivityDays * 86_400_000;
+  if (thread.archivedAt !== undefined || overlay?.archiveTombstonedAt !== undefined) return "Already archived";
+  const protection = archiveCandidateProtectionReason(candidate);
+  if (protection) return protection;
+  if (!Number.isFinite(thread.updatedAt) || (thread.updatedAt ?? 0) <= 0) return "Activity unknown";
+  return policy.mode === "count" || now - archiveCandidateLastActivity(candidate) >= policy.inactivityDays * 86_400_000
+    ? undefined
+    : "Recently active";
+}
+
+/** A parent archived with more sub-threads left than this would scatter
+ * them: archive ungroups or promotes them. Archiving the children is fine. */
+export const MAX_SUBTHREADS_LEFT_BY_ARCHIVE = 2;
+
+export const SUBTHREAD_PARENT_KEEP_REASON = "Parent of 3+ sub-threads";
+
+export const PEER_SUBTHREADS_UNREADABLE = "Sub-threads on other instances could not be read";
+
+const PEER_SUBTHREAD_KEY_PREFIX = "peer/";
+
+/** The key a peer's sub-thread is counted under. It never equals a local
+ * identity key, so an archive here never counts it as archived. */
+export function peerSubthreadKey(instanceId: string, backend: AppServerBackendKind, threadId: string): string {
+  return `${PEER_SUBTHREAD_KEY_PREFIX}${instanceId}/${buildThreadIdentityKey(backend, threadId)}`;
+}
+
+export function isPeerSubthreadKey(key: string): boolean {
+  return key.startsWith(PEER_SUBTHREAD_KEY_PREFIX);
+}
+
+/** Direct, non-archived sub-threads per parent identity key. A local
+ * sub-thread's parent link lives on its own overlay. `peerChildren` adds this
+ * machine's threads' sub-threads on peers (`peerSubthreadChildren`): archive
+ * ungroups those too. Peer parents and native sub-agents (which archive with
+ * their root) are not counted. */
+export function subthreadChildren(
+  candidates: readonly ThreadArchiveCandidate[],
+  peerChildren?: ReadonlyMap<string, readonly string[]>,
+): Map<string, string[]> {
+  const children = new Map<string, string[]>();
+  for (const [key, list] of peerChildren ?? []) children.set(key, [...list]);
+  for (const { thread, overlay } of candidates) {
+    const parentId = overlay?.parentThreadId?.trim();
+    if (!parentId || overlay?.parentThreadInstanceId || thread.codexNativeSubAgent) continue;
+    if (overlay?.archiveTombstonedAt !== undefined || overlay?.archiveRetentionStartedAt !== undefined) continue;
+    const key = buildThreadIdentityKey(overlay?.parentThreadBackend ?? thread.source, parentId);
+    children.set(key, [...children.get(key) ?? [], buildThreadIdentityKey(thread.source, thread.id)]);
+  }
+  return children;
+}
+
+/** Removes from `selected` every parent that would leave more than
+ * MAX_SUBTHREADS_LEFT_BY_ARCHIVE sub-threads behind, counting selected
+ * children as gone. Repeats until stable, since keeping a child that is itself
+ * a parent can push its own parent over the limit. Returns the kept keys. */
+export function keepSubthreadParents(selected: Set<string>, children: ReadonlyMap<string, readonly string[]>): string[] {
+  const kept: string[] = [];
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const key of [...selected]) {
+      const left = (children.get(key) ?? []).filter((child) => !selected.has(child)).length;
+      if (left > MAX_SUBTHREADS_LEFT_BY_ARCHIVE) {
+        selected.delete(key);
+        kept.push(key);
+        changed = true;
+      }
+    }
+  }
+  return kept;
+}
+
+/** Deepest sub-threads first, then their parents, then top-level threads;
+ * otherwise in the given order. A sub-thread that is itself a parent must wait
+ * for its own sub-threads, or its archive promotes them. */
+export function subthreadsFirst<T>(
+  items: readonly T[],
+  candidateOf: (item: T) => Pick<ThreadArchiveCandidate, "thread" | "overlay"> | undefined =
+    (item) => item as unknown as ThreadArchiveCandidate,
+): T[] {
+  const parentOf = new Map<string, string | undefined>();
+  for (const item of items) {
+    const candidate = candidateOf(item);
+    if (!candidate) continue;
+    const parentId = candidate.overlay?.parentThreadId?.trim();
+    parentOf.set(buildThreadIdentityKey(candidate.thread.source, candidate.thread.id), parentId
+      ? buildThreadIdentityKey(candidate.overlay?.parentThreadBackend ?? candidate.thread.source, parentId)
+      : undefined);
+  }
+  // Parent links walked from the item, bounded so a parent loop cannot spin.
+  const depth = (item: T): number => {
+    const candidate = candidateOf(item);
+    if (!candidate) return 0;
+    let key = buildThreadIdentityKey(candidate.thread.source, candidate.thread.id);
+    let levels = 0;
+    while (levels <= items.length) {
+      const parent = parentOf.get(key);
+      if (!parent) break;
+      levels += 1;
+      key = parent;
+    }
+    return levels;
+  };
+  const depths = new Map(items.map((item) => [item, depth(item)]));
+  return [...items].sort((a, b) => depths.get(b)! - depths.get(a)!);
+}
+
+/** Groups each root with its native sub-agent threads, which archive with it. */
+export function archiveFamilies(candidates: ThreadArchiveCandidate[]): (root: ThreadArchiveCandidate) => ThreadArchiveCandidate[] {
+  const children = new Map<string, ThreadArchiveCandidate[]>();
+  for (const candidate of candidates) {
+    const parentId = candidate.thread.codexNativeSubAgent?.parentThreadId;
+    if (!parentId) continue;
+    const key = buildThreadIdentityKey(candidate.thread.source, parentId);
+    children.set(key, [...children.get(key) ?? [], candidate]);
+  }
+  return (root) => {
+    const group: ThreadArchiveCandidate[] = [];
+    const seen = new Set<string>();
+    const visit = (candidate: ThreadArchiveCandidate) => {
+      const key = buildThreadIdentityKey(candidate.thread.source, candidate.thread.id);
+      if (seen.has(key)) return;
+      seen.add(key);
+      group.push(candidate);
+      for (const child of children.get(key) ?? []) visit(child);
+    };
+    visit(root);
+    return group;
+  };
 }
 
 /** Main-process housekeeping. Only explicit start() schedules it, so registry
@@ -134,7 +288,7 @@ export class ThreadArchiveSweeper {
   private started = false;
   private running?: Promise<void>;
   private readonly abort = new AbortController();
-  private status: DesktopThreadArchiveSweepStatus = { running: false, archived: 0, deleted: 0, failed: 0 };
+  private status: DesktopThreadArchiveSweepStatus = { running: false, deleted: 0, failed: 0 };
 
   constructor(private readonly deps: SweeperDeps) {}
 
@@ -154,12 +308,12 @@ export class ThreadArchiveSweeper {
     if (this.abort.signal.aborted) return Promise.resolve();
     if (this.running) return this.running;
     clearTimeout(this.timer);
-    const tally: SweepTally = { archived: 0, deleted: 0, failed: 0 };
+    const tally: SweepTally = { deleted: 0, failed: 0 };
     this.publish({ ...tally, running: true, startedAt: Date.now() });
     this.running = withCodexRequestActivity(
       { countsAsActivity: false }, () => this.run(tally, options.manual === true),
     ).catch((error) => {
-      if (!this.abort.signal.aborted) this.fail(tally, error);
+      if (!this.abort.signal.aborted) this.fail(tally, "sweep", error);
     }).finally(() => {
       this.running = undefined;
       if (this.abort.signal.aborted) return;
@@ -172,7 +326,8 @@ export class ThreadArchiveSweeper {
   async stop(): Promise<void> {
     clearTimeout(this.timer);
     this.abort.abort();
-    // An archive already sent must settle before the registry closes its stores.
+    // A deletion or hibernation already sent must settle before the registry
+    // closes its stores.
     await this.running;
   }
 
@@ -187,116 +342,88 @@ export class ThreadArchiveSweeper {
     this.deps.onStatus?.(status);
   }
 
-  private count(tally: SweepTally, error: unknown): void {
+  private count(tally: SweepTally, phase: SweepPhase, error: unknown, details: SweepFailureDetails = {}): void {
+    const message = error instanceof Error ? error.message : String(error);
     tally.failed += 1;
-    tally.error ??= error instanceof Error ? error.message : String(error);
+    tally.error ??= message;
+    const failures = tally.failures ??= [];
+    if (failures.length < THREAD_ARCHIVE_SWEEP_FAILURE_LIMIT) {
+      failures.push({ phase, message,
+        ...(details.path ? { path: details.path } : {}),
+        ...(details.threadId ? { threadId: details.threadId } : {}) });
+    }
   }
 
-  private fail(tally: SweepTally, error: unknown, threadId?: string): void {
-    this.count(tally, error);
+  private fail(tally: SweepTally, phase: SweepPhase, error: unknown, threadId?: string): void {
+    this.count(tally, phase, error, { threadId });
     this.deps.onError(error, threadId);
   }
 
   private async run(tally: SweepTally, manual: boolean): Promise<void> {
+    // Each phase reports its own failures; none of them stops a later phase.
     try {
       await this.deps.cleanupWorktrees?.({ manual,
         onProgress: (worktrees) => this.publish({ ...this.status, ...tally, worktrees }),
-        onFailure: (error) => this.count(tally, error),
+        onFailure: (error, details) => this.count(tally, "worktrees", error, details),
       });
-    } catch (error) { if (!this.abort.signal.aborted) this.fail(tally, error); }
-    const policy = this.deps.getPolicy?.() ?? { ...DEFAULT_THREAD_ARCHIVE_POLICY, mode: "age" as const };
-    try { tally.deleted += await this.deps.cleanupRetention?.((error) => this.count(tally, error)) || 0; }
-    catch (error) { if (!this.abort.signal.aborted) this.fail(tally, error); }
-    if (!policy.enabled || this.abort.signal.aborted) return;
-    const candidates = await this.deps.listCandidates();
-    const children = new Map<string, ThreadArchiveCandidate[]>();
-    for (const candidate of candidates) {
-      const parentId = candidate.thread.codexNativeSubAgent?.parentThreadId;
-      if (!parentId) continue;
-      const key = buildThreadIdentityKey(candidate.thread.source, parentId);
-      children.set(key, [...children.get(key) ?? [], candidate]);
+    } catch (error) { if (!this.abort.signal.aborted) this.fail(tally, "worktrees", error); }
+    try { tally.deleted += await this.deps.cleanupRetention?.((error, details) => this.count(tally, "retention", error, details)) || 0; }
+    catch (error) { if (!this.abort.signal.aborted) this.fail(tally, "retention", error); }
+    if (this.abort.signal.aborted) return;
+    await this.hibernateCheckouts(tally);
+  }
+
+  private async hibernateCheckouts(tally: SweepTally): Promise<void> {
+    const deps = this.deps.hibernation;
+    if (!deps) return;
+    let policy: DesktopCheckoutHibernationPolicy;
+    try { policy = deps.getPolicy(); }
+    catch (error) {
+      this.fail(tally, "hibernation", error);
+      tally.hibernation = { checked: 0, hibernated: 0, kept: {}, skipped: "The hibernation policy could not be read" };
+      return;
     }
-    const groupFor = (root: ThreadArchiveCandidate): ThreadArchiveCandidate[] => {
-      const group: ThreadArchiveCandidate[] = [];
-      const seen = new Set<string>();
-      const visit = (candidate: ThreadArchiveCandidate) => {
-        const key = buildThreadIdentityKey(candidate.thread.source, candidate.thread.id);
-        if (seen.has(key)) return;
-        seen.add(key);
-        group.push(candidate);
-        for (const child of children.get(key) ?? []) visit(child);
-      };
-      visit(root);
-      return group;
-    };
-    const eligibleRoots = candidates.filter((candidate) => !candidate.thread.codexNativeSubAgent
-      && groupFor(candidate).every((item) => isStaleArchiveCandidate(item, Date.now(), policy) && !this.deps.isBusy(item)));
-    const selected = new Set<ThreadArchiveCandidate>();
-    if (policy.mode === "count") {
-      const projects = new Map<string, ThreadArchiveCandidate[]>();
-      for (const candidate of eligibleRoots) {
-        if (this.abort.signal.aborted) return;
-        // Workspaces that cannot be safely archived are kept in addition to
-        // the quota, just like pins and active work.
-        try {
-          let safe = true;
-          const paths = new Set(groupFor(candidate).flatMap(({ thread, overlay }) =>
-            [...thread.linkedDirectories, ...overlay?.extraLinkedDirectories ?? []]
-              .map((directory) => directory.worktreePath ?? directory.path)));
-          for (const cwd of paths) {
-            if (!cwd.trim() || !await (this.deps.workspaceIsSafe ?? workspaceIsSafeForAutoArchive)(cwd, this.abort.signal)) {
-              safe = false;
-              break;
-            }
-          }
-          if (!safe) continue;
-        } catch (error) {
-          if (!this.abort.signal.aborted) this.fail(tally, error, candidate.thread.id);
-          continue;
-        }
-        const key = this.deps.resolveProject
-          ? await this.deps.resolveProject(candidate)
-          : candidate.thread.projectKey ?? candidate.thread.linkedDirectories[0]?.path;
-        // Unknown project identity must not combine unrelated worktrees into one quota.
-        if (!key) continue;
-        projects.set(key, [...projects.get(key) ?? [], candidate]);
-      }
-      for (const group of projects.values()) {
-        group.sort((a, b) => archiveCandidateLastActivity(b) - archiveCandidateLastActivity(a)
-          || a.thread.id.localeCompare(b.thread.id));
-        for (const candidate of group.slice(policy.keepPerProject)) selected.add(candidate);
-      }
-    } else {
-      for (const candidate of eligibleRoots) selected.add(candidate);
+    const hibernation: NonNullable<SweepTally["hibernation"]> = { checked: 0, hibernated: 0, kept: {} };
+    tally.hibernation = hibernation;
+    if (!policy.enabled) {
+      hibernation.skipped = "Hibernation is off";
+      return;
+    }
+    const keep = (reason: string) => { hibernation.kept[reason] = (hibernation.kept[reason] ?? 0) + 1; };
+    let candidates: ThreadArchiveCandidate[];
+    try { candidates = await this.deps.listCandidates(); }
+    catch (error) {
+      if (!this.abort.signal.aborted) this.fail(tally, "hibernation", error);
+      hibernation.skipped = "Threads could not be listed";
+      return;
     }
     for (const candidate of candidates) {
       if (this.abort.signal.aborted) return;
-      if (!selected.has(candidate)) continue;
-      const group = groupFor(candidate);
-      if (!group.every((item) => isStaleArchiveCandidate(item, Date.now(), policy) && !this.deps.isBusy(item))) continue;
+      // Native children may own an independent checkout. Shared-path rules
+      // protect inherited checkouts, regardless of where the parent lives.
       try {
-        const refreshed = await Promise.all(group.map((item) => this.deps.refreshCandidate(item)));
-        if (this.abort.signal.aborted) return;
-        if (policy.mode === "count" && archiveCandidateLastActivity(refreshed[0]!) > archiveCandidateLastActivity(candidate)) continue;
-        if (!refreshed.every((item) => isStaleArchiveCandidate(item, Date.now(), policy) && !this.deps.isBusy(item))) continue;
-        const paths = new Set(refreshed.flatMap(({ thread, overlay }) =>
-          [...thread.linkedDirectories, ...overlay?.extraLinkedDirectories ?? []]
-            .map((directory) => directory.worktreePath ?? directory.path),
-        ));
-        let safe = true;
-        for (const cwd of paths) {
-          if (!cwd.trim() || !await (this.deps.workspaceIsSafe ?? workspaceIsSafeForAutoArchive)(cwd, this.abort.signal)) {
-            safe = false;
-            break;
-          }
+        const listed = deps.keepReason(candidate, candidates, policy, Date.now());
+        if (!listed.target) continue;
+        hibernation.checked += 1;
+        if (listed.keep) {
+          keep(listed.keep);
+          continue;
         }
-        if (!safe || this.abort.signal.aborted) continue;
-        if (!refreshed.every((item) => !this.deps.isBusy(item)) || !await this.deps.canArchive(refreshed)) continue;
+        const workspace = await deps.inspectWorkspace(listed.target, policy, this.abort.signal);
         if (this.abort.signal.aborted) return;
-        if (JSON.stringify(this.deps.getPolicy?.() ?? policy) !== JSON.stringify(policy)) return;
-        if (await this.deps.archive(refreshed[0]!, refreshed) !== false) tally.archived += 1;
+        if (workspace) {
+          keep(workspace);
+          continue;
+        }
+        if (JSON.stringify(deps.getPolicy()) !== JSON.stringify(policy)) return;
+        const result = await deps.hibernate(candidate, policy);
+        if (result === true) hibernation.hibernated += 1;
+        else keep(result === false ? "Hibernation cancelled" : result);
       } catch (error) {
-        if (!this.abort.signal.aborted) this.fail(tally, error, candidate.thread.id);
+        if (!this.abort.signal.aborted) {
+          this.count(tally, "hibernation", error, { threadId: candidate.thread.id });
+          this.deps.onError(error, candidate.thread.id);
+        }
       }
     }
   }

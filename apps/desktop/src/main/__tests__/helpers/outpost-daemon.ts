@@ -1,4 +1,4 @@
-import { execFile, execFileSync, spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import path from "node:path";
@@ -16,10 +16,7 @@ export const OUTPOST_PACKAGE_ROOT = path.join(process.cwd(), "packages/pwragent"
 
 /** Every grant a viewer can hold on an Outpost. */
 export const OUTPOST_VIEWER_CAPABILITIES: FederationCapability[] = ["remote_window", "thread_navigation", "thread_detail",
-  "turn_control", "messaging_route", "messaging_destinations", "messaging_files", "environment_actions"];
-
-/** One build serves every daemon a test file starts. */
-let outpostBuilt = false;
+  "turn_control", "durable_turn_requests_v1", "durable_steer_requests_v1", "messaging_route", "messaging_destinations", "messaging_files", "environment_actions"];
 
 export type OutpostDaemon = {
   client: FederationRemoteBackendClient;
@@ -31,22 +28,21 @@ export type OutpostDaemon = {
   cli: string;
   env: NodeJS.ProcessEnv;
   viewerId: string;
+  ownerInstanceId: string;
   close(): Promise<void>;
 };
 
 /**
- * Builds the standalone Outpost, starts its daemon on the fake Codex fixture
+ * Starts the standalone Outpost on the fake Codex fixture
  * and enrolls one viewer through a real invite, Noise handshake and RPC
  * endpoint, the way a desktop viewer connects.
  */
 export async function startOutpostDaemon(options: {
   workspaceKind?: "direct" | "symlink";
   capabilities?: FederationCapability[];
+  profileRoot?: string;
+  packageRoot?: string;
 } = {}): Promise<OutpostDaemon> {
-  if (!outpostBuilt) {
-    execFileSync(process.execPath, [path.join(OUTPOST_PACKAGE_ROOT, "scripts/build.mjs")], { cwd: process.cwd(), stdio: "pipe" });
-    outpostBuilt = true;
-  }
   // The outpost listens on $PWRAGENT_HOME/profiles/t/state/headless/rpc.sock
   // and refuses a socket path over 100 bytes (the Unix sun_path limit). A
   // root inside the checkout makes that depend on where the checkout lives,
@@ -55,19 +51,20 @@ export async function startOutpostDaemon(options: {
   // resolves to a long /private/var/folders/... path. Canonicalize the short
   // root so every fixture path uses the outpost's realpath identity (on
   // macOS /tmp is an alias for /private/tmp, which is still short enough).
-  const root = realpathSync(mkdtempSync("/tmp/pwragent-h-"));
+  const root = options.profileRoot ?? realpathSync(mkdtempSync("/tmp/pwragent-h-"));
   const workspace = path.join(root, "w");
   const home = path.join(root, "c");
   const data = path.join(root, "f");
-  for (const directory of [workspace, home, data]) mkdirSync(directory);
+  for (const directory of [workspace, home, data]) mkdirSync(directory, { recursive: true });
   // Exercise alias resolution on Linux too, while all RPC requests and
   // assertions continue to use the canonical project/directory identity.
   const workspaceInput = options.workspaceKind === "symlink" ? path.join(root, "alias") : workspace;
   if (options.workspaceKind === "symlink") symlinkSync(workspace, workspaceInput, "dir");
   const env = { ...process.env, PWRAGENT_HOME: root, PWRAGENT_PROFILE: "t", PWRAGENT_TEST_DATA: data };
-  const cli = path.join(OUTPOST_PACKAGE_ROOT, "bin/pwragent.js");
+  const packageRoot = options.packageRoot ?? OUTPOST_PACKAGE_ROOT;
+  const cli = path.join(packageRoot, "bin/pwragent.js");
   const daemon = spawn(process.execPath, [cli, "serve", "--workspace", workspaceInput, "--codex-home", home,
-    "--codex-bin", path.join(OUTPOST_PACKAGE_ROOT, "test/fixtures/codex.js")], { env, stdio: ["ignore", "pipe", "pipe"] });
+    "--codex-bin", path.join(packageRoot, "test/fixtures/codex.js")], { env, stdio: ["ignore", "pipe", "pipe"] });
   let output = "";
   let errors = "";
   daemon.stdout.on("data", (chunk) => { output += String(chunk); });
@@ -78,7 +75,7 @@ export async function startOutpostDaemon(options: {
     connection?.close();
     daemon.kill("SIGTERM");
     await exited;
-    rmSync(root, { recursive: true, force: true });
+    if (!options.profileRoot) rmSync(root, { recursive: true, force: true });
   };
   try {
     for (let attempt = 0; !output.includes('"ready":true'); attempt++) {
@@ -109,7 +106,7 @@ export async function startOutpostDaemon(options: {
       sendEnvelope: (envelope) => connected.sendEnvelope(envelope), defaultTimeoutMs: 3000 });
     connected.startReceiving();
     return {
-      client: new FederationRemoteBackendClient(rpc), rpc, events, workspace, cli, env, viewerId, close,
+      client: new FederationRemoteBackendClient(rpc), rpc, events, workspace, cli, env, viewerId, ownerInstanceId: invite.gatewayInstanceId, close,
       subscribe: (eventClasses) => connected.sendEnvelope({ kind: "notification", method: "federation.eventSubscription",
         id: randomUUID(), params: { eventClasses, threadSelection: { kind: "all" } }, protocolVersion: FEDERATION_PROTOCOL_VERSION,
         sourceInstanceId: viewerId, targetInstanceId: invite.gatewayInstanceId, createdAt: Date.now() }),

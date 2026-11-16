@@ -26,15 +26,16 @@ vi.mock("electron", () => ({ ipcMain: {
   handle: (channel: string, handler: (event: unknown, request: unknown) => Promise<unknown>) => fixture.handlers.set(channel, handler),
 } }));
 vi.mock("../app-server/backend-registry", () => ({ getDesktopBackendRegistry: () => ({}) }));
-vi.mock("../app-server/desktop-overlay-store", () => ({ getDesktopOverlayStore: () => ({ listRemoteThreadPins: async () => [] }) }));
+vi.mock("../storage/desktop-overlay-store", () => ({ getDesktopOverlayStore: () => ({ listRemoteThreadPins: async () => [] }) }));
 vi.mock("../state/app-state", () => ({ getAppStateDb: () => ({}) }));
-vi.mock("../operator-requests/operator-request-store", () => ({ OperatorRequestStore: class {} }));
+vi.mock("../storage/desktop-operator-request-storage", () => ({ createOperatorRequestStorage: () => ({}) }));
 vi.mock("../operator-requests/operator-request-service", () => ({ OperatorRequestService: class {
   constructor(options: { broadcast: (event: OperatorRequestsChangedEvent) => void }) { fixture.broadcast = options.broadcast; }
   start() {}
   stop() {}
 } }));
-vi.mock("../operator-requests/operator-request-runtime", () => ({
+vi.mock("../operator-requests/operator-request-runtime", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../operator-requests/operator-request-runtime")>(),
   installOperatorRequestService: () => {},
   localOperatorQuestionOperations: { dismiss: fixture.localDismiss, listDismissed: fixture.localList },
 }));

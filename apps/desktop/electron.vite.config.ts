@@ -146,6 +146,7 @@ export default defineConfig(({ command }) => {
             "@pwragent/shared",
             "@pwragent/federation",
             "@pwragent/owner-core",
+            "@pwragent/sqlite-storage",
             "@pwragent/agent-tools",
             "@pwrdrvr/codex-app-server-protocol",
             "@pwragent/messaging-interface",
@@ -170,6 +171,7 @@ export default defineConfig(({ command }) => {
           input: {
             index: resolve(__dirname, "src/main/index.ts"),
             "storage-maintenance-worker": resolve(__dirname, "src/main/state/storage-maintenance-worker.ts"),
+            "claude-session-reader-worker": resolve(__dirname, "src/main/claude/claude-session-reader-worker.ts"),
             "mcp-connection-bridge": resolve(
               __dirname,
               "src/main/mcp-connections/mcp-connection-bridge-entry.ts"

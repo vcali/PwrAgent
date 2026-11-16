@@ -1,3 +1,4 @@
+import fc from "fast-check";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -29,6 +30,8 @@ import type {
   RenameThreadRequest,
   RestoreWorktreeRequest,
   RestoreThreadRequest,
+  SetDirectoryPinRequest,
+  ReorderDirectoryPinsRequest,
   SetThreadParentRequest,
   ThreadGitWorkingState,
   ThreadPullRequestWatchEvent,
@@ -78,9 +81,14 @@ const backendRegistryLifecycle = vi.hoisted(() => {
 const withThreadLifecycleMutation = vi.hoisted(() => vi.fn(
   async (_identity: unknown, work: () => Promise<unknown>) => await work(),
 ));
+/** Restore on open, which the owner runs only for its own threads. */
+const wakeHibernatedCheckoutOnOpen = vi.hoisted(() => vi.fn(async (_identity: unknown) => false));
 const overlayStoreFixture = vi.hoisted(() => ({ stable: undefined as unknown }));
 const federationMock = vi.hoisted(() => {
   const remoteBackend = {
+    setDirectoryPin: vi.fn(async (request: SetDirectoryPinRequest) => ({ directoryKey: request.directoryKey,
+      pinnedRank: request.pinned ? "4096" : undefined })),
+    reorderDirectoryPins: vi.fn(async (request: ReorderDirectoryPinsRequest) => ({ pinnedRanks: { [request.move!.key]: "512" } })),
     manageThreadPrWatchesV1: vi.fn(async (): Promise<ThreadPrWatchesResponse> => ({ ok: true, cancelled: true })),
     continueThreadEnvironmentStartup: vi.fn(async (request: { backend: string; threadId: string }) => ({ ...request, turnId: "owner-turn" })),
     acknowledgeThreadEnvironmentFailure: vi.fn(async (request: { backend: string; threadId: string }) => ({ ...request, acknowledged: true })),
@@ -275,6 +283,10 @@ const readLocalHeadPastPrHead = vi.hoisted(() =>
 );
 
 const handlers = new Map<string, (...args: unknown[]) => Promise<unknown>>();
+function navigationReadHandler(method: string): (...args: unknown[]) => Promise<unknown> {
+  return (event, params, consumerId) => handlers.get("owner:request")!(event, { method, params }, consumerId);
+}
+
 const getStartupProviderRefreshStatus = vi.fn();
 const isIncompleteThreadList = vi.fn((_threads: unknown) => false);
 const listThreads = vi.fn(async (request?: {
@@ -759,6 +771,8 @@ const setThreadPullRequestCanonicalizer = vi.fn();
 const setLocalPullRequestAuthorityResolver = vi.fn();
 const setThreadPullRequestWatchToolHandler = vi.fn();
 const setThreadDependencyToolHandler = vi.fn();
+const setThreadDependenciesPeerHandler = vi.fn();
+const setThreadMaintenanceToolHandler = vi.fn();
 const setThreadPrAutoDispatchHandler = vi.fn();
 const setThreadPullRequestDetachHandler = vi.fn();
 const setThreadPrWatchesPeerHandler = vi.fn();
@@ -993,6 +1007,8 @@ const advanceThreadPrStatusWatches = vi.fn(async () => ({
 const listActiveThreadPrStatusWatches = vi.fn(async () => []);
 const cancelThreadPrStatusWatchesForPr = vi.fn(async () => 0);
 const claimThreadPrTerminalWatches = vi.fn(async () => []);
+const observeThreadPrTerminalWatches = vi.fn(async () => []);
+const listPendingPrTerminalWatchObservations = vi.fn(async () => []);
 const finishThreadPrTerminalWatch = vi.fn(async () => undefined);
 const listPendingPrTerminalWatchPrKeys = vi.fn(async () => [] as string[]);
 const listAllActiveThreadPrStatusWatches = vi.fn(async () => []);
@@ -1134,7 +1150,7 @@ vi.mock("../settings/desktop-settings-singleton", () => ({
   }),
 }));
 
-vi.mock("../app-server/desktop-overlay-store", () => ({
+vi.mock("../storage/desktop-overlay-store", () => ({
   getDesktopOverlayStore: () => overlayStoreFixture.stable ?? ({
     reconcileNavigationSnapshot,
     readNavigationQueryIndex,
@@ -1171,6 +1187,8 @@ vi.mock("../app-server/desktop-overlay-store", () => ({
     listPendingThreadPrAutoDispatches,
     recoverOrphanedThreadPrAutoDispatches,
     registerThreadPrStatusWatch,
+    retireArchivedThreadPrAutomation: async () => [],
+    isThreadPrStatusWatchClaimActive: async () => true,
     claimThreadPrStatusWatches,
     releaseThreadPrStatusWatch,
     renewThreadPrStatusWatchLease,
@@ -1179,6 +1197,8 @@ vi.mock("../app-server/desktop-overlay-store", () => ({
     listActiveThreadPrStatusWatches,
     cancelThreadPrStatusWatchesForPr,
     claimThreadPrTerminalWatches,
+    observeThreadPrTerminalWatches,
+    listPendingPrTerminalWatchObservations,
     finishThreadPrTerminalWatch,
     listPendingPrTerminalWatchPrKeys,
     listAllActiveThreadPrStatusWatches,
@@ -1220,6 +1240,9 @@ vi.mock("../app-server/backend-registry", () => {
     renameThread,
     listThreads,
     getCachedThreadSummary,
+    getThreadInfo: () => undefined,
+    observeArchivedThreads: async () => {},
+    publishArchivedThreadAutomationRetirements: async () => {},
     readThread,
     getThreadTranscriptImageRoots,
     readDirectoryStatuses,
@@ -1252,9 +1275,12 @@ vi.mock("../app-server/backend-registry", () => {
     setThreadPullRequestCanonicalizer,
     setPullRequestReferenceResolver: vi.fn(),
     setThreadPrimaryGitRepositoryReader: vi.fn(),
+    setThreadProjectRepositoryResolver: vi.fn(),
     setLocalPullRequestAuthorityResolver,
     setThreadPullRequestWatchToolHandler,
     setThreadDependencyToolHandler,
+    setThreadDependenciesPeerHandler,
+    setThreadMaintenanceToolHandler,
     setThreadPrAutoDispatchHandler,
     setThreadPullRequestDetachHandler,
     setThreadPrWatchesPeerHandler,
@@ -1278,6 +1304,7 @@ vi.mock("../app-server/backend-registry", () => {
     rememberNavigationVisibilityIndex: rememberCompleteNavigationSnapshot,
     getCodexAppServerRestartStatus: () => ({ stopped: false }),
     withThreadLifecycleMutation,
+    wakeHibernatedCheckoutOnOpen,
     onCodexAppServerRestartStatusChanged: (listener: (status: unknown) => void) => {
       codexRestartStatus.listeners.add(listener);
       return () => codexRestartStatus.listeners.delete(listener);
@@ -1367,6 +1394,26 @@ const {
 } = await import("../ipc/app-server");
 
 describe("app server ipc", () => {
+  it("routes remote directory pins and moves to the selected owner", async () => {
+    const { NAVIGATION_SET_DIRECTORY_PIN_CHANNEL, NAVIGATION_REORDER_DIRECTORY_PINS_CHANNEL } = await import("../../shared/ipc");
+    registerAppServerIpcHandlers();
+    const federationTarget = { scope: "remote" as const, instanceId: "m2-max" };
+    const directoryKey = "directory:/fixture/git";
+    const pin = handlers.get(NAVIGATION_SET_DIRECTORY_PIN_CHANNEL)!;
+    const reorder = handlers.get(NAVIGATION_REORDER_DIRECTORY_PINS_CHANNEL)!;
+    await expect(pin({}, { directoryKey, pinned: true, federationTarget }))
+      .resolves.toEqual({ directoryKey, pinnedRank: "4096" });
+    await expect(reorder({}, { move: { key: directoryKey, direction: "up" }, federationTarget }))
+      .resolves.toEqual({ pinnedRanks: { [directoryKey]: "512" } });
+    await expect(pin({}, { directoryKey, pinned: false, federationTarget }))
+      .resolves.toEqual({ directoryKey, pinnedRank: undefined });
+    expect(federationMock.runtime.remoteBackend.mock.calls).toEqual([[federationTarget], [federationTarget], [federationTarget]]);
+    expect(federationMock.remoteBackend.setDirectoryPin.mock.calls).toEqual([
+      [{ directoryKey, pinned: true }], [{ directoryKey, pinned: false }],
+    ]);
+    expect(federationMock.remoteBackend.reorderDirectoryPins).toHaveBeenCalledExactlyOnceWith({ move: { key: directoryKey, direction: "up" } });
+  });
+
   it("keeps the selected owner and original cause in remote directory mark-read failures", async () => {
     const { appServerService } = await import("../ipc/app-server");
     const target = { scope: "remote" as const, instanceId: "pwr_laptop" };
@@ -1475,6 +1522,7 @@ describe("app server ipc", () => {
     backendRegistryLifecycle.existing = true;
     backendRegistryLifecycle.get.mockClear();
     withThreadLifecycleMutation.mockClear();
+    wakeHibernatedCheckoutOnOpen.mockClear();
     prAutomationSettings.state.backgroundPrPollingEnabled = true;
     prAutomationSettings.state.budgetPaused = false;
     prAutomationSettings.state.budgetPausedAt = 1_000;
@@ -1565,6 +1613,8 @@ describe("app server ipc", () => {
     setLocalPullRequestAuthorityResolver.mockClear();
     setThreadPullRequestWatchToolHandler.mockClear();
     setThreadDependencyToolHandler.mockClear();
+    setThreadDependenciesPeerHandler.mockClear();
+    setThreadMaintenanceToolHandler.mockClear();
     setThreadPrAutoDispatchHandler.mockClear();
     setThreadPullRequestDetachHandler.mockClear();
     setThreadPrWatchesPeerHandler.mockClear();
@@ -1922,10 +1972,9 @@ describe("app server ipc", () => {
     );
   });
 
-  it("guards dependency IPC against remote windows and malformed consumers", async () => {
+  it("guards dependency IPC against malformed consumers", async () => {
     registerAppServerIpcHandlers();
     const handler = handlers.get("thread:dependencies")!;
-    await expect(handler({ sender: { id: 999 } }, { action: "list", backend: "codex", threadId: "waiting" })).rejects.toThrow("local window");
     await expect(handler({ sender: { id: 1 } }, { action: "create", backend: "codex", threadId: "" })).rejects.toThrow("waiting threadId");
     // The operator's dialog must write the plan down too, not only agents.
     await expect(handler({ sender: { id: 1 } }, {
@@ -1936,7 +1985,7 @@ describe("app server ipc", () => {
     await expect(tool({ action: "create", backend: "codex", threadId: "" })).resolves.toMatchObject({ ok: false, error: { code: "invalid_arguments" } });
   });
 
-  it("lists every active registration for sidebar status, to local windows only", async () => {
+  it("lists every active registration for sidebar status", async () => {
     const { appServerService } = await import("../ipc/app-server");
     const appState = await import("../state/app-state");
     registerAppServerIpcHandlers();
@@ -1952,7 +2001,6 @@ describe("app server ipc", () => {
     const coordinator = vi.spyOn(service, "getThreadDependencyCoordinator").mockReturnValue(agent);
     try {
       await expect(handler({ sender: { id: 1 } }, { action: "active" })).resolves.toEqual({ dependencies: [waiting] });
-      await expect(handler({ sender: { id: 999 } }, { action: "active" })).rejects.toThrow("local window");
     } finally {
       coordinator.mockRestore(); mode.mockRestore();
     }
@@ -2395,7 +2443,7 @@ describe("app server ipc", () => {
 
   it("reconciles a newer canonical PR event instead of applying an older startup inventory", async () => {
     const { startAppServerOwnerNavigation } = await import("../ipc/app-server");
-    const { getDesktopOverlayStore } = await import("../app-server/desktop-overlay-store");
+    const { getDesktopOverlayStore } = await import("../storage/desktop-overlay-store");
     // The production store is a singleton. Keep this test's owner identity
     // stable so the service loop can reuse the fresh replacement index.
     overlayStoreFixture.stable = getDesktopOverlayStore();
@@ -3640,7 +3688,7 @@ describe("app server ipc", () => {
 
   it("reads pending wakes from initialized stores without starting the scheduler or listing unrelated PRs", async () => {
     const { SqliteOverlayStore } = await import("../state/overlay-store-sqlite");
-    const { ScheduledThreadActionStore } = await import("../scheduled-actions/scheduled-thread-action-store");
+    const { ScheduledThreadActionStore } = await import("../storage/scheduled-thread-action-store");
     const scheduler = await import("../scheduled-actions/scheduled-thread-action-service");
     const { appServerService } = await import("../ipc/app-server");
     const appState = await import("../state/app-state");
@@ -4305,6 +4353,7 @@ describe("app server ipc", () => {
     overlayStoreFixture.stable = {
       setDirectoryForgeAutomation: vi.fn(async (params: { automation: unknown }) => ({ forgeAutomation: params.automation })),
       listPendingPrTerminalWatchPrKeys: listPendingTerminalWatches,
+      listPendingPrTerminalWatchObservations: vi.fn(async () => []),
     };
     const cancelPendingDisallowedByProject = vi.fn(async (_thread: unknown) => true);
     const handlePrEvent = vi.fn(async () => undefined);
@@ -4339,7 +4388,7 @@ describe("app server ipc", () => {
       expect(scheduler.tick).toHaveBeenCalledTimes(1);
       expect(handlePrEvent).toHaveBeenCalledTimes(1);
       // A merge or close seen while paused left its watch pending; resume re-offers it.
-      expect(listPendingTerminalWatches).toHaveBeenCalledExactlyOnceWith({ backend: "codex", threadId: "thread-1" });
+      expect(listPendingTerminalWatches).toHaveBeenCalledExactlyOnceWith({ backend: "codex", threadId: "thread-1", unobservedOnly: true });
       expect(cancelPendingDisallowedByProject).toHaveBeenCalledTimes(1);
     } finally {
       dependencies.mockRestore(); autoDispatch.mockRestore(); mode.mockRestore();
@@ -4962,15 +5011,83 @@ describe("app server ipc", () => {
     ).resolves.toBe(snapshot);
   });
 
+  it("routes every local navigation read through one owner dispatcher with window-owned demand", async () => {
+    const { registerAppServerIpcHandlers, appServerService } = await import("../ipc/app-server");
+    registerAppServerIpcHandlers();
+    const dispatch = handlers.get("owner:request");
+    expect(dispatch).toBeTypeOf("function");
+    for (const channel of ["navigation:get-query-page", "navigation:get-selected-detail",
+      "navigation:get-queue-projection", "navigation:get-launchpad-config"]) {
+      expect(handlers.has(channel)).toBe(false);
+    }
+    const methods = ["getNavigationQueryPage", "getNavigationSelectedDetail", "getNavigationQueueProjection",
+      "getNavigationLaunchpadConfig"] as const;
+    await fc.assert(fc.asyncProperty(fc.integer({ min: 0, max: 3 }), fc.integer({ min: 100_000, max: 999_999 }),
+      fc.string({ minLength: 1, maxLength: 30 }), async (index, senderId, consumerId) => {
+        const method = methods[index]!;
+        const response = { protocol: 2, revision: consumerId };
+        const read = vi.spyOn(appServerService, method).mockResolvedValue(response as never);
+        try {
+          const request = { protocol: 2, inventory: "viewer", query: { kind: "lens", lens: "inbox" } };
+          const result = await dispatch!({ sender: { id: senderId, once: vi.fn() } },
+            { method: `backend.${method}`, params: request }, consumerId);
+          expect(result).toEqual(response);
+          expect(read).toHaveBeenCalledExactlyOnceWith(request, JSON.stringify([senderId, consumerId]));
+        } finally { read.mockRestore(); }
+      }));
+  });
+
+  it("admits native demand before allocating an Attention lease", async () => {
+    const { registerAppServerIpcHandlers } = await import("../ipc/app-server");
+    const { NavigationAttentionViewLeases } = await import("../app-server/navigation-attention-view-leases");
+    const qualify = vi.spyOn(NavigationAttentionViewLeases.prototype, "qualify");
+    registerAppServerIpcHandlers();
+    try {
+      await fc.assert(fc.asyncProperty(fc.oneof(fc.constant(""), fc.string({ minLength: 129, maxLength: 150 }), fc.integer()), async (consumer) => {
+        await expect(handlers.get("owner:request")!({ sender: { id: 99501, once: vi.fn() } }, {
+          method: "backend.getNavigationQueryPage", params: { protocol: 2, consumer: "main-sidebar",
+            query: { kind: "lens", lens: "attention" }, attentionView: { id: "invalid-demand", promoteOnTurnEnd: true } },
+        }, consumer)).rejects.toThrow("Navigation consumer identity must contain 1 to 128 characters.");
+        expect(qualify).not.toHaveBeenCalled();
+      }));
+    } finally { qualify.mockRestore(); }
+  });
+
+  it.skipIf(!process.env.PWRAGENT_NAVIGATION_BENCHMARK)("measures local sidebar navigation read latency", async () => {
+    const { registerAppServerIpcHandlers } = await import("../ipc/app-server");
+    listThreads.mockResolvedValue(Array.from({ length: 1000 }, (_, index) => ({ id: `benchmark-${index}`,
+      source: "codex", title: `Benchmark thread ${index}`, titleSource: "explicit", updatedAt: index,
+      createdAt: index, linkedDirectories: [] })) as never);
+    registerAppServerIpcHandlers();
+    const read = process.env.PWRAGENT_NAVIGATION_BENCHMARK_TRANSPORT === "legacy"
+      ? handlers.get("navigation:get-query-page")! : navigationReadHandler("backend.getNavigationQueryPage");
+    const event = { sender: { id: 999_999, once: vi.fn() } };
+    const measurements: unknown[] = [];
+    for (const scenario of ["warm", "changed-query"] as const) {
+      const samples: number[] = [];
+      for (let index = 0; index < 120; index += 1) {
+        const request = { protocol: 2, consumer: "main-sidebar", inventory: "viewer", backend: "all",
+          query: { kind: "lens", lens: "inbox", ...(scenario === "changed-query" ? { filter: String(index) } : {}) } };
+        const start = performance.now();
+        await read(event, request, "sidebar-benchmark");
+        if (index >= 20) samples.push(performance.now() - start);
+      }
+      samples.sort((a, b) => a - b);
+      measurements.push({ benchmark: "local-sidebar-main-read", scenario, rows: 1000, samples: samples.length,
+        p50Ms: samples[50], p95Ms: samples[95], totalMs: samples.reduce((sum, value) => sum + value, 0) });
+      await writeFile(`.local/pwr50-navigation-${process.env.PWRAGENT_NAVIGATION_BENCHMARK}.json`, JSON.stringify(measurements, null, 2));
+    }
+    await handlers.get("navigation:release-query")?.(event, "sidebar-benchmark");
+  });
+
   it("carries renderer causes across IPC into the physical owner and index reads", async () => {
     const { registerAppServerIpcHandlers } = await import("../ipc/app-server");
     const { listingDiagnostics } = await import("../diagnostics/listing-diagnostics");
-    const { NAVIGATION_QUERY_PAGE_CHANNEL } = await import("../../shared/ipc");
     listThreads.mockResolvedValueOnce([]);
     readNavigationQueryIndex.mockReturnValueOnce({ threads: [], directories: [] });
     registerAppServerIpcHandlers();
     const before = listingDiagnostics.snapshot().recorded;
-    await handlers.get(NAVIGATION_QUERY_PAGE_CHANNEL)!({ sender: { id: 90299, once: vi.fn() } }, {
+    await navigationReadHandler("backend.getNavigationQueryPage")!({ sender: { id: 90299, once: vi.fn() } }, {
       protocol: 2, consumer: "main-sidebar", query: { kind: "lens", lens: "inbox" },
       diagnostic: { view: 44, effect: 2, logical: 6, attempt: 1, cause: "turn", trigger: "turn/completed", invalidations: 2 },
     });
@@ -4990,7 +5107,6 @@ describe("app server ipc", () => {
   it("reconciles compact saved pins through the owner cache before projecting viewer Attention", async () => {
     const { buildFederatedThreadRef } = await import("@pwragent/shared");
     const { registerAppServerIpcHandlers } = await import("../ipc/app-server");
-    const { NAVIGATION_QUERY_PAGE_CHANNEL } = await import("../../shared/ipc");
     const ref = buildFederatedThreadRef({ backend: "codex", threadId: "saved-active", instanceId: "peer-idle" });
     const saved: NavigationThreadSummary = { id: ref.threadId, source: "codex", title: "Saved active", titleSource: "explicit",
       threadStatus: "active", updatedAt: 1, linkedDirectories: [], inbox: { inInbox: false },
@@ -5003,7 +5119,7 @@ describe("app server ipc", () => {
       threads: [idle], refreshed: [{ ref, summary: idle, instanceLabel: "Peer" }], archived: [],
     });
     registerAppServerIpcHandlers();
-    const page = await handlers.get(NAVIGATION_QUERY_PAGE_CHANNEL)!({ sender: { id: 90201, once: vi.fn() } }, {
+    const page = await navigationReadHandler("backend.getNavigationQueryPage")!({ sender: { id: 90201, once: vi.fn() } }, {
       protocol: 2, consumer: "main-sidebar", inventory: "viewer", query: { kind: "lens", lens: "attention" },
     }) as { counts: { active: number }; entries: unknown[] };
     expect(page.counts.active).toBe(0);
@@ -5017,7 +5133,6 @@ describe("app server ipc", () => {
   it("rescues an existing summaryless mount when its exact owner row loads", async () => {
     const { buildFederatedThreadRef } = await import("@pwragent/shared");
     const { registerAppServerIpcHandlers } = await import("../ipc/app-server");
-    const { NAVIGATION_QUERY_PAGE_CHANNEL } = await import("../../shared/ipc");
     const ref = buildFederatedThreadRef({ backend: "codex", threadId: "child", instanceId: "peer" });
     const row = { id: "child", source: "codex", title: "Child", titleSource: "explicit", linkedDirectories: [],
       inbox: { inInbox: false }, ref: { backend: "codex", threadId: "child", ownerInstanceId: "peer" },
@@ -5026,7 +5141,7 @@ describe("app server ipc", () => {
       coverage: { state: "complete" } });
     updateRemoteThreadPinSnapshots.mockResolvedValueOnce(true);
     registerAppServerIpcHandlers();
-    await handlers.get(NAVIGATION_QUERY_PAGE_CHANNEL)!({ sender: { id: 90203, once: vi.fn() } }, {
+    await navigationReadHandler("backend.getNavigationQueryPage")!({ sender: { id: 90203, once: vi.fn() } }, {
       protocol: 2, consumer: "main-sidebar", inventory: "owner", federationTarget: { scope: "remote", instanceId: "peer" },
       query: { kind: "exact", identities: [row.ref], includeAncestry: true },
     });
@@ -5039,7 +5154,6 @@ describe("app server ipc", () => {
   it("projects a mounted remote child beneath its local parent through viewer IPC", async () => {
     const { buildFederatedThreadRef } = await import("@pwragent/shared");
     const { registerAppServerIpcHandlers } = await import("../ipc/app-server");
-    const { NAVIGATION_QUERY_PAGE_CHANNEL } = await import("../../shared/ipc");
     const parent: NavigationThreadSummary = { id: "local-parent", source: "codex", title: "Parent", titleSource: "explicit",
       linkedDirectories: [], inbox: { inInbox: false } };
     const child: NavigationThreadSummary = { ...parent, id: "remote-child", parentThreadId: parent.id,
@@ -5050,7 +5164,7 @@ describe("app server ipc", () => {
     readRemoteThreadPinNavigationRows.mockResolvedValueOnce([child]);
     federationMock.remoteThreadSummaries.resolvePinnedThreads.mockResolvedValueOnce({ threads: [child], refreshed: [], archived: [] });
     registerAppServerIpcHandlers();
-    const page = await handlers.get(NAVIGATION_QUERY_PAGE_CHANNEL)!({ sender: { id: 90202, once: vi.fn() } }, {
+    const page = await navigationReadHandler("backend.getNavigationQueryPage")!({ sender: { id: 90202, once: vi.fn() } }, {
       protocol: 2, consumer: "main-sidebar", inventory: "viewer",
       query: { kind: "children", parent: { backend: "codex", threadId: parent.id } },
     }) as import("@pwragent/shared").NavigationQueryPage;
@@ -5061,7 +5175,6 @@ describe("app server ipc", () => {
   it("reads every instance's drafts in one viewer page without waiting on a peer", async () => {
     const { buildFederatedThreadRef } = await import("@pwragent/shared");
     const { registerAppServerIpcHandlers } = await import("../ipc/app-server");
-    const { NAVIGATION_QUERY_PAGE_CHANNEL } = await import("../../shared/ipc");
     const base = { source: "codex" as const, titleSource: "explicit" as const, linkedDirectories: [], inbox: { inInbox: false } };
     const localParent: NavigationThreadSummary = { ...base, id: "local-parent", title: "Local parent" };
     const localDraft: NavigationThreadSummary = { ...base, id: "local-draft", title: "Local draft" };
@@ -5088,7 +5201,7 @@ describe("app server ipc", () => {
       { backend: "codex" as const, threadId: "held-draft", ownerInstanceId: "peer-b" },
       { backend: "codex" as const, threadId: "pinned-draft", ownerInstanceId: "peer-a" },
     ];
-    const page = await handlers.get(NAVIGATION_QUERY_PAGE_CHANNEL)!({ sender: { id: 90204, once: vi.fn() } }, {
+    const page = await navigationReadHandler("backend.getNavigationQueryPage")!({ sender: { id: 90204, once: vi.fn() } }, {
       protocol: 2, consumer: "main-sidebar", inventory: "viewer",
       query: { kind: "exact", identities, includeAncestry: true, resolveFromOwners: true },
     }) as import("@pwragent/shared").NavigationQueryPage;
@@ -5105,7 +5218,6 @@ describe("app server ipc", () => {
   it("resolves a selected peer draft's local project", async () => {
     const { buildFederatedThreadRef } = await import("@pwragent/shared");
     const { registerAppServerIpcHandlers } = await import("../ipc/app-server");
-    const { NAVIGATION_QUERY_PAGE_CHANNEL } = await import("../../shared/ipc");
     const ref = buildFederatedThreadRef({ backend: "codex", threadId: "peer-draft", instanceId: "peer-a" });
     const peerDraft: NavigationThreadSummary = { source: "codex", id: "peer-draft", title: "Peer draft", titleSource: "explicit",
       linkedDirectories: [{ path: "/peer/src/PwrAgent", label: "PwrAgent", kind: "local" }], inbox: { inInbox: false },
@@ -5116,7 +5228,7 @@ describe("app server ipc", () => {
     readRemoteThreadPinNavigationRows.mockResolvedValueOnce([]);
     federationMock.remoteThreadSummaries.resolveWatchedThreads.mockReturnValueOnce([peerDraft]);
     registerAppServerIpcHandlers();
-    const page = await handlers.get(NAVIGATION_QUERY_PAGE_CHANNEL)!({ sender: { id: 90206, once: vi.fn() } }, {
+    const page = await navigationReadHandler("backend.getNavigationQueryPage")!({ sender: { id: 90206, once: vi.fn() } }, {
       protocol: 2, consumer: "main-sidebar", inventory: "viewer",
       query: { kind: "exact", identities: [{ backend: "codex", threadId: "peer-draft", ownerInstanceId: "peer-a" }],
         includeAncestry: true, resolveFromOwners: true },
@@ -5127,10 +5239,9 @@ describe("app server ipc", () => {
 
   it("never sends an owner-resolved read to a remote owner", async () => {
     const { registerAppServerIpcHandlers } = await import("../ipc/app-server");
-    const { NAVIGATION_QUERY_PAGE_CHANNEL } = await import("../../shared/ipc");
     federationMock.runtime.remoteNavigationQueryPage.mockClear();
     registerAppServerIpcHandlers();
-    await expect(handlers.get(NAVIGATION_QUERY_PAGE_CHANNEL)!({ sender: { id: 90205, once: vi.fn() } }, {
+    await expect(navigationReadHandler("backend.getNavigationQueryPage")!({ sender: { id: 90205, once: vi.fn() } }, {
       protocol: 2, consumer: "main-sidebar", inventory: "owner", federationTarget: { scope: "remote", instanceId: "peer-a" },
       query: { kind: "exact", identities: [{ backend: "codex", threadId: "t1" }], resolveFromOwners: true },
     })).rejects.toThrow("Owner-resolved navigation is available only to this machine's viewer inventory.");
@@ -5139,9 +5250,8 @@ describe("app server ipc", () => {
 
   it.each(["FEDERATION_PEER_UNAVAILABLE", "navigation_busy"])("returns expected %s state without rejecting the Electron handler, but still rejects unexpected failures", async (code) => {
     const { registerAppServerIpcHandlers } = await import("../ipc/app-server");
-    const { NAVIGATION_QUERY_PAGE_CHANNEL } = await import("../../shared/ipc");
     registerAppServerIpcHandlers();
-    const handler = handlers.get(NAVIGATION_QUERY_PAGE_CHANNEL)!;
+    const handler = navigationReadHandler("backend.getNavigationQueryPage")!;
     const event = { sender: { id: 90009, once: vi.fn() } };
     const request = { protocol: 2, consumer: "main-sidebar", federationTarget: { scope: "remote", instanceId: "offline-peer" },
       query: { kind: "directory-index" } };
@@ -5157,13 +5267,12 @@ describe("app server ipc", () => {
 
   it("returns a Federation-wrapped owner read race without rejecting the Electron handler", async () => {
     const { registerAppServerIpcHandlers } = await import("../ipc/app-server");
-    const { NAVIGATION_QUERY_PAGE_CHANNEL } = await import("../../shared/ipc");
     registerAppServerIpcHandlers();
     const error = Object.assign(new Error("handler_failed: [navigation_busy] Navigation changed during its owner read. Refresh the retained range."), {
       code: "handler_failed",
     });
     federationMock.runtime.remoteNavigationQueryPage.mockRejectedValueOnce(error);
-    await expect(handlers.get(NAVIGATION_QUERY_PAGE_CHANNEL)!({ sender: { id: 90010, once: vi.fn() } }, {
+    await expect(navigationReadHandler("backend.getNavigationQueryPage")!({ sender: { id: 90010, once: vi.fn() } }, {
       protocol: 2, consumer: "main-sidebar", federationTarget: { scope: "remote", instanceId: "busy-peer" },
       query: { kind: "directory-index" },
     })).resolves.toEqual({ navigationReadFailure: true, code: "navigation_busy", message: error.message });
@@ -5171,7 +5280,6 @@ describe("app server ipc", () => {
 
   it("overlays only a bounded remote page's viewer directory preferences without accepting owner-only unchanged proof", async () => {
     const { registerAppServerIpcHandlers } = await import("../ipc/app-server");
-    const { NAVIGATION_QUERY_PAGE_CHANNEL } = await import("../../shared/ipc");
     const federationTarget = { scope: "remote" as const, instanceId: "peer_v2_disclosure" };
     const directoryKey = "directory:/remote/project";
     readRemoteDirectoryOverlays.mockResolvedValueOnce({ [directoryKey]: { directoryKey, directoryThreadsCollapsed: true } });
@@ -5184,7 +5292,7 @@ describe("app server ipc", () => {
       ownerEpoch: "owner", countsRevision: "r", counts, coverage: { state: "complete" }, entries: [],
       directories: [directory], selectionDirectory: directory, complete: true });
     registerAppServerIpcHandlers();
-    const page = await handlers.get(NAVIGATION_QUERY_PAGE_CHANNEL)?.({ sender: { id: 90001, once: vi.fn() } }, {
+    const page = await navigationReadHandler("backend.getNavigationQueryPage")?.({ sender: { id: 90001, once: vi.fn() } }, {
       protocol: 2, consumer: "main-sidebar", federationTarget, query: { kind: "directory-index" },
       completeBaselineRevision: "owner-only-revision",
     }) as {
@@ -5204,7 +5312,7 @@ describe("app server ipc", () => {
     readRemoteDirectoryOverlays.mockResolvedValueOnce({ [directoryKey]: { directoryKey, directoryThreadsCollapsed: false } });
     federationMock.runtime.remoteNavigationQueryPage.mockResolvedValueOnce({ protocol: 2, queryKey: "directories", generation: "g",
       ownerEpoch: "owner", countsRevision: "r", counts, coverage: { state: "complete" }, entries: [], complete: true, unchanged: true });
-    const refreshed = await handlers.get(NAVIGATION_QUERY_PAGE_CHANNEL)?.({ sender: { id: 90001, once: vi.fn() } }, {
+    const refreshed = await navigationReadHandler("backend.getNavigationQueryPage")?.({ sender: { id: 90001, once: vi.fn() } }, {
       protocol: 2, consumer: "main-sidebar", federationTarget, query: { kind: "directory-index" },
     }) as typeof page;
     expect(federationMock.runtime.remoteNavigationQueryPage).toHaveBeenLastCalledWith(federationTarget,
@@ -5216,7 +5324,6 @@ describe("app server ipc", () => {
 
   it("refreshes viewer federation metadata when unchanged owner pages are expanded", async () => {
     const { registerAppServerIpcHandlers } = await import("../ipc/app-server");
-    const { NAVIGATION_QUERY_PAGE_CHANNEL } = await import("../../shared/ipc");
     const { stampRemoteNavigationQueryPage } = await import("../federation/federation-navigation-query");
     const target: FederationRemoteTarget = { scope: "remote", instanceId: "peer-metadata" };
     let metadata: { instanceLabel: string; capabilities: FederationCapability[];
@@ -5241,7 +5348,7 @@ describe("app server ipc", () => {
       .mockResolvedValueOnce(unchanged)
       .mockResolvedValueOnce(unchanged);
     registerAppServerIpcHandlers();
-    const read = async () => handlers.get(NAVIGATION_QUERY_PAGE_CHANNEL)!({ sender: { id: 90205, once: vi.fn() } }, {
+    const read = async () => navigationReadHandler("backend.getNavigationQueryPage")!({ sender: { id: 90205, once: vi.fn() } }, {
       protocol: 2, consumer: "main-sidebar", federationTarget: target, query: { kind: "lens", lens: "inbox" },
     }) as Promise<NavigationQueryPage>;
     const first = await read();
@@ -5265,7 +5372,7 @@ describe("app server ipc", () => {
 
   it("shares exact owner reads across native windows and aborts only after the last window releases", async () => {
     const { registerAppServerIpcHandlers } = await import("../ipc/app-server");
-    const { NAVIGATION_SELECTED_DETAIL_CHANNEL, NAVIGATION_QUERY_RELEASE_CHANNEL } = await import("../../shared/ipc");
+    const { NAVIGATION_QUERY_RELEASE_CHANNEL } = await import("../../shared/ipc");
     let finish!: (value: unknown) => void;
     federationMock.runtime.remoteNavigationSelectedDetail.mockReset().mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
     registerAppServerIpcHandlers();
@@ -5273,8 +5380,8 @@ describe("app server ipc", () => {
     const b = { sender: { id: 90012, once: vi.fn() } };
     const request = { protocol: 2, federationTarget: { scope: "remote", instanceId: "exact-owner" },
       ref: { backend: "codex", threadId: "same", ownerInstanceId: "exact-owner" } };
-    const first = handlers.get(NAVIGATION_SELECTED_DETAIL_CHANNEL)!(a, request, "detail");
-    const second = handlers.get(NAVIGATION_SELECTED_DETAIL_CHANNEL)!(b, request, "detail");
+    const first = navigationReadHandler("backend.getNavigationSelectedDetail")!(a, request, "detail");
+    const second = navigationReadHandler("backend.getNavigationSelectedDetail")!(b, request, "detail");
     const settled = Promise.allSettled([first, second]);
     expect(federationMock.runtime.remoteNavigationSelectedDetail).toHaveBeenCalledTimes(1);
     const options = federationMock.runtime.remoteNavigationSelectedDetail.mock.calls[0]![2] as { signal: AbortSignal; deadlineAt: number };
@@ -5293,8 +5400,7 @@ describe("app server ipc", () => {
 
   it.each(["detail", "queue"])("quietly cancels a Star Map %s waiting for owner read capacity", async (kind) => {
     const { registerAppServerIpcHandlers } = await import("../ipc/app-server");
-    const { NAVIGATION_SELECTED_DETAIL_CHANNEL, NAVIGATION_QUEUE_PROJECTION_CHANNEL,
-      NAVIGATION_QUERY_RELEASE_CHANNEL } = await import("../../shared/ipc");
+    const { NAVIGATION_QUERY_RELEASE_CHANNEL } = await import("../../shared/ipc");
     const finish: Array<() => void> = [];
     federationMock.runtime.remoteNavigationSelectedDetail.mockReset().mockImplementation((_target, request) =>
       new Promise((resolve) => finish.push(() => resolve({ protocol: 2, ref: request.ref,
@@ -5304,11 +5410,11 @@ describe("app server ipc", () => {
     const event = { sender: { id: kind === "detail" ? 90013 : 90014, once: vi.fn() } };
     const request = { protocol: 2, federationTarget: { scope: "remote", instanceId: "busy-map-owner" },
       ref: { backend: "codex", threadId: "waiting" } };
-    const detail = handlers.get(NAVIGATION_SELECTED_DETAIL_CHANNEL)!;
+    const detail = navigationReadHandler("backend.getNavigationSelectedDetail")!;
     const release = handlers.get(NAVIGATION_QUERY_RELEASE_CHANNEL)!;
     const active = Array.from({ length: 8 }, (_, index) => detail(event,
       { ...request, ref: { ...request.ref, threadId: `active-${index}` } }, `active-${index}`));
-    const handler = handlers.get(kind === "detail" ? NAVIGATION_SELECTED_DETAIL_CHANNEL : NAVIGATION_QUEUE_PROJECTION_CHANNEL)!;
+    const handler = navigationReadHandler(kind === "detail" ? "backend.getNavigationSelectedDetail" : "backend.getNavigationQueueProjection")!;
     const waiting = handler(event, request, "unmounted-card");
     const settled = Promise.allSettled([waiting]);
     await release(event, "unmounted-card");
@@ -6657,6 +6763,41 @@ describe("app server ipc", () => {
     });
   });
 
+  it("publishes PwrDisk for PR #115 despite the session's old disktree origin", async () => {
+    const worktreePath = "/Users/fixture/.codex/worktrees/mw2h6pqb/disktree";
+    listThreads.mockResolvedValueOnce([{
+      id: "thread-1",
+      title: "Order-independent partial estimates",
+      titleSource: "explicit",
+      source: "codex",
+      gitOriginUrl: "git@github.com:pwrdrvr/disktree.git",
+      linkedDirectories: [{
+        id: "/Users/fixture/github/disktree",
+        kind: "worktree",
+        label: "disktree",
+        path: "/Users/fixture/github/disktree",
+        worktreePath,
+      }],
+      prs: [githubPr({ org: "pwrdrvr", repo: "PwrDisk", number: 115, state: "passing",
+        url: "https://github.com/pwrdrvr/PwrDisk/pull/115" })],
+      updatedAt: 2000,
+    }] as never);
+    resolveGitHubRepoForDirectory.mockResolvedValue({
+      host: "github.com", owner: "pwrdrvr", repo: "PwrDisk",
+    });
+
+    registerAppServerIpcHandlers();
+    const response = await readLegacyOwnerMaterialization?.({}, {});
+
+    expect(resolveGitHubRepoForDirectory).toHaveBeenCalledWith(worktreePath);
+    expect(response).toMatchObject({ threads: [{
+      id: "thread-1", primaryGitRepository: "github.com/pwrdrvr/pwrdisk",
+    }] });
+    const { appServerService } = await import("../ipc/app-server");
+    expect(appServerService.readPrimaryGitRepository("codex", "thread-1"))
+      .toBe("github.com/pwrdrvr/pwrdisk");
+  });
+
   it("invalidates unchanged snapshots when primary repository resolution recovers", async () => {
     const thread = {
       id: "thread-1",
@@ -7515,6 +7656,8 @@ describe("app server ipc", () => {
     expect(withThreadLifecycleMutation).toHaveBeenCalledWith(
       { backend: "acp:grok", threadId: "thread-1" }, expect.any(Function),
     );
+    // Opening a local thread is where restore_on = "open" brings a hibernated checkout back.
+    expect(wakeHibernatedCheckoutOnOpen).toHaveBeenCalledWith({ backend: "acp:grok", threadId: "thread-1" });
     expect(response).toEqual({
       backend: "acp:grok",
       threadId: "thread-1",
@@ -7548,6 +7691,8 @@ describe("app server ipc", () => {
       seenUpdatedAt: 3_000,
     });
     expect(markThreadSeen).not.toHaveBeenCalled();
+    // The owning peer restores its own checkout; this instance has none.
+    expect(wakeHibernatedCheckoutOnOpen).not.toHaveBeenCalled();
     expect(response).toEqual({
       backend: "codex",
       threadId: "thread-remote",
@@ -10453,7 +10598,7 @@ describe("app server ipc", () => {
       };
     };
     const registry = backendRegistryLifecycle.get() as Record<string, unknown>;
-    const submitTurnIfIdle = vi.fn(async () => ({ status: "started" as const, turnId: "wake" }));
+    const submitTurnIfIdle = vi.fn(async (): Promise<{ status: "started" | "busy"; turnId?: string }> => ({ status: "started", turnId: "wake" }));
     registry.submitTurnIfIdle = submitTurnIfIdle;
     registry.getActiveTurnForThread = () => undefined;
     // Dependency registration reads each thread's turns through the provider.
@@ -10480,6 +10625,135 @@ describe("app server ipc", () => {
     };
     return { appServerService, service, submitTurnIfIdle, restore };
   }
+
+  it.each(["status-cache", "legacy-attachment"])("retires a locked terminal watch from %s and delivers its saved event on unlock without a forge read", async (source) => {
+    await withRenamedRepositoryStore("terminal-watch-recovery-", async ({ store }) => {
+      const { appServerService, service, submitTurnIfIdle, restore } = await renamedRepositoryService();
+      const internal = service as unknown as {
+        retryPendingPrTerminalWatches: () => Promise<void>;
+        prStatusRegistryLoaded: boolean;
+        prStatusRegistry: Map<string, { pr: PrSummary; fetchedAt: number }>;
+      };
+      const identity = { backend: "codex" as const, threadId: "locked-terminal-fixture" };
+      const terminal = githubPr({ org: "fixture", repo: "project", number: 17, state: "passing", lifecycleState: "merged",
+        url: "https://github.com/fixture/project/pull/17" });
+      const key = buildPullRequestStatusKey(terminal);
+      const previous = { loaded: internal.prStatusRegistryLoaded, entry: internal.prStatusRegistry.get(key) };
+      const appState = await import("../state/app-state");
+      const mode = vi.spyOn(appState, "getAppStateMode").mockReturnValue("active-profile");
+      let locked = true;
+      submitTurnIfIdle.mockImplementation(async () => locked
+        ? { status: "busy" as const }
+        : { status: "started" as const, turnId: "wake" });
+      try {
+        await store.setThreadLock({ ...identity, lock: { source: "operator", lockedAt: 1, note: "Child owns checkout" } });
+        await store.registerThreadPrStatusWatch({ now: 1, watch: {
+          ...identity, watchId: "terminal-fixture", prKey: key, prUrl: terminal.url, prNumber: terminal.number,
+          kind: "terminal", headSha: "", notifyOn: ["merged", "closed"], createdAt: 1, failureHandledByAutoFix: false,
+        } });
+        internal.prStatusRegistryLoaded = true;
+        if (source === "status-cache") internal.prStatusRegistry.set(key, { pr: terminal, fetchedAt: 10 });
+        else {
+          internal.prStatusRegistry.delete(key);
+          await store.setThreadPullRequests({ ...identity, prs: [terminal], fetchedAt: 10 });
+        }
+        await internal.retryPendingPrTerminalWatches();
+        expect(await store.listAllActivePrStatusWatches()).toEqual([]);
+        expect(await store.listPendingPrTerminalWatchObservations(identity)).toEqual([{ pr: terminal, observedAt: 10 }]);
+        expect((await store.getThreadOverlayState(identity))?.lock?.note).toBe("Child owns checkout");
+        expect(fetchPullRequestTerminalDetails).not.toHaveBeenCalled();
+        // The saved event survives independently of the shared status cache.
+        internal.prStatusRegistry.delete(key);
+        locked = false;
+        submitTurnIfIdle.mockClear();
+        appServerService.handleAgentEventForPrWatches({ backend: "codex", notification: {
+          method: "thread/lock/updated", params: { threadId: identity.threadId },
+        } });
+        await vi.waitFor(async () => expect(await store.listPendingPrTerminalWatchObservations(identity)).toEqual([]));
+        expect(submitTurnIfIdle).toHaveBeenCalledTimes(1);
+        expect(fetchPullRequestTerminalDetails).not.toHaveBeenCalled();
+      } finally {
+        mode.mockRestore();
+        internal.prStatusRegistryLoaded = previous.loaded;
+        if (previous.entry) internal.prStatusRegistry.set(key, previous.entry);
+        else internal.prStatusRegistry.delete(key);
+        restore();
+      }
+    });
+  });
+
+  it("removes an archived thread from PR routing immediately and rejects late lookup results", async () => {
+    const { appServerService, service, restore } = await renamedRepositoryService();
+    const registry = backendRegistryLifecycle.get() as Record<string, unknown>;
+    const previousInfo = registry.getThreadInfo;
+    let archived = false;
+    registry.getThreadInfo = () => ({ archived });
+    service.ownerNavigationActive = false;
+    const threadKey = "codex:archived-watcher";
+    const attachment = { backend: "codex" as const, prs: [githubPr({
+      org: "fixture", repo: "project", number: 70, state: "pending", url: "https://github.com/fixture/project/pull/70",
+    })] };
+    const attachments = (service as unknown as { attachedPrsByThreadKey: Map<string, unknown> }).attachedPrsByThreadKey;
+    try {
+      service.setThreadPrAttachment(threadKey, attachment);
+      expect(attachments.has(threadKey)).toBe(true);
+      archived = true;
+      appServerService.handleAgentEventForPrAttachments({ backend: "codex",
+        notification: { method: "thread/archived", params: { threadId: "archived-watcher" } },
+      });
+      expect(attachments.has(threadKey)).toBe(false);
+      service.setThreadPrAttachment(threadKey, attachment);
+      expect(attachments.has(threadKey)).toBe(false);
+    } finally {
+      registry.getThreadInfo = previousInfo;
+      service.setThreadPrAttachment(threadKey, undefined);
+      restore();
+    }
+  });
+
+  it.each(["checks", "terminal"] as const)("retires an archived thread's %s watch without replaying it after restore", async (kind) => {
+    await withRenamedRepositoryStore("archived-pr-watch-", async ({ store }) => {
+      const { service, submitTurnIfIdle, restore } = await renamedRepositoryService();
+      const registry = backendRegistryLifecycle.get() as Record<string, unknown>;
+      const previousInfo = registry.getThreadInfo;
+      let archived = true;
+      registry.getThreadInfo = () => ({ archived });
+      const threadId = "archived-watcher";
+      const target = githubPr({
+        number: 70, org: "pwrdrvr", repo: "fixture", url: "https://github.com/pwrdrvr/fixture/pull/70",
+        headSha: "a".repeat(40), state: "passing", checkState: "passing",
+        lifecycleState: kind === "terminal" ? "merged" : "open",
+      });
+      try {
+        await store.registerThreadPrStatusWatch({
+          watch: {
+            watchId: "archived-watch", backend: "codex", threadId, kind,
+            prKey: buildPullRequestStatusKey(target), prUrl: target.url, prNumber: target.number,
+            headSha: kind === "terminal" ? "" : target.headSha!,
+            notifyOn: kind === "terminal" ? ["merged"] : ["success"],
+            createdAt: Date.now(), failureHandledByAutoFix: false,
+          },
+          now: Date.now(),
+        });
+        await store.observeArchivedThreads([{ backend: "codex", threadId }], Date.now());
+        const coordinator = service.getPrStatusWatchCoordinator();
+        await coordinator.handleStatusSnapshot(target, Date.now());
+        expect(submitTurnIfIdle).not.toHaveBeenCalled();
+        expect(fetchPullRequestTerminalDetails).not.toHaveBeenCalled();
+        expect(await store.listActiveThreadPrStatusWatches({ backend: "codex", threadId }))
+          .toEqual([]);
+
+        archived = false;
+        await store.setThreadArchiveTombstone({ backend: "codex", threadId, restoredAt: Date.now() });
+        await coordinator.handleStatusSnapshot(target, Date.now());
+        expect(submitTurnIfIdle).not.toHaveBeenCalled();
+        expect(await store.listActiveThreadPrStatusWatches({ backend: "codex", threadId })).toEqual([]);
+      } finally {
+        registry.getThreadInfo = previousInfo;
+        restore();
+      }
+    });
+  });
 
   it("claims a watch saved under a renamed repository's old name after a restart", async () => {
     // The watch was registered before the duplicate rows collapsed. Status
@@ -10647,6 +10921,63 @@ describe("app server ipc", () => {
         expect(dependency?.conditions).toEqual([expect.objectContaining({ prUrl: RENAMED_PR_URL })]);
         expect(dependency?.evidence[0]).toMatchObject({ prUrl: RENAMED_PR_URL });
         expect(dependency?.evidence[0]?.reason).not.toBe("Waiting for a primary-workspace PR");
+      } finally {
+        stateDb.mockRestore();
+        mode.mockRestore();
+        restore();
+      }
+    });
+  });
+
+  it("lists the merge holds main enforces for a PR, including another thread's", async () => {
+    // Oracle: a merge card's list answers exactly what assertMergeNotHeld
+    // would refuse the merge for, so a hold on any thread with the PR
+    // attached shows on the card instead of failing the click.
+    const appState = await import("../state/app-state");
+    const { ThreadDependencyStore } = await import("../state/thread-dependency-store");
+    const { blockingMergeDependencies } = await import("../app-server/thread-dependency-merge-hold");
+    await withRenamedRepositoryStore("merge-card-shared-pr-hold-", async ({ store, db }) => {
+      const { appServerService, restore } = await renamedRepositoryService();
+      const stateDb = vi.spyOn(appState, "getAppStateDb").mockReturnValue(db);
+      const mode = vi.spyOn(appState, "getAppStateMode").mockReturnValue("active-profile");
+      const pr = githubPr({ number: 3179, org: "pwrdrvr", repo: "PwrAgent", state: "pending", url: RENAMED_PR_URL });
+      try {
+        await store.setThreadPullRequests({
+          backend: "codex", threadId: "holder", prs: [pr], fetchedAt: Date.now(), refreshKey: "holder",
+        });
+        const dependencies = new ThreadDependencyStore(db.raw);
+        dependencies.register({
+          id: "hold-17", backend: "codex", threadId: "holder", holdMerge: true,
+          conditions: [{ backend: "codex", threadId: "", when: "marked_done", subject: "Validation" }],
+          mode: "all", onFailure: "notify", deliver: "operator",
+          status: "waiting", evidence: [], createdAt: Date.now(), updatedAt: Date.now(),
+        });
+
+        const response = await appServerService.manageThreadDependencies({
+          action: "list", backend: "codex", threadId: "merger", pullRequest: RENAMED_PR_URL,
+        });
+
+        expect(response.dependencies).toEqual([]);
+        expect(response.mergeHolds?.map((item) => item.id)).toEqual(["hold-17"]);
+        const enforced = blockingMergeDependencies(dependencies.active(), {
+          backend: "codex", threadId: "merger", pullRequest: RENAMED_PR_URL,
+        }, (thread) => store.readThreadPullRequestUrls(thread as { backend: "codex"; threadId: string }));
+        expect(response.mergeHolds).toEqual(enforced);
+        // A card that names the PR by number, as gh accepts it, sees the
+        // same hold once the merging thread has the PR attached.
+        await store.setThreadPullRequests({
+          backend: "codex", threadId: "merger", prs: [pr], fetchedAt: Date.now(), refreshKey: "merger",
+        });
+        expect((await appServerService.manageThreadDependencies({
+          action: "list", backend: "codex", threadId: "merger", pullRequest: "3179",
+        })).mergeHolds?.map((item) => item.id)).toEqual(["hold-17"]);
+        // A plain list asks no merge question.
+        expect((await appServerService.manageThreadDependencies({
+          action: "list", backend: "codex", threadId: "merger",
+        })).mergeHolds).toBeUndefined();
+        await expect(appServerService.manageThreadDependencies({
+          action: "cancel", backend: "codex", threadId: "merger", dependencyId: "x", pullRequest: RENAMED_PR_URL,
+        })).rejects.toThrow("only list takes it");
       } finally {
         stateDb.mockRestore();
         mode.mockRestore();

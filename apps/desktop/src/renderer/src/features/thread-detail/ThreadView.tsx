@@ -1,3 +1,4 @@
+import { ContinueAfterStatus } from "../thread-dependencies/ContinueAfterStatus";
 import { threadTodoThreadKey, parseRemoteOperatorItemKey } from "@pwragent/shared";
 import { StartupTiming } from "../composer/StartupTiming";
 import { LaunchpadStartupCancelledError } from "../../lib/launchpad-creation-client";
@@ -26,6 +27,7 @@ import type {
   MoveThreadToMainCheckoutResponse,
   RecreateThreadWorktreeRequest,
   RecreateThreadWorktreeResponse,
+  SetThreadCheckoutHibernationResponse,
   AppServerAvailableCommandSummary,
   AppServerCollaborationModeRequest,
   AppServerBackendKind,
@@ -68,6 +70,7 @@ import type {
   ThreadUsageLineRecord,
   ToolOutputIncidentExplorerLens,
   ForgeApprovalRememberOptionId,
+  ThreadTodoMergeMethod,
 } from "@pwragent/shared";
 import {
   buildPendingRequestResponse,
@@ -218,6 +221,7 @@ import {
   WorkspaceRecoveryNotice,
   type WorkspaceRecoveryOutcome,
 } from "../workspace-recovery/MissingWorktreeCard";
+import { HibernatedCheckoutCard } from "../workspace-recovery/HibernatedCheckoutCard";
 import { ThreadLockDialog } from "../thread-lock/ThreadLockDialog";
 
 import {
@@ -858,6 +862,8 @@ export type ThreadViewProps = {
   agentCommandsStatus?: AgentCommandsStatus;
   pastedImageMaxPatches?: number;
   pdfAnalysisEnabled?: boolean;
+  /** Settings -> General -> Reviews: whether a new review panel opens with Auto-fix on. */
+  reviewAutoFixDefault?: boolean;
   /** Token Miser experiment availability gate. */
   tokenMiserEnabled?: boolean;
   /** Inherited Token Miser state when a thread has no explicit override. */
@@ -1063,6 +1069,10 @@ export type ThreadViewProps = {
   onRecreateThreadWorktree?: (
     request: Pick<RecreateThreadWorktreeRequest, "worktreePath" | "skipCheckpoint" | "detached">
   ) => Promise<RecreateThreadWorktreeResponse>;
+  /** Restore now, or Keep it awake, for the selected thread's hibernated checkout. */
+  onSetThreadCheckoutHibernation?: (
+    change: { restore?: boolean; keepAwake?: boolean },
+  ) => Promise<SetThreadCheckoutHibernationResponse>;
   /** Moves the selected thread to its main checkout without switching it. */
   onMoveThreadToMainCheckout?: (
     worktreePath: string
@@ -3948,6 +3958,8 @@ export function ThreadView(props: ThreadViewProps) {
     action: "accept" | "decline" | "cancel",
     persist?: McpApprovalPersistence,
     remember?: ForgeApprovalRememberOptionId,
+    mergeMethod?: ThreadTodoMergeMethod,
+    projectGrant?: boolean,
   ): Promise<void> {
     if (!props.desktopApi?.submitServerRequest || !selectedThread) {
       setPendingRequestError("Desktop bridge is missing submitServerRequest().");
@@ -3968,7 +3980,7 @@ export function ThreadView(props: ThreadViewProps) {
             ? pendingMcpInteraction.turnId
             : undefined,
         requestId: pendingMcpInteraction.requestId,
-        response: buildMcpElicitationResponse(pendingMcpInteraction, action, persist, remember),
+        response: buildMcpElicitationResponse(pendingMcpInteraction, action, persist, remember, mergeMethod, projectGrant),
       });
       props.clearPendingRequest(
         pendingMcpInteraction.requestId,
@@ -4197,6 +4209,10 @@ export function ThreadView(props: ThreadViewProps) {
     ? selectedThread?.workspaceMissing
     : undefined;
   const missingWorkspaceOwnerStatus = selectedThread?.federation?.peerStatus;
+  // A hibernated checkout keeps the composer: the next send restores it.
+  const hibernatedWorkspace = threadView && !missingWorkspace
+    ? selectedThread?.workspaceHibernated
+    : undefined;
   const missingWorkspaceTurnActive = Boolean(props.activeTurnId);
   const composerReplacedByRecovery = Boolean(missingWorkspace) && !missingWorkspaceTurnActive;
   const workspaceRecoverySlot = missingWorkspace && selectedThread && selectedThreadKey ? (
@@ -4223,6 +4239,23 @@ export function ThreadView(props: ThreadViewProps) {
         ? async () => await props.onArchiveThread!(selectedThread)
         : undefined}
       onRecovered={(outcome) => setWorkspaceRecovery({ threadKey: selectedThreadKey, outcome })}
+    />
+  ) : hibernatedWorkspace && selectedThreadKey ? (
+    <HibernatedCheckoutCard
+      key={`${selectedThreadKey}:${hibernatedWorkspace.worktreePath}`}
+      workspace={hibernatedWorkspace}
+      ownerLabel={selectedThread?.federation?.instanceLabel ?? props.activeFederationOwnerLabel}
+      ownerOffline={
+        missingWorkspaceOwnerStatus !== undefined
+        && missingWorkspaceOwnerStatus !== "connected"
+        && missingWorkspaceOwnerStatus !== "degraded"
+      }
+      onRestore={props.onSetThreadCheckoutHibernation
+        ? async () => await props.onSetThreadCheckoutHibernation!({ restore: true })
+        : undefined}
+      onKeepAwake={props.onSetThreadCheckoutHibernation
+        ? async () => await props.onSetThreadCheckoutHibernation!({ keepAwake: true })
+        : undefined}
     />
   ) : workspaceRecoveryOutcome ? (
     <WorkspaceRecoveryNotice
@@ -4340,6 +4373,7 @@ export function ThreadView(props: ThreadViewProps) {
         onPickDirectoryForReference={props.onPickDirectoryForReference}
         pastedImageMaxPatches={props.pastedImageMaxPatches}
         pdfAnalysisEnabled={props.pdfAnalysisEnabled}
+        reviewAutoFixDefault={props.reviewAutoFixDefault}
         tokenMiserEnabled={props.tokenMiserEnabled}
         tokenMiserDefaultEnabled={props.tokenMiserDefaultEnabled}
         monitorJobSuggestionsDefaultEnabled={props.monitorJobSuggestionsDefaultEnabled}
@@ -4959,6 +4993,7 @@ export function ThreadView(props: ThreadViewProps) {
               ownerLabel={props.activeFederationOwnerLabel}
               onOpenFederationSettings={props.starMap?.onOpenFederationSettings}
             /> : null}
+            {selectedThread ? <ContinueAfterStatus thread={selectedThread} api={props.desktopApi} /> : null}
             {primaryContent}
             {composerSlotElement}
             {threadLock ? (
